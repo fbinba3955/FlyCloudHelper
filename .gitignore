@@ -1,0 +1,60 @@
+# 环境变量与敏感配置
+.env
+.env.*
+!.env.example
+secrets/*
+!secrets/.gitkeep
+!secrets/README.md
+*.key
+*.pem
+*.p12
+*.pfx
+
+# 依赖目录
+node_modules/
+.pnpm-store/
+.yarn/
+
+# 构建、覆盖率与工具缓存
+dist/
+build/
+coverage/
+.cache/
+*.tsbuildinfo
+
+# FlymbyScanner 运行数据
+data/
+runtime/
+storage/
+uploads/
+exports/
+backups/
+tmp/
+temp/
+logs/
+*.log
+*.pid
+
+# 本地数据库及其临时文件
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Docker 本地覆盖配置
+compose.override.yml
+compose.override.yaml
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# IDE 与操作系统文件
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
