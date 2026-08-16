@@ -383,6 +383,8 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   }, [serviceId, service?.id, service?.scanProfileRevision, providers.data]);
 
   if (!service) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取服务详情…"}</div></Panel>;
+  // 关键变量：详情已经通过空值检查，异步回调统一捕获稳定引用，避免刷新期间类型重新变为可空。
+  const activeService = service;
 
   /** 从详情页创建用户选择的扫描任务。 */
   async function trigger(mode: "incremental" | "full"): Promise<void> {
@@ -401,11 +403,11 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     const nextFullScanRoots = mode === "full" ? selectedRoots : fullScanRoots;
     const nextIncrementalScanRoots = mode === "incremental" ? selectedRoots : incrementalScanRoots;
     const nextProfile = {
-      ...service.scanProfile,
+      ...activeService.scanProfile,
       roots: undefined,
       fullRoots: nextFullScanRoots,
       incrementalRoots: nextIncrementalScanRoots,
-      mediaTypes: [service.dataType],
+      mediaTypes: [activeService.dataType],
     };
     setMessage(`正在验证并保存${mode === "full" ? "全量" : "增量"}扫描目录…`);
     try {
@@ -425,7 +427,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   async function saveScanConcurrency(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     const nextProfile = {
-      ...service.scanProfile,
+      ...activeService.scanProfile,
       scanDirectoryConcurrency: scanConcurrencySettings.scanDirectoryConcurrency,
       scrapeTaskConcurrency: scanConcurrencySettings.scrapeTaskConcurrency,
     };
@@ -444,7 +446,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     event.preventDefault();
     setMessage("正在保存元数据配置…");
     try {
-      const profile = buildVideoMetadataProfile(service.metadataProfile, metadataSettings);
+      const profile = buildVideoMetadataProfile(activeService.metadataProfile, metadataSettings);
       await updateServiceMetadataProfile(serviceId, profile, admin);
       setMessage("元数据配置已保存，新修订只影响之后创建的任务");
       await resource.refresh();
@@ -468,7 +470,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     event.preventDefault();
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
-    const descriptor = providers.data?.find((item) => item.type === service.providerType);
+    const descriptor = providers.data?.find((item) => item.type === activeService.providerType);
     if (!descriptor) return;
     const connection: Record<string, string> = {};
     descriptor.connectionFields.forEach((field) => {
@@ -504,7 +506,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   /** 启用或停用当前服务。 */
   async function toggleStatus(): Promise<void> {
     try {
-      await updateServiceStatus(serviceId, service.status === "disabled" ? "active" : "disabled", admin);
+      await updateServiceStatus(serviceId, activeService.status === "disabled" ? "active" : "disabled", admin);
       await resource.refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "服务状态修改失败");
@@ -513,7 +515,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
 
   /** 二次确认后仅清空当前服务的扫描与刮削结果。 */
   async function clearCatalog(): Promise<void> {
-    if (!window.confirm(`确定清空“${service.displayName}”的全部扫描刮削结果吗？服务连接和配置会保留，媒体条目、文件索引和目录版本将被清空。`)) return;
+    if (!window.confirm(`确定清空“${activeService.displayName}”的全部扫描刮削结果吗？服务连接和配置会保留，媒体条目、文件索引和目录版本将被清空。`)) return;
     setMessage("正在清空当前服务的媒体库…");
     try {
       const result = await clearServiceCatalog(serviceId, admin);

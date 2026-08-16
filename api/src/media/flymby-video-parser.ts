@@ -462,7 +462,7 @@ function parseEpisodeMarker(baseName: string, filePath: string): EpisodeMarker {
       index: sxe.index,
       seasonNumber: Number(sxe[1]),
       explicitSeason: true,
-      episodeNumbers: collectEpisodeNumbers(sxe[2]),
+      episodeNumbers: collectEpisodeNumbers(sxe[2] ?? ""),
     };
   }
   const seasonEpisode = /(?:Season|Series)\s*0*(\d{1,2})[\s._\-–—:：]*(?:Episode|EP|E)\s*0*(\d{1,4})/iu.exec(baseName);
@@ -473,13 +473,13 @@ function parseEpisodeMarker(baseName: string, filePath: string): EpisodeMarker {
   if (oneX) return markerFromMatch(oneX, Number(oneX[1]), true, [Number(oneX[2])]);
   const chineseSeasonEpisode = /第\s*([0-9一二三四五六七八九十两]{1,3})\s*[季部]\s*第?\s*0*(\d{1,4})\s*[集话話]/u.exec(baseName);
   if (chineseSeasonEpisode) {
-    return markerFromMatch(chineseSeasonEpisode, parseChineseNumber(chineseSeasonEpisode[1]), true, [Number(chineseSeasonEpisode[2])]);
+    return markerFromMatch(chineseSeasonEpisode, parseChineseNumber(chineseSeasonEpisode[1] ?? ""), true, [Number(chineseSeasonEpisode[2])]);
   }
   const chineseSeasonTrailingEpisode = /第\s*([0-9一二三四五六七八九十两]{1,3})\s*[季部]\s*0*(\d{1,4})(?:\s*v\d+)?(?:$|[\s._\-–—:：\]】)）])/u.exec(baseName);
   if (chineseSeasonTrailingEpisode) {
     return markerFromMatch(
       chineseSeasonTrailingEpisode,
-      parseChineseNumber(chineseSeasonTrailingEpisode[1]),
+      parseChineseNumber(chineseSeasonTrailingEpisode[1] ?? ""),
       true,
       [Number(chineseSeasonTrailingEpisode[2])],
     );

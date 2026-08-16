@@ -77,7 +77,7 @@ function validateScanRoot(
   const allowedMediaTypes = new Set<MediaType>([serviceDataType]);
   const rootMediaTypes = root.mediaTypes;
   if (rootMediaTypes !== undefined && (!Array.isArray(rootMediaTypes)
-    || rootMediaTypes.some((item) => typeof item !== "string" || !allowedMediaTypes.has(item)))) {
+    || rootMediaTypes.some((item) => typeof item !== "string" || !allowedMediaTypes.has(item as MediaType)))) {
     throw validationError(`scan.${fieldName}.${index}.mediaTypes`, "扫描根媒体类型必须与服务数据类型一致，本阶段仅支持影视");
   }
   return {
@@ -490,8 +490,8 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       服务ID: service.id,
       全量路径数: getScanRootsForMode(profile, "full").length,
       增量路径数: getScanRootsForMode(profile, "incremental").length,
-      扫描目录并发: profile.scanDirectoryConcurrency,
-      刮削任务并发: profile.scrapeTaskConcurrency,
+      扫描目录并发: Number(profile.scanDirectoryConcurrency ?? 0),
+      刮削任务并发: Number(profile.scrapeTaskConcurrency ?? 0),
     });
     return { service: updatedService };
   });

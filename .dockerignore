@@ -19,6 +19,7 @@ temp
 logs
 secrets
 doc
+assets/readme
 *.log
 *.db
 *.sqlite*

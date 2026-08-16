@@ -676,12 +676,13 @@ export class ScanWorker {
           mediaResult.changedItemIds.forEach((itemId) => changedItemIds.add(itemId));
         } catch (error) {
           if (rememberTmdbRecoveryError(error)) {
+            const recoveryError = error as TmdbTemporarilyUnavailableError;
             this.logger.warn({
               日志关键字: "codex-flycloud-helper-tmdb-recovery",
               事件: "影片刮削触发任务级延迟恢复",
               任务ID: job.id,
               影片任务标识: businessTaskKey,
-              下次重试时间: tmdbRecoveryError?.nextRetryAt,
+              下次重试时间: recoveryError.nextRetryAt,
             });
             break;
           }

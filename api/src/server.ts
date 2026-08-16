@@ -80,7 +80,9 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     },
     bodyLimit: Math.max(1024 * 1024, config.pluginMaxBytes + 1024 * 1024),
   });
-  const database = new FlyCloudHelperDatabase(config);
+  const database = new FlyCloudHelperDatabase(config, (level, fields) => {
+    server.log[level](fields);
+  });
   await database.initialize();
   await database.bindCredentialMasterKey({
     fingerprint: config.credentialKeyFingerprint,

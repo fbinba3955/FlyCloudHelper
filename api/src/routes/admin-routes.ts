@@ -435,8 +435,8 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       服务ID: service.id,
       全量路径数: getScanRootsForMode(scanProfile, "full").length,
       增量路径数: getScanRootsForMode(scanProfile, "incremental").length,
-      扫描目录并发: scanProfile.scanDirectoryConcurrency,
-      刮削任务并发: scanProfile.scrapeTaskConcurrency,
+      扫描目录并发: Number(scanProfile.scanDirectoryConcurrency ?? 0),
+      刮削任务并发: Number(scanProfile.scrapeTaskConcurrency ?? 0),
     });
     await audit(runtime, operator, "update_service_scan_profile", "service", service.id);
     return { service: updated };

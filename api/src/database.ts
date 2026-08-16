@@ -28,6 +28,139 @@ interface AuthenticationRow extends UserRow {
   password_hash: string;
 }
 
+type DatabaseBootstrapLogger = (
+  level: "info" | "warn",
+  fields: Record<string, string | number | boolean | null>,
+) => void;
+
+interface RemoteDatabaseTarget {
+  databaseName: string;
+  host: string;
+  port: number;
+  targetUrl: string;
+  bootstrapUrl: string;
+}
+
+/** 提取数据库驱动错误码，不把连接地址或密码写入日志。 */
+function getDatabaseErrorCode(error: unknown): string {
+  if (!error || typeof error !== "object") {
+    return "unknown";
+  }
+  const databaseError = error as { code?: string; errno?: number };
+  return String(databaseError.code ?? databaseError.errno ?? "unknown");
+}
+
+/** 判断连接失败是否仅仅因为目标数据库尚不存在。 */
+function isDatabaseMissingError(databaseType: "postgres" | "mysql", error: unknown): boolean {
+  const errorCode = getDatabaseErrorCode(error);
+  return databaseType === "postgres"
+    ? errorCode === "3D000"
+    : errorCode === "ER_BAD_DB_ERROR" || errorCode === "1049";
+}
+
+/** 解析目标数据库及用于自动建库的服务器级连接地址。 */
+function parseRemoteDatabaseTarget(config: ApiConfig): RemoteDatabaseTarget {
+  if (!config.databaseUrl || config.databaseType === "sqlite") {
+    throw new Error("远端数据库连接配置缺失");
+  }
+  const targetUrl = new URL(config.databaseUrl);
+  const expectedProtocols = config.databaseType === "postgres"
+    ? new Set(["postgres:", "postgresql:"])
+    : new Set(["mysql:"]);
+  if (!expectedProtocols.has(targetUrl.protocol)) {
+    throw new Error(`${config.databaseType} 数据库连接协议不正确`);
+  }
+  const databaseName = decodeURIComponent(targetUrl.pathname.replace(/^\/+/, ""));
+  if (!/^[A-Za-z0-9_]+$/.test(databaseName) || databaseName.length > 63) {
+    throw new Error("数据库名称只能包含英文字母、数字和下划线，且不能超过 63 个字符");
+  }
+
+  const bootstrapUrl = new URL(targetUrl);
+  bootstrapUrl.pathname = config.databaseType === "postgres" ? "/postgres" : "/";
+  return {
+    databaseName,
+    host: targetUrl.hostname,
+    port: Number(targetUrl.port || (config.databaseType === "postgres" ? 5432 : 3306)),
+    targetUrl: targetUrl.toString(),
+    bootstrapUrl: bootstrapUrl.toString(),
+  };
+}
+
+/** 创建一个只用于连通性检查或自动建库的短生命周期连接。 */
+function createTemporaryConnection(databaseType: "postgres" | "mysql", connectionUrl: string): Knex {
+  return knex({
+    client: databaseType === "postgres" ? "pg" : "mysql2",
+    connection: connectionUrl,
+    pool: { min: 0, max: 1 },
+  });
+}
+
+/** 检查目标数据库，不存在时使用同一账号尝试安全创建。 */
+async function ensureRemoteDatabase(
+  config: ApiConfig,
+  logger: DatabaseBootstrapLogger,
+): Promise<void> {
+  if (config.databaseType === "sqlite") {
+    return;
+  }
+  const databaseType = config.databaseType;
+  const target = parseRemoteDatabaseTarget(config);
+  const logContext = {
+    日志关键字: "codex-flycloud-helper-database-bootstrap",
+    数据库类型: databaseType,
+    数据库地址: target.host,
+    数据库端口: target.port,
+    数据库名称: target.databaseName,
+  };
+  const targetConnection = createTemporaryConnection(databaseType, target.targetUrl);
+  try {
+    await targetConnection.raw("SELECT 1");
+    logger("info", { ...logContext, 事件: "目标数据库已存在" });
+    return;
+  } catch (error) {
+    if (!isDatabaseMissingError(databaseType, error)) {
+      throw error;
+    }
+  } finally {
+    await targetConnection.destroy();
+  }
+
+  if (!config.databaseAutoCreate) {
+    throw new Error(`数据库 ${target.databaseName} 不存在，且数据库自动创建已关闭`);
+  }
+  logger("warn", { ...logContext, 事件: "目标数据库不存在，开始自动创建" });
+
+  const bootstrapConnection = createTemporaryConnection(databaseType, target.bootstrapUrl);
+  try {
+    if (databaseType === "postgres") {
+      await bootstrapConnection.raw(`CREATE DATABASE "${target.databaseName}" ENCODING 'UTF8'`);
+    } else {
+      await bootstrapConnection.raw(
+        `CREATE DATABASE IF NOT EXISTS \`${target.databaseName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`,
+      );
+    }
+    logger("info", { ...logContext, 事件: "目标数据库自动创建成功" });
+  } catch (error) {
+    if (databaseType === "postgres" && getDatabaseErrorCode(error) === "42P04") {
+      logger("info", { ...logContext, 事件: "目标数据库已由其他实例创建" });
+      return;
+    }
+    logger("warn", {
+      ...logContext,
+      事件: "目标数据库自动创建失败",
+      错误码: getDatabaseErrorCode(error),
+      错误信息: error instanceof Error ? error.message : "未知数据库错误",
+    });
+    const requiredPermission = databaseType === "postgres" ? "CREATEDB" : "CREATE";
+    throw new Error(
+      `无法自动创建数据库 ${target.databaseName}，请确认数据库账号拥有 ${requiredPermission} 权限`,
+      { cause: error },
+    );
+  } finally {
+    await bootstrapConnection.destroy();
+  }
+}
+
 /** 将数据库用户行转换为公开用户结构。 */
 function mapPublicUser(row: UserRow): PublicUserRecord {
   return {
@@ -72,8 +205,12 @@ function createConnection(config: ApiConfig): Knex {
 export class FlyCloudHelperDatabase {
   public readonly query: Knex;
   public readonly databaseType: ApiConfig["databaseType"];
+  private readonly config: ApiConfig;
+  private readonly bootstrapLogger: DatabaseBootstrapLogger;
 
-  public constructor(config: ApiConfig) {
+  public constructor(config: ApiConfig, bootstrapLogger: DatabaseBootstrapLogger) {
+    this.config = config;
+    this.bootstrapLogger = bootstrapLogger;
     this.databaseType = config.databaseType;
     this.query = createConnection(config);
   }
@@ -84,6 +221,8 @@ export class FlyCloudHelperDatabase {
       await this.query.raw("PRAGMA journal_mode = WAL");
       await this.query.raw("PRAGMA foreign_keys = ON");
       await this.query.raw("PRAGMA busy_timeout = 5000");
+    } else {
+      await ensureRemoteDatabase(this.config, this.bootstrapLogger);
     }
     await migrateDatabase(this.query);
   }

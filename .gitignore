@@ -35,6 +35,9 @@ logs/
 *.log
 *.pid
 
+# 本地设计与实施文档，不纳入 Git 管理
+doc/
+
 # 本地数据库及其临时文件
 *.db
 *.db-*
@@ -57,4 +60,3 @@ docker-compose.override.yaml
 *.iml
 .DS_Store
 Thumbs.db
-

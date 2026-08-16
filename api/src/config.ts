@@ -12,6 +12,7 @@ export interface ApiConfig {
   databaseType: DatabaseType;
   sqlitePath: string;
   databaseUrl: string | null;
+  databaseAutoCreate: boolean;
   webSessionTtlSeconds: number;
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
@@ -213,16 +214,61 @@ function readDatabaseType(): DatabaseType {
   return rawType;
 }
 
-/** 加载并校验 API、数据库、Worker 和 Secret 运行配置。 */
-export function loadApiConfig(): ApiConfig {
-  const databaseType = readDatabaseType();
+/** 校验自动创建数据库时可安全引用的数据库名称。 */
+function validateDatabaseName(databaseName: string): string {
+  if (!/^[A-Za-z0-9_]+$/.test(databaseName) || databaseName.length > 63) {
+    throw new Error("数据库名称只能包含英文字母、数字和下划线，且不能超过 63 个字符");
+  }
+  return databaseName;
+}
+
+/** 使用拆分环境变量生成数据库连接地址，密码中的特殊字符会被自动编码。 */
+function buildSeparatedDatabaseUrl(databaseType: Exclude<DatabaseType, "sqlite">): string {
+  const databaseHost = readEnvironmentValue("FLYCLOUDHELPER_DATABASE_HOST");
+  const databaseName = readEnvironmentValue("FLYCLOUDHELPER_DATABASE_NAME");
+  const databaseUser = readEnvironmentValue("FLYCLOUDHELPER_DATABASE_USER");
+  const databasePassword = readSecret(
+    "FLYCLOUDHELPER_DATABASE_PASSWORD",
+    "FLYCLOUDHELPER_DATABASE_PASSWORD_FILE",
+  ).value;
+  const missingFields = [
+    ["FLYCLOUDHELPER_DATABASE_HOST", databaseHost],
+    ["FLYCLOUDHELPER_DATABASE_NAME", databaseName],
+    ["FLYCLOUDHELPER_DATABASE_USER", databaseUser],
+    ["FLYCLOUDHELPER_DATABASE_PASSWORD", databasePassword],
+  ].filter(([, value]) => !value).map(([name]) => name);
+  if (missingFields.length > 0) {
+    throw new Error(`${databaseType} 模式缺少数据库配置：${missingFields.join("、")}`);
+  }
+
+  const connectionUrl = new URL(databaseType === "postgres" ? "postgresql://localhost" : "mysql://localhost");
+  connectionUrl.hostname = databaseHost!;
+  connectionUrl.port = String(readPositiveInteger(
+    "FLYCLOUDHELPER_DATABASE_PORT",
+    databaseType === "postgres" ? 5432 : 3306,
+  ));
+  connectionUrl.username = databaseUser!;
+  connectionUrl.password = databasePassword!;
+  connectionUrl.pathname = `/${validateDatabaseName(databaseName!)}`;
+  return connectionUrl.toString();
+}
+
+/** 兼容完整连接 URL，并在未配置 URL 时读取拆分数据库字段。 */
+function resolveDatabaseUrl(databaseType: DatabaseType): string | null {
+  if (databaseType === "sqlite") {
+    return null;
+  }
   const databaseSecret = readSecret(
     "FLYCLOUDHELPER_DATABASE_URL",
     "FLYCLOUDHELPER_DATABASE_URL_FILE",
   );
-  if (databaseType !== "sqlite" && !databaseSecret.value) {
-    throw new Error(`${databaseType} 模式必须配置 FLYCLOUDHELPER_DATABASE_URL 或对应 Secret 文件`);
-  }
+  return databaseSecret.value || buildSeparatedDatabaseUrl(databaseType);
+}
+
+/** 加载并校验 API、数据库、Worker 和 Secret 运行配置。 */
+export function loadApiConfig(): ApiConfig {
+  const databaseType = readDatabaseType();
+  const databaseUrl = resolveDatabaseUrl(databaseType);
   const credentialSecret = loadOrCreateCredentialMasterKey();
   const acoustidSecret = readSecret(
     "FLYCLOUDHELPER_ACOUSTID_API_KEY",
@@ -231,10 +277,11 @@ export function loadApiConfig(): ApiConfig {
 
   return {
     host: readEnvironmentValue("FLYCLOUDHELPER_API_HOST") || "0.0.0.0",
-    port: readPositiveInteger("FLYCLOUDHELPER_API_PORT", 4174),
+    port: readPositiveInteger("FLYCLOUDHELPER_API_PORT", 9934),
     databaseType,
     sqlitePath: resolveSqlitePath(),
-    databaseUrl: databaseSecret.value,
+    databaseUrl,
+    databaseAutoCreate: readBoolean("FLYCLOUDHELPER_DATABASE_AUTO_CREATE", true),
     webSessionTtlSeconds: readPositiveInteger(
       "FLYCLOUDHELPER_WEB_SESSION_TTL_SECONDS",
       30 * 24 * 60 * 60,
@@ -256,7 +303,7 @@ export function loadApiConfig(): ApiConfig {
     tmdbPerKeyConcurrency: readPositiveInteger("FLYCLOUDHELPER_TMDB_PER_KEY_CONCURRENCY", 1),
     tmdbMaxConcurrency: readPositiveInteger("FLYCLOUDHELPER_TMDB_MAX_CONCURRENCY", 32),
     musicbrainzUserAgent: readEnvironmentValue("FLYCLOUDHELPER_MUSICBRAINZ_USER_AGENT")
-      || "FlyCloudHelper/0.1.0 (self-hosted)",
+      || "FlyCloudHelper/0.1.1 (self-hosted)",
     acoustidApiKey: acoustidSecret.value,
     fpcalcPath: readEnvironmentValue("FLYCLOUDHELPER_FPCALC_PATH") || null,
     workerEnabled: readBoolean("FLYCLOUDHELPER_WORKER_ENABLED", true),

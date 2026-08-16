@@ -88,7 +88,7 @@ async function resolveProviderUrl(
     throw new ApiError(400, "provider_url_insecure", "当前实例不允许 Provider 使用 HTTP，请启用 FLYCLOUDHELPER_ALLOW_INSECURE_HTTP");
   }
 
-  let addresses: Array<{ address: string; family: 4 | 6 }>;
+  let addresses: Array<{ address: string; family: number }>;
   try {
     addresses = await dns.lookup(url.hostname, { all: true, verbatim: true });
   } catch {
@@ -101,7 +101,8 @@ async function resolveProviderUrl(
   if (!selectedAddress || (selectedAddress.family !== 4 && selectedAddress.family !== 6)) {
     throw new ApiError(503, "provider_resolved_address_invalid", "Provider 域名未解析到可用的 IPv4 或 IPv6 地址，请检查 DNS 或系统代理设置");
   }
-  return { url, address: selectedAddress.address, family: selectedAddress.family };
+  const selectedFamily: 4 | 6 = selectedAddress.family;
+  return { url, address: selectedAddress.address, family: selectedFamily };
 }
 
 /** 校验 Provider URL，供 Provider 在构造派生路径前使用。 */
@@ -113,7 +114,7 @@ export async function validateProviderUrl(
 }
 
 /** 把当前内置 Provider 支持的请求体转换为原生 HTTP 可写数据。 */
-function toRequestBody(body: BodyInit | null | undefined): string | Uint8Array | undefined {
+function toRequestBody(body: RequestInit["body"]): string | Uint8Array | undefined {
   if (body === undefined || body === null) {
     return undefined;
   }

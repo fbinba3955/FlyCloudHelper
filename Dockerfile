@@ -1,4 +1,7 @@
-FROM node:20-bookworm-slim AS build
+# syntax=docker/dockerfile:1
+
+# 编译阶段固定使用构建主机架构，避免在跨架构仿真中运行 esbuild。
+FROM --platform=$BUILDPLATFORM node:20-bookworm-slim AS build
 
 WORKDIR /app
 
@@ -10,13 +13,22 @@ RUN npm ci
 COPY api ./api
 COPY web ./web
 RUN npm run build
-RUN npm prune --omit=dev
+
+# 运行依赖按目标架构单独安装，确保 argon2、better-sqlite3 等原生模块可用。
+FROM node:20-bookworm-slim AS production-dependencies
+
+WORKDIR /app
+
+COPY package.json package-lock.json tsconfig.json ./
+COPY api/package.json api/tsconfig.json api/tsconfig.build.json ./api/
+COPY web/package.json web/tsconfig.json ./web/
+RUN npm ci --omit=dev
 
 FROM node:20-bookworm-slim AS runtime
 
 ENV NODE_ENV=production \
     FLYCLOUDHELPER_API_HOST=0.0.0.0 \
-    FLYCLOUDHELPER_API_PORT=4174 \
+    FLYCLOUDHELPER_API_PORT=9934 \
     FLYCLOUDHELPER_DATABASE_TYPE=sqlite \
     FLYCLOUDHELPER_SQLITE_PATH=/data/database/flycloud-helper.db \
     FLYCLOUDHELPER_GENERATED_CREDENTIAL_KEY_PATH=/data/secrets/credential-master-key \
@@ -26,7 +38,8 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
-COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules
+COPY --from=production-dependencies --chown=node:node /app/api/node_modules ./api/node_modules
 COPY --from=build --chown=node:node /app/package.json ./package.json
 COPY --from=build --chown=node:node /app/api/package.json ./api/package.json
 COPY --from=build --chown=node:node /app/api/dist ./api/dist
@@ -35,7 +48,7 @@ COPY --from=build --chown=node:node /app/web/dist ./web/dist
 RUN mkdir -p /data/database /data/secrets /data/plugins /data/exports && chown -R node:node /data
 
 USER node
-EXPOSE 4174
+EXPOSE 9934
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
