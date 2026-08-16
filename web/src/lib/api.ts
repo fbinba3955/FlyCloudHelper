@@ -74,7 +74,7 @@ export type MediaType = "video" | "music" | "audiobook";
 export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | "title_asc";
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";
-export type JobStatus = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
+export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "completed" | "failed" | "cancelled";
 
 export interface OverviewResult {
   serviceCount: number;
@@ -178,7 +178,11 @@ export interface ScanJob {
   currentPath: string | null;
   errorCode: string | null;
   errorMessage: string | null;
+  nextRetryAt: string | null;
+  retryCount: number;
   snapshot: Record<string, unknown>;
+  checkpointUpdatedAt: string | null;
+  resumeSupported: boolean;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
@@ -410,6 +414,24 @@ export async function retryScanJob(jobId: string, admin = false): Promise<ScanJo
 export async function cancelScanJob(jobId: string, admin = false): Promise<ScanJob> {
   const result = await requestJson<{ job: ScanJob }>(
     admin ? `/api/v1/admin/jobs/${jobId}/cancel` : `/api/v1/scan-jobs/${jobId}/cancel`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+  return result.job;
+}
+
+/** 请求在安全检查点暂停排队中或运行中的扫描任务。 */
+export async function pauseScanJob(jobId: string, admin = false): Promise<ScanJob> {
+  const result = await requestJson<{ job: ScanJob }>(
+    admin ? `/api/v1/admin/jobs/${jobId}/pause` : `/api/v1/scan-jobs/${jobId}/pause`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+  return result.job;
+}
+
+/** 继续已暂停任务；服务端复用原扫描会话和目录检查点。 */
+export async function resumeScanJob(jobId: string, admin = false): Promise<ScanJob> {
+  const result = await requestJson<{ job: ScanJob }>(
+    admin ? `/api/v1/admin/jobs/${jobId}/resume` : `/api/v1/scan-jobs/${jobId}/resume`,
     { method: "POST", body: JSON.stringify({}) },
   );
   return result.job;

@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { Radio, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
+import { Pause, Play, Radio, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
@@ -8,6 +8,8 @@ import {
   deleteScanJob,
   listJobs,
   listServices,
+  pauseScanJob,
+  resumeScanJob,
   retryScanJob,
   type JobStatus,
 } from "@/lib/api";
@@ -19,6 +21,7 @@ const JOB_PROGRESS_REFRESH_INTERVAL_MS = 5_000;
 const jobStatusLabels: Record<JobStatus, string> = {
   queued: "排队中",
   running: "运行中",
+  retry_waiting: "等待 TMDB 恢复",
   paused: "已暂停",
   completed: "已完成",
   failed: "失败",
@@ -75,6 +78,13 @@ function formatOptionalCount(value: number | null): string {
   return value === null ? "—" : value.toLocaleString();
 }
 
+/** 把服务端 ISO 时间转换为当前浏览器本地时间。 */
+function formatCheckpointTime(value: string | null): string {
+  if (!value) return "尚未保存";
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? value : timestamp.toLocaleString("zh-CN", { hour12: false });
+}
+
 /** 旧任务曾把所有网盘文件计入发现数，改用已处理和错误数避免继续显示非媒体文件总量。 */
 function getScannedMediaCount(job: {
   discoveredCount: number;
@@ -120,7 +130,7 @@ function getJobPluginSnapshots(snapshot: Record<string, unknown>): JobPluginSnap
 function getJobTone(status: JobStatus): StatusTone {
   if (status === "completed") return "success";
   if (status === "failed" || status === "cancelled") return "danger";
-  if (status === "queued" || status === "paused") return "warning";
+  if (status === "queued" || status === "retry_waiting" || status === "paused") return "warning";
   return "primary";
 }
 
@@ -133,7 +143,9 @@ function JobsView({ admin }: { admin: boolean }) {
   const activeJob = jobs.find((job) => job.id === selectedJobId) ?? jobs[0];
   // 只有终态失败任务允许生成重试任务，避免把正常扫描误认为重试。
   const canRetryActiveJob = activeJob?.status === "failed" || activeJob?.status === "cancelled";
-  const canCancelActiveJob = Boolean(activeJob && ["queued", "running", "paused"].includes(activeJob.status));
+  const canPauseActiveJob = activeJob?.status === "queued" || activeJob?.status === "running" || activeJob?.status === "retry_waiting";
+  const canResumeActiveJob = activeJob?.status === "paused";
+  const canCancelActiveJob = Boolean(activeJob && ["queued", "running", "retry_waiting", "paused"].includes(activeJob.status));
   const canDeleteActiveJob = Boolean(activeJob && ["completed", "failed", "cancelled"].includes(activeJob.status));
   const snapshotFields = activeJob ? getJobSnapshotFields(activeJob.snapshot) : [];
   const pluginSnapshots = activeJob ? getJobPluginSnapshots(activeJob.snapshot) : [];
@@ -181,6 +193,32 @@ function JobsView({ admin }: { admin: boolean }) {
     }
   }
 
+  /** 请求 Worker 在安全边界暂停当前任务。 */
+  async function pauseSelectedJob(): Promise<void> {
+    if (!activeJob || !canPauseActiveJob) return;
+    setMessage("正在提交暂停请求…");
+    try {
+      await pauseScanJob(activeJob.id, admin);
+      setMessage(`任务 ${activeJob.id} 将在安全检查点暂停`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "暂停任务失败");
+    }
+  }
+
+  /** 继续已暂停任务，服务端会从持久化目录游标恢复。 */
+  async function resumeSelectedJob(): Promise<void> {
+    if (!activeJob || !canResumeActiveJob) return;
+    setMessage("正在恢复扫描任务…");
+    try {
+      await resumeScanJob(activeJob.id, admin);
+      setMessage(`任务 ${activeJob.id} 已恢复到队列`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "继续任务失败");
+    }
+  }
+
   /** 二次确认后删除终态任务及其进度事件。 */
   async function deleteSelectedJob(): Promise<void> {
     if (!activeJob || !canDeleteActiveJob) return;
@@ -200,7 +238,7 @@ function JobsView({ admin }: { admin: boolean }) {
     <>
       <PageHeader
         title={admin ? "全部扫描任务" : "扫描任务"}
-        actions={<><SecondaryButton onClick={() => void resource.refresh()}><Radio className="size-4" /> 每 5 秒刷新</SecondaryButton><SecondaryButton onClick={() => void cancelSelectedJob()} disabled={!canCancelActiveJob}><Square className="size-4" /> 终止任务</SecondaryButton><PrimaryButton onClick={() => void retrySelectedJob()} disabled={!canRetryActiveJob}><RotateCcw className="size-4" /> 重试失败任务</PrimaryButton><button type="button" onClick={() => void deleteSelectedJob()} disabled={!canDeleteActiveJob} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> 删除任务</button></>}
+        actions={<><SecondaryButton onClick={() => void resource.refresh()}><Radio className="size-4" /> 每 5 秒刷新</SecondaryButton><SecondaryButton onClick={() => void pauseSelectedJob()} disabled={!canPauseActiveJob}><Pause className="size-4" /> 暂停</SecondaryButton><SecondaryButton onClick={() => void resumeSelectedJob()} disabled={!canResumeActiveJob}><Play className="size-4" /> 继续</SecondaryButton><SecondaryButton onClick={() => void cancelSelectedJob()} disabled={!canCancelActiveJob}><Square className="size-4" /> 终止任务</SecondaryButton><PrimaryButton onClick={() => void retrySelectedJob()} disabled={!canRetryActiveJob}><RotateCcw className="size-4" /> 重试失败任务</PrimaryButton><button type="button" onClick={() => void deleteSelectedJob()} disabled={!canDeleteActiveJob} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> 删除任务</button></>}
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
       {!activeJob ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "还没有扫描任务"}</div></Panel> : (
@@ -212,7 +250,9 @@ function JobsView({ admin }: { admin: boolean }) {
               <div className="mt-3 min-w-0 rounded-lg border border-border/70 bg-background/30 px-3 py-2">
                 <p className="text-[11px] text-muted-foreground">当前扫描路径</p>
                 <p className="mt-1 truncate font-mono text-xs" title={activeJob.currentPath ?? undefined}>{activeJob.currentPath || "准备读取扫描目录"}</p>
+                {activeJob.resumeSupported && <p className="mt-2 text-[11px] text-muted-foreground">可恢复检查点：{formatCheckpointTime(activeJob.checkpointUpdatedAt)}</p>}
               </div>
+              {activeJob.status === "retry_waiting" && <div className="mt-3 rounded-lg border border-warning/30 bg-warning/8 px-3 py-2"><p className="text-sm font-medium">TMDB 暂时不可用，任务会自动恢复</p><p className="mt-1 text-[11px] text-muted-foreground">预计恢复时间：{formatCheckpointTime(activeJob.nextRetryAt)} · 已等待 {activeJob.retryCount.toLocaleString()} 次</p></div>}
               <div className="mt-3 grid grid-cols-2 gap-3 font-mono text-[11px] text-muted-foreground sm:grid-cols-5">
                 <span title="扫描路径中识别出的可处理媒体文件数量">{getScannedMediaLabel(activeJob.dataType)} {getScannedMediaCount(activeJob).toLocaleString()}</span>
                 <span title="按 Flymby APP 刮削任务聚合后，已经成功处理或最终失败的完整电影、节目数量">{getProcessedMediaLabel(activeJob.dataType)} {activeJob.processedCount.toLocaleString()}</span>
@@ -231,7 +271,7 @@ function JobsView({ admin }: { admin: boolean }) {
                 {pluginSnapshots.length === 0 ? <p className="mt-2 text-sm">未使用插件</p> : <ul className="mt-2 space-y-2">{pluginSnapshots.map((plugin) => <li key={`${plugin.pluginId}@${plugin.version}`} className="rounded-lg border border-border bg-background/35 px-3 py-2"><p className="text-sm">{plugin.pluginId} · {plugin.version}</p><p className="mt-1 text-[11px] text-muted-foreground">配置 {plugin.configurationRevision}{plugin.sha256 ? ` · SHA256 ${plugin.sha256.slice(0, 12)}` : ""}</p></li>)}</ul>}
               </div>
             </div>
-            {(activeJob.errorCode || activeJob.errorMessage) && <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive/8 p-4"><p className="font-mono text-xs text-destructive">{activeJob.errorCode}</p><p className="mt-2 text-sm">{activeJob.errorMessage}</p></div>}
+            {activeJob.status !== "retry_waiting" && (activeJob.errorCode || activeJob.errorMessage) && <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive/8 p-4"><p className="font-mono text-xs text-destructive">{activeJob.errorCode}</p><p className="mt-2 text-sm">{activeJob.errorMessage}</p></div>}
           </Panel>
           <Panel title="任务列表" description={`共 ${resource.data?.total ?? 0} 个任务`}>
             <ul className="space-y-2">

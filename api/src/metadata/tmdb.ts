@@ -7,6 +7,10 @@ interface TmdbKeyState {
   inFlight: number;
   cooldownUntil: number;
   disabled: boolean;
+  /** 连续临时失败次数，用于计算单 Key 的短暂退避时间。 */
+  temporaryFailureCount: number;
+  /** 最近一次临时退出调度池的原因，不包含 Key 原文。 */
+  temporaryReason: TmdbTemporarilyUnavailableError["reasonCode"] | null;
 }
 
 interface TmdbSearchCandidate {
@@ -24,6 +28,8 @@ interface TmdbSearchCandidate {
 
 type TmdbDiagnosticLogger = (fields: Record<string, unknown>) => void;
 
+const TMDB_REQUEST_TIMEOUT_MS = 20_000;
+
 /** 区分 TMDB 的未找到与真实请求失败，避免把网络异常统计成“未匹配”。 */
 class TmdbRequestError extends Error {
   public readonly status: number;
@@ -33,6 +39,32 @@ class TmdbRequestError extends Error {
     this.name = "TmdbRequestError";
     this.status = status;
   }
+}
+
+/** 表示 TMDB Key 池暂时没有可用 Key，Worker 应保留检查点并延迟恢复。 */
+export class TmdbTemporarilyUnavailableError extends Error {
+  public readonly code = "tmdb_temporarily_unavailable";
+  public readonly nextRetryAt: string;
+  public readonly reasonCode: "tmdb_rate_limit" | "tmdb_server_error" | "tmdb_network";
+
+  public constructor(
+    nextRetryAt: string,
+    reasonCode: "tmdb_rate_limit" | "tmdb_server_error" | "tmdb_network",
+  ) {
+    super(`TMDB 暂时不可用，将在 ${nextRetryAt} 后自动恢复`);
+    this.name = "TmdbTemporarilyUnavailableError";
+    this.nextRetryAt = nextRetryAt;
+    this.reasonCode = reasonCode;
+  }
+}
+
+/** 判断未知异常是否为任务级 TMDB 延迟恢复信号。 */
+export function isTmdbTemporarilyUnavailableError(error: unknown): error is TmdbTemporarilyUnavailableError {
+  return error instanceof TmdbTemporarilyUnavailableError
+    || Boolean(error && typeof error === "object"
+      && "code" in error
+      && String((error as { code?: string }).code) === "tmdb_temporarily_unavailable"
+      && "nextRetryAt" in error);
 }
 
 /** 提供给手动匹配页面展示的安全 TMDB 候选摘要。 */
@@ -121,7 +153,14 @@ export class TmdbKeyPool {
   private revisionValue: string;
 
   public constructor(config: ApiConfig, keys: string[] = [], diagnosticLogger: TmdbDiagnosticLogger = () => undefined) {
-    this.states = keys.map((key) => ({ key, inFlight: 0, cooldownUntil: 0, disabled: false }));
+    this.states = keys.map((key) => ({
+      key,
+      inFlight: 0,
+      cooldownUntil: 0,
+      disabled: false,
+      temporaryFailureCount: 0,
+      temporaryReason: null,
+    }));
     this.perKeyConcurrency = config.tmdbPerKeyConcurrency;
     this.maxConcurrency = config.tmdbMaxConcurrency;
     this.diagnosticLogger = diagnosticLogger;
@@ -141,6 +180,8 @@ export class TmdbKeyPool {
       inFlight: 0,
       cooldownUntil: 0,
       disabled: false,
+      temporaryFailureCount: 0,
+      temporaryReason: null,
     });
     this.revisionValue = this.createRevision(keys);
   }
@@ -158,6 +199,20 @@ export class TmdbKeyPool {
       effectiveConcurrency: Math.min(this.maxConcurrency, healthy * this.perKeyConcurrency),
       revision: this.revision,
     };
+  }
+
+  /** 所有未禁用 Key 均在冷却时，返回最早可重试时间对应的任务级恢复信号。 */
+  public getTemporaryUnavailableError(): TmdbTemporarilyUnavailableError | null {
+    const now = Date.now();
+    const coolingStates = this.states.filter((state) => !state.disabled && state.cooldownUntil > now);
+    const hasHealthyState = this.states.some((state) => !state.disabled && state.cooldownUntil <= now);
+    if (hasHealthyState || coolingStates.length === 0) return null;
+    const nextState = [...coolingStates].sort((left, right) => left.cooldownUntil - right.cooldownUntil)[0]!;
+    const nextRetryTimestamp = nextState.cooldownUntil;
+    return new TmdbTemporarilyUnavailableError(
+      new Date(Math.max(now + 1_000, nextRetryTimestamp)).toISOString(),
+      nextState.temporaryReason ?? "tmdb_network",
+    );
   }
 
   /**
@@ -484,11 +539,13 @@ export class TmdbKeyPool {
   private async requestJson<T>(pathname: string, params: Record<string, string>, signal?: AbortSignal): Promise<T | null> {
     const attemptedKeys = new Set<string>();
     let lastError: TmdbRequestError | null = null;
+    let temporaryReason: TmdbTemporarilyUnavailableError["reasonCode"] | null = null;
     while (attemptedKeys.size < this.states.length) {
       const state = await this.acquireKey(signal, attemptedKeys);
       // 关键变量：已有 Key 请求失败后若没有其他可尝试 Key，必须在循环后抛出原错误，不能误报为未匹配。
       if (!state) break;
       attemptedKeys.add(state.key);
+      const requestSignal = createTimedRequestSignal(signal, TMDB_REQUEST_TIMEOUT_MS);
       try {
         const url = new URL(`https://api.themoviedb.org/3${pathname}`);
         Object.entries(params).forEach(([key, value]) => {
@@ -497,33 +554,64 @@ export class TmdbKeyPool {
         const headers: Record<string, string> = { Accept: "application/json" };
         if (state.key.startsWith("eyJ")) headers.Authorization = `Bearer ${state.key}`;
         else url.searchParams.set("api_key", state.key);
-        const response = await fetch(url, { headers, signal });
+        const response = await fetch(url, { headers, signal: requestSignal.signal });
         if (response.status === 401 || response.status === 403) {
           state.disabled = true;
           lastError = new TmdbRequestError("TMDB Key 无效或无权访问", response.status);
           continue;
         }
         if (response.status === 429) {
-          const retryAfter = Number(response.headers.get("retry-after") ?? 60);
-          state.cooldownUntil = Date.now() + Math.max(1, retryAfter) * 1000;
+          const retryAfter = readRetryAfterSeconds(response.headers.get("retry-after"));
+          state.temporaryFailureCount += 1;
+          state.cooldownUntil = Date.now() + retryAfter * 1000;
+          temporaryReason = "tmdb_rate_limit";
+          state.temporaryReason = temporaryReason;
           lastError = new TmdbRequestError("TMDB 请求被限流，请稍后重试", response.status);
+          this.logTemporaryKeyFailure(state, response.status, retryAfter, temporaryReason);
           continue;
         }
         if (response.status === 404) return null;
+        if (response.status >= 500) {
+          const retryAfter = readRetryAfterSeconds(
+            response.headers.get("retry-after"),
+            createTemporaryBackoffSeconds(state.temporaryFailureCount),
+          );
+          state.temporaryFailureCount += 1;
+          state.cooldownUntil = Date.now() + retryAfter * 1000;
+          temporaryReason = "tmdb_server_error";
+          state.temporaryReason = temporaryReason;
+          lastError = new TmdbRequestError(`TMDB 服务暂时异常，状态码 ${response.status}`, response.status);
+          this.logTemporaryKeyFailure(state, response.status, retryAfter, temporaryReason);
+          continue;
+        }
         if (!response.ok) {
           throw new TmdbRequestError(`TMDB 请求失败，状态码 ${response.status}`, response.status);
         }
-        return await response.json() as T;
+        const payload = await response.json() as T;
+        state.temporaryFailureCount = 0;
+        if (state.cooldownUntil <= Date.now()) state.temporaryReason = null;
+        return payload;
       } catch (error) {
         if (signal?.aborted) throw error;
-        lastError = error instanceof TmdbRequestError
-          ? error
-          : new TmdbRequestError(error instanceof Error ? `TMDB 请求失败：${error.message}` : "TMDB 请求失败");
-        break;
+        if (error instanceof TmdbRequestError) {
+          lastError = error;
+          break;
+        }
+        const retryAfter = createTemporaryBackoffSeconds(state.temporaryFailureCount);
+        state.temporaryFailureCount += 1;
+        state.cooldownUntil = Date.now() + retryAfter * 1000;
+        temporaryReason = "tmdb_network";
+        state.temporaryReason = temporaryReason;
+        lastError = new TmdbRequestError(error instanceof Error ? `TMDB 请求失败：${error.message}` : "TMDB 请求失败");
+        this.logTemporaryKeyFailure(state, 0, retryAfter, temporaryReason);
+        continue;
       } finally {
+        requestSignal.dispose();
         state.inFlight -= 1;
       }
     }
+    const temporaryError = this.getTemporaryUnavailableError();
+    if (temporaryError) throw temporaryError;
     if (lastError) throw lastError;
     return null;
   }
@@ -535,6 +623,8 @@ export class TmdbKeyPool {
       const candidates = this.states.filter((state) => !state.disabled && !excludedKeys.has(state.key));
       if (candidates.length === 0) return null;
       const now = Date.now();
+      // 所有剩余候选都在冷却时立即交回调用方，避免单次请求在 Key 池内部无限等待。
+      if (!candidates.some((state) => state.cooldownUntil <= now)) return null;
       const globalInFlight = this.states.reduce((sum, state) => sum + state.inFlight, 0);
       const available = candidates
         .filter((state) => state.cooldownUntil <= now && state.inFlight < this.perKeyConcurrency)
@@ -551,6 +641,64 @@ export class TmdbKeyPool {
   private createRevision(keys: string[]): string {
     return createHash("sha256").update(keys.join("\u0000")).digest("hex").slice(0, 16);
   }
+
+  /** 记录单 Key 临时退出调度池的原因，不输出 Key 原文。 */
+  private logTemporaryKeyFailure(
+    state: TmdbKeyState,
+    status: number,
+    retryAfterSeconds: number,
+    reasonCode: TmdbTemporarilyUnavailableError["reasonCode"],
+  ): void {
+    this.diagnosticLogger({
+      日志关键字: "codex-flycloud-helper-tmdb-recovery",
+      事件: "TMDB Key进入临时冷却",
+      原因代码: reasonCode,
+      响应状态码: status,
+      连续临时失败次数: state.temporaryFailureCount,
+      冷却秒数: retryAfterSeconds,
+      下次可用时间: new Date(state.cooldownUntil).toISOString(),
+    });
+  }
+}
+
+/** 读取 Retry-After 秒数并限制为 1 秒到 30 分钟，非法值使用调用方默认值。 */
+function readRetryAfterSeconds(value: string | null, fallback = 60): number {
+  const numericSeconds = Number(value);
+  if (Number.isFinite(numericSeconds) && numericSeconds > 0) {
+    return Math.min(1_800, Math.max(1, Math.ceil(numericSeconds)));
+  }
+  if (value) {
+    const dateTimestamp = Date.parse(value);
+    if (Number.isFinite(dateTimestamp)) {
+      return Math.min(1_800, Math.max(1, Math.ceil((dateTimestamp - Date.now()) / 1_000)));
+    }
+  }
+  return Math.min(1_800, Math.max(1, Math.ceil(fallback)));
+}
+
+/** 为 5xx 和网络异常计算单 Key 指数退避，最大等待 5 分钟。 */
+function createTemporaryBackoffSeconds(failureCount: number): number {
+  return Math.min(300, 15 * (2 ** Math.min(4, Math.max(0, failureCount))));
+}
+
+/** 合并扫描取消信号和单次 TMDB 请求超时，释放时同步移除监听器。 */
+function createTimedRequestSignal(parentSignal: AbortSignal | undefined, timeoutMs: number): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  const controller = new AbortController();
+  /** 扫描任务取消时立即取消当前 TMDB 请求。 */
+  const abortFromParent = (): void => controller.abort();
+  if (parentSignal?.aborted) controller.abort();
+  else parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timeout);
+      parentSignal?.removeEventListener("abort", abortFromParent);
+    },
+  };
 }
 
 /** 将未知 JSON 值收窄为普通对象。 */

@@ -1,7 +1,7 @@
 export type UserRole = "user" | "super_admin";
 export type UserStatus = "active" | "disabled" | "pending_delete";
 export type ServiceStatus = "active" | "scanning" | "reauthorization_required" | "disabled";
-export type JobStatus = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
+export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "completed" | "failed" | "cancelled";
 export type JobStage = "queued" | "enumerating" | "classifying" | "scraping" | "persisting" | "completed";
 export type MediaType = "video" | "music" | "audiobook";
 export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | "title_asc";
@@ -81,8 +81,16 @@ export interface ScanJobRecord {
   currentPath: string | null;
   errorCode: string | null;
   errorMessage: string | null;
+  /** TMDB 临时不可用时，任务下一次自动恢复的时间。 */
+  nextRetryAt: string | null;
+  /** 当前任务已经进入延迟恢复状态的累计次数。 */
+  retryCount: number;
   snapshot: Record<string, unknown>;
   controlAction: "none" | "pause" | "cancel";
+  /** 最近一次可恢复安全检查点时间；终态任务清理后为空。 */
+  checkpointUpdatedAt: string | null;
+  /** 当前任务是否存在可供暂停/进程恢复使用的检查点。 */
+  resumeSupported: boolean;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
@@ -102,6 +110,8 @@ export interface SourceFileRecord {
   size: number;
   modifiedAt: string | null;
   etag: string | null;
+  /** 文件所属的稳定扫描根键，用于只对完整根执行缺失对账。 */
+  scanRootKey: string;
   generationId: string;
   locator: Record<string, unknown>;
 }

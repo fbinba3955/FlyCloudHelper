@@ -25,7 +25,7 @@ import {
 import { useApiResource } from "@/lib/use-api-resource";
 
 const jobStatusLabels: Record<JobStatus, string> = {
-  queued: "排队中", running: "运行中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消",
+  queued: "排队中", running: "运行中", retry_waiting: "等待 TMDB 恢复", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消",
 };
 
 const userRoleLabels: Record<AuthRole, string> = {
@@ -144,7 +144,7 @@ export function AdminOverviewPage() {
           <SystemConfigurationSummary config={config} />
         </Panel>
         <Panel title="最近任务" description="跨用户任务进度" className="xl:col-span-2">
-          <ul className="space-y-2.5">{jobs.slice(0, 8).map((job) => <li key={job.id} className="rounded-xl border border-border bg-secondary/40 p-3.5"><div className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="truncate text-sm">{job.serviceName}</p><p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{job.id} · {job.ownerUsername} · {job.stage}</p></div><StatusPill tone={job.status === "failed" ? "danger" : job.status === "completed" ? "success" : "primary"}>{jobStatusLabels[job.status]}</StatusPill></div><div className="mt-2.5"><ProgressMeter value={job.processedCount} total={job.totalCount} /></div></li>)}</ul>
+          <ul className="space-y-2.5">{jobs.slice(0, 8).map((job) => <li key={job.id} className="rounded-xl border border-border bg-secondary/40 p-3.5"><div className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="truncate text-sm">{job.serviceName}</p><p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{job.id} · {job.ownerUsername} · {job.stage}</p></div><StatusPill tone={job.status === "failed" ? "danger" : job.status === "completed" ? "success" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{jobStatusLabels[job.status]}</StatusPill></div><div className="mt-2.5"><ProgressMeter value={job.processedCount} total={job.totalCount} /></div></li>)}</ul>
         </Panel>
       </div>
       <Panel title="需要处理的服务" className="mt-4"><div className="overflow-x-auto"><table className="w-full min-w-[620px] text-left text-xs"><thead className="text-[10px] text-muted-foreground uppercase"><tr><th className="pb-2.5">服务</th><th className="pb-2.5">所属用户</th><th className="pb-2.5">Provider</th><th className="pb-2.5">状态</th></tr></thead><tbody className="divide-y divide-border">{services.filter((service) => service.status !== "active" || service.connectionStatus !== "valid").map((service) => <tr key={service.id}><td className="py-3">{service.displayName}</td><td className="py-3 text-muted-foreground">{service.ownerUsername}</td><td className="py-3 font-mono text-muted-foreground">{service.providerType}</td><td className="py-3"><StatusPill tone="warning">{service.status}</StatusPill></td></tr>)}</tbody></table></div></Panel>

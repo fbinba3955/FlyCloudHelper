@@ -31,6 +31,26 @@ export interface ProviderEnumerationWarning {
   path: string;
 }
 
+/** Provider 可持久化的目录枚举位置；内容不得包含连接凭据。 */
+export interface ProviderEnumerationCheckpoint {
+  providerType: string;
+  version: number;
+  checkpointSequence: number;
+  rootIndex: number;
+  rootWarningCount: number;
+  pendingDirectories: Array<{
+    resourcePath: string;
+    isRoot: boolean;
+  }>;
+}
+
+/** Provider 单个扫描根的运行状态，用于判断该根是否完整枚举。 */
+export interface ProviderRootRunState {
+  rootIndex: number;
+  root: ScanRoot;
+  warningCount: number;
+}
+
 /** 前端路径选择器使用的单个网盘目录。 */
 export interface ProviderDirectory {
   name: string;
@@ -64,6 +84,16 @@ export interface ProviderRecommendedScanSettings {
 /** Worker 交给 Provider 的单次枚举运行参数。 */
 export interface ProviderEnumerationOptions {
   directoryConcurrency: number;
+  /** 上一次安全检查点保存的 Provider 游标。 */
+  resumeState?: Record<string, unknown> | null;
+  /** 每处理多少批目录生成一次可持久化游标。 */
+  checkpointDirectoryInterval?: number;
+  /** 只上报检查点候选，是否持久化由 Worker 在业务任务落库后决定。 */
+  onCheckpoint?: (checkpoint: ProviderEnumerationCheckpoint) => void;
+  /** 扫描根开始时通知 Worker 建立根运行记录。 */
+  onRootStart?: (state: ProviderRootRunState) => Promise<void>;
+  /** 扫描根完成时通知 Worker 提交根运行结果。 */
+  onRootComplete?: (state: ProviderRootRunState) => Promise<void>;
 }
 
 export interface ProviderDescriptor {

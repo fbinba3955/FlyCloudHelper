@@ -689,7 +689,7 @@ Web 静态资源与 API 由同一 FlyCloudHelper 部署提供。前端必须同�
 | `service_metadata_profile` | `tenantId`、`serviceId`、`metadataProfileRevision`、三类媒体刮削配置及选择的元数据来源 |
 | `media_library` | `libraryId`、`tenantId`、`serviceId`、Provider、`catalogVersion`和状态 |
 | `library_root` | 稳定 `resourceId`、展示路径、盘 ID、最后成功 generation |
-| `scan_job` | 任务状态、阶段、计数、`serviceId`、冻结的凭据/扫描/刮削/插件修订引用和检查点 |
+| `scan_job` | 任务状态、阶段、计数、`serviceId`、冻结的凭据/扫描/刮削/插件修订引用、检查点、`nextRetryAt` 和累计延迟恢复次数；临时 TMDB 故障使用 `retry_waiting` |
 | `source_file` | Provider 文件身份、大小、修改时间、ETag、可用状态 |
 | `media_item` | 通用 `mediaType`、`itemType`、标题、排序标题、图片、匹配状态和扩展 schema 版本 |
 | `media_relation` | 父子、合集、艺术家-专辑、专辑-曲目、作品-章节等带类型关系 |
@@ -772,7 +772,7 @@ APP 必须在本地存在与 `libraryId` 关联的网盘服务实例后才能播
 1. `media_item + 类型扩展数据 + media_relation + file_link` 必须以单个可查询聚合事务提交。
 2. 只有完整事务才对查询端可见。
 3. 事务成功后递增 `catalogVersion`并写入 `catalog_change`。
-4. SSE 事件至少包含 `job.progress`、`service.reauthorization_required`、`job.paused`、`job.completed`、`job.failed`、`catalog.item.created`、`catalog.item.updated`、`catalog.item.removed`。
+4. SSE 事件至少包含 `job.progress`、`job.retry_waiting`、`job.queued`、`service.reauthorization_required`、`job.paused`、`job.completed`、`job.failed`、`catalog.item.created`、`catalog.item.updated`、`catalog.item.removed`。
 5. SSE 可断线重连；客户端带上最后版本再调用 `/changes`补齐事件。
 6. 首页、列表、详情和搜索响应都返回当前 `catalogVersion`。
 

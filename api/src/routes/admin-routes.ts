@@ -550,6 +550,34 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     return { job };
   });
 
+  server.post<{ Params: { jobId: string } }>("/api/v1/admin/jobs/:jobId/pause", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const job = await runtime.repository.requestJobControl(request.params.jobId, undefined, "pause");
+    await audit(runtime, operator, "pause_scan_job", "scan_job", job.id);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-job-control",
+      事件: "管理员暂停扫描任务",
+      管理员ID: operator.id,
+      任务ID: job.id,
+      控制动作: "pause",
+    });
+    return { job };
+  });
+
+  server.post<{ Params: { jobId: string } }>("/api/v1/admin/jobs/:jobId/resume", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const job = await runtime.repository.resumeJob(request.params.jobId);
+    await audit(runtime, operator, "resume_scan_job", "scan_job", job.id);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-job-control",
+      事件: "管理员继续扫描任务",
+      管理员ID: operator.id,
+      任务ID: job.id,
+      控制动作: "resume",
+    });
+    return { job };
+  });
+
   server.delete<{ Params: { jobId: string }; Body: Record<string, unknown> }>("/api/v1/admin/jobs/:jobId", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, request.params.jobId);

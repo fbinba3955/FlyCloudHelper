@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 
-export const currentSchemaVersion = 11;
+export const currentSchemaVersion = 13;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -236,6 +236,8 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.text("current_path").nullable();
       table.string("error_code", 100).nullable();
       table.text("error_message").nullable();
+      table.string("next_retry_at", 40).nullable();
+      table.integer("retry_count").notNullable().defaultTo(0);
       table.text("snapshot_json").notNullable();
       table.string("control_action", 32).notNullable().defaultTo("none");
       table.string("created_at", 40).notNullable();
@@ -245,6 +247,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.unique(["tenant_id", "client_device_id", "request_id"], { indexName: "uq_scan_jobs_request" });
       table.index(["tenant_id", "status"], "idx_scan_jobs_tenant_status");
       table.index(["service_id", "status"], "idx_scan_jobs_service_status");
+      table.index(["status", "next_retry_at"], "idx_scan_jobs_retry_due");
     });
   }
   await addColumnIfMissing(database, "scan_jobs", "matched_count", (table) => {
@@ -255,6 +258,14 @@ async function createCatalogTables(database: Knex): Promise<void> {
   });
   await addColumnIfMissing(database, "scan_jobs", "current_path", (table) => {
     table.text("current_path").nullable();
+  });
+  await addColumnIfMissing(database, "scan_jobs", "next_retry_at", (table) => {
+    table.string("next_retry_at", 40).nullable();
+    // 关键索引：Worker 只按等待状态和到期时间查询，不扫描全部历史任务。
+    table.index(["status", "next_retry_at"], "idx_scan_jobs_retry_due");
+  });
+  await addColumnIfMissing(database, "scan_jobs", "retry_count", (table) => {
+    table.integer("retry_count").notNullable().defaultTo(0);
   });
 
   if (!(await database.schema.hasTable("scan_job_events"))) {
@@ -267,6 +278,48 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("created_at", 40).notNullable();
       table.index(["job_id", "sequence"], "idx_scan_job_events_job_sequence");
       table.index(["tenant_id", "sequence"], "idx_scan_job_events_tenant_sequence");
+    });
+  }
+
+  if (!(await database.schema.hasTable("scan_job_checkpoints"))) {
+    await database.schema.createTable("scan_job_checkpoints", (table) => {
+      table.string("job_id", 64).primary().references("id").inTable("scan_jobs").onDelete("CASCADE");
+      table.string("tenant_id", 64).notNullable();
+      table.string("service_id", 64).notNullable();
+      table.string("library_id", 64).notNullable();
+      table.integer("checkpoint_version").notNullable();
+      table.string("scan_session_id", 64).notNullable();
+      table.string("generation_id", 64).notNullable();
+      table.string("provider_type", 64).notNullable();
+      table.text("provider_state_json").notNullable();
+      table.text("progress_json").notNullable();
+      table.text("nfo_sidecars_json").notNullable();
+      table.text("changed_item_ids_json").notNullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.index(["tenant_id", "updated_at"], "idx_scan_job_checkpoints_tenant_updated");
+      table.index(["service_id", "updated_at"], "idx_scan_job_checkpoints_service_updated");
+    });
+  }
+
+  if (!(await database.schema.hasTable("scan_root_runs"))) {
+    await database.schema.createTable("scan_root_runs", (table) => {
+      table.string("id", 64).primary();
+      table.string("job_id", 64).notNullable().references("id").inTable("scan_jobs").onDelete("CASCADE");
+      table.string("tenant_id", 64).notNullable();
+      table.string("service_id", 64).notNullable();
+      table.string("library_id", 64).notNullable();
+      table.string("root_key", 64).notNullable();
+      table.text("root_resource_id").notNullable();
+      table.text("display_path").notNullable();
+      table.string("generation_id", 64).notNullable();
+      table.string("status", 32).notNullable();
+      table.bigInteger("warning_count").notNullable().defaultTo(0);
+      table.string("started_at", 40).notNullable();
+      table.string("finished_at", 40).nullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["job_id", "root_key"], { indexName: "uq_scan_root_runs_job_root" });
+      table.index(["library_id", "status"], "idx_scan_root_runs_library_status");
     });
   }
 
@@ -284,6 +337,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.bigInteger("size").notNullable();
       table.string("modified_at", 40).nullable();
       table.string("etag", 255).nullable();
+      table.string("scan_root_key", 64).nullable();
       table.string("generation_id", 64).notNullable();
       table.text("locator_json").notNullable();
       table.string("status", 32).notNullable();
@@ -291,8 +345,12 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("updated_at", 40).notNullable();
       table.unique(["tenant_id", "library_id", "provider_resource_id"], { indexName: "uq_source_files_resource" });
       table.index(["library_id", "generation_id"], "idx_source_files_generation");
+      table.index(["library_id", "scan_root_key", "generation_id"], "idx_source_files_root_generation");
     });
   }
+  await addColumnIfMissing(database, "source_files", "scan_root_key", (table) => {
+    table.string("scan_root_key", 64).nullable();
+  });
 
   if (!(await database.schema.hasTable("media_items"))) {
     await database.schema.createTable("media_items", (table) => {

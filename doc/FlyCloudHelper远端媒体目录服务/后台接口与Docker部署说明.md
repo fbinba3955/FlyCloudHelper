@@ -8,16 +8,20 @@
 
 1. Fastify REST API、APP Bearer Token、Web HttpOnly Cookie 会话和 SSE 任务事件。
 2. SQLite、PostgreSQL、MySQL 共用的 Knex schema 初始化与数据访问层。
-3. 内置扫描 Worker、任务恢复、暂停、继续、取消、重试和目录 generation 对账。
+3. 内置扫描 Worker、WebDAV 检查点恢复、暂停、继续、取消、重试和目录 generation 对账。
 4. WebDAV、阿里云盘开放接口、百度网盘开放接口和光鸭标准网关 Provider。
 5. 当前影视扫描已对齐 Flymby APP 的文件名清洗、电影/剧集/季集识别、默认排除目录、同名 NFO 优先和 TMDB 电影/电视剧刮削流程。Worker 在一个目录枚举完成后立即构建影片任务并加入刮削队列，扫描与刮削流水线并行，不等待全盘文件枚举完成；音乐和有声书保留处理器与插件扩展位。
 6. 当前开放影视目录、父子关系、APP 文件定位、目录变更和 JSON 快照导出。
 7. 普通用户服务管理，以及超级管理员用户、服务、任务、海报墙、插件、系统状态和审计接口。
 8. 同源提供 `web/dist` 前端静态文件；Web 页面不返回播放定位。
 
-业务日志关键字为 `flycloud-helper-api` 和 `flycloud-helper-worker`。影视刮削可使用 `codex-flycloud-helper-scrape` 筛查，扫描与刮削流水线入队可使用 `codex-flycloud-helper-streaming-scrape` 筛查，服务并发实际取值可使用 `codex-flycloud-helper-worker-tuning` 筛查，Provider 请求异常可使用 `codex-flycloud-helper-provider-request` 筛查，任务重试可使用 `codex-flycloud-helper-job-retry` 筛查。日志结构中的业务变量使用中文 key，并对 Authorization、Cookie、密码、Token 和连接配置进行脱敏。
+业务日志关键字为 `flycloud-helper-api` 和 `flycloud-helper-worker`。影视刮削可使用 `codex-flycloud-helper-scrape` 筛查，扫描与刮削流水线入队可使用 `codex-flycloud-helper-streaming-scrape` 筛查，服务并发实际取值可使用 `codex-flycloud-helper-worker-tuning` 筛查，Provider 请求异常可使用 `codex-flycloud-helper-provider-request` 筛查，任务重试可使用 `codex-flycloud-helper-job-retry` 筛查，检查点建立、保存、恢复和停止保留可使用 `codex-flycloud-helper-checkpoint` 筛查，TMDB Key 冷却、任务等待和到期重新入队可使用 `codex-flycloud-helper-tmdb-recovery` 筛查。日志结构中的业务变量使用中文 key，并对 Authorization、Cookie、密码、Token 和连接配置进行脱敏。
 
-失败或已取消任务通过任务级 `retry` 接口创建新任务，原任务状态、错误和快照保持不变；新任务使用服务当前有效配置，并在快照的 `retryOfJobId` 中记录原任务 ID。增量任务重试时也会重新处理上次已经发现的文件，避免未变更判断把上次失败或未匹配的条目直接跳过。运行中、排队中、暂停中和已完成任务不能走重试接口，其中暂停任务应使用继续接口。
+失败或已取消任务通过任务级 `retry` 接口创建新任务，原任务状态、错误和快照保持不变；新任务使用服务当前有效配置，并在快照的 `retryOfJobId` 中记录原任务 ID。增量任务重试时也会重新处理上次已经发现的文件，避免未变更判断把上次失败或未匹配的条目直接跳过。运行中、排队中、等待 TMDB 恢复、暂停中和已完成任务不能走手动重试接口，其中暂停任务应使用继续接口，`retry_waiting` 任务会由 Worker 到期自动重新入队。
+
+schema 12 新增 `scan_job_checkpoints`、`scan_root_runs` 和 `source_files.scan_root_key`。WebDAV 每 20 批目录生成一次安全游标候选，Worker 只在上一窗口的刮削和持久化完成后提交游标、统计、NFO 白名单结果和变化条目 ID；检查点不保存密码、Token、Cookie、Authorization 或播放定位。暂停和服务进程退出保留最近安全窗口，继续时复用同一 `scanSessionId/generationId` 并重放最近窗口。全量扫描正常进入持久化时只对完整根执行缺失对账，不完整根保留旧数据；后续根发生致命错误前即时提交前序完整根仍待补齐。阿里云盘、百度网盘和光鸭的分页游标尚未接入。
+
+schema 13 为 `scan_jobs` 增加 `next_retry_at`、`retry_count` 及到期查询索引。TMDB 请求遇到 `429`、临时 `5xx`、网络异常或 20 秒请求超时时，先把当前 Key 移入独立冷却并尝试其他健康 Key；只有全部未禁用 Key 都在冷却时，任务才进入 `retry_waiting`。等待任务保留最近安全检查点并回退页面统计，到达 `nextRetryAt` 后由 Worker 自动重新入队，从 WebDAV 检查点窗口继续。`401/403` 会禁用对应 Key，TMDB `404` 或确定没有候选仍按未匹配处理，不进入延迟恢复。单次 `Retry-After` 最长采用 30 分钟，网络和 `5xx` 使用 15 秒起步、最长 5 分钟的单 Key 退避；当前实现未设置累计等待次数上限，用户可以暂停或终止等待任务。
 
 创建云端服务时必须提交服务级 `dataType`。页面展示影视、音乐和有声书三个选项，当前只允许选择 `video`（影视）；后台会拒绝 `music` 和 `audiobook`，并要求扫描范围与元数据配置和服务数据类型一致。现有服务在 schema 7 升级时默认补为 `video`。
 
@@ -186,6 +190,7 @@ npm run start:api
 ## 8. Provider 与插件说明
 
 - WebDAV 使用 RFC 4918 `PROPFIND` 的 `Depth: 0/1` 递归枚举。
+- WebDAV 暂停/继续使用持久化目录窗口；普通用户接口为 `POST /api/v1/scan-jobs/{jobId}/pause|resume`，管理员接口为 `POST /api/v1/admin/jobs/{jobId}/pause|resume`。继续不是新建任务，不更换冻结配置、扫描会话或 generation。
 - WebDAV 返回的目录 `href` 会先解码用于目录身份，再按路径分段重新编码后发起请求，避免 `#`、`?`、空格或中文被解释成 URL 结构。连接验证或扫描根目录访问失败仍终止任务；扫描中的任意单个子目录读取失败时按 Flymby APP 的 `scanOneDirectory` 行为记录并跳过，继续处理其余目录。`401` 表示凭据未被接受，`403` 表示当前资源权限不足，不再把两者都标记为整个服务凭据失效。只要本轮存在目录警告，就禁止缺失文件、排除路径和孤立父项清理，避免不完整枚举误删历史媒体。目录异常筛查关键字为 `codex-flycloud-helper-webdav-directory`，变量 `目录路径`、`响应状态码` 和 `错误码` 表示实际异常请求；通用 Provider 异常仍使用 `codex-flycloud-helper-provider-request`。
 - 阿里云盘使用开放平台文件列表契约，保存 `driveId + fileId` 定位。
 - 百度网盘使用 xpan 文件列表契约，`fsId` 始终按字符串返回。
@@ -199,6 +204,6 @@ npm run start:api
 
 ## 9. 当前验证边界
 
-已在 Node.js 20 下完成 TypeScript API/Web 全量构建，并实际验证 SQLite schema 初始化、系统探测、首次超级管理员创建、Cookie 会话、管理员用户查询、个人概览和生产静态页面返回。
+此前版本已在 Node.js 20 下完成 TypeScript API/Web 全量构建，并实际验证 SQLite schema 初始化、系统探测、首次超级管理员创建、Cookie 会话、管理员用户查询、个人概览和生产静态页面返回。本次 schema 12/13、WebDAV 检查点、暂停/继续及 TMDB 延迟恢复改动按用户要求未编译、未运行真实网盘或限流恢复验证，目前只完成静态差异检查。
 
 当前开发机没有 Docker CLI，因此尚未实际执行镜像构建、Compose 健康检查、PostgreSQL 容器或 MySQL 容器联调。四种真实网盘也需要用户使用自己的有效授权进行连接、分页、限流与大目录验证。

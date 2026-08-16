@@ -639,7 +639,15 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.post<{ Params: { jobId: string } }>("/api/v1/scan-jobs/:jobId/resume", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    return { job: await runtime.repository.resumeJob(request.params.jobId, user.tenantId) };
+    const job = await runtime.repository.resumeJob(request.params.jobId, user.tenantId);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-job-control",
+      事件: "用户继续扫描任务",
+      用户ID: user.id,
+      任务ID: job.id,
+      控制动作: "resume",
+    });
+    return { job };
   });
 
   server.post<{ Params: { jobId: string }; Body: Record<string, unknown> }>("/api/v1/scan-jobs/:jobId/retry", async (request, reply) => {

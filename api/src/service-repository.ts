@@ -67,12 +67,58 @@ interface JobRow {
   current_path: string | null;
   error_code: string | null;
   error_message: string | null;
+  next_retry_at: string | null;
+  retry_count: number | string;
   snapshot_json: string;
   control_action: "none" | "pause" | "cancel";
+  checkpoint_updated_at: string | null;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
   updated_at: string;
+}
+
+/** Worker 持久化的业务统计集合；使用稳定任务键避免续扫后重复计数。 */
+export interface ScanCheckpointProgress {
+  enumeratedEntryCount: number;
+  scannedMediaCount: number;
+  skippedCount: number;
+  currentScanPath: string | null;
+  scannedDirectoryCount: number;
+  providerWarningKeys: string[];
+  taskKeys: string[];
+  processedKeys: string[];
+  matchedKeys: string[];
+  unmatchedKeys: string[];
+  failedKeys: string[];
+  movieTaskKeys: string[];
+  seriesTaskKeys: string[];
+}
+
+/** 单个扫描任务的安全检查点；不包含任何 Provider 连接凭据。 */
+export interface ScanJobCheckpointRecord {
+  jobId: string;
+  tenantId: string;
+  serviceId: string;
+  libraryId: string;
+  checkpointVersion: number;
+  scanSessionId: string;
+  generationId: string;
+  providerType: string;
+  providerState: Record<string, unknown>;
+  progress: ScanCheckpointProgress;
+  nfoSidecars: Record<string, unknown>;
+  changedItemIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 扫描根运行记录，用于区分完整枚举和带警告完成。 */
+export interface ScanRootRunRecord {
+  rootKey: string;
+  generationId: string;
+  status: "running" | "completed" | "incomplete";
+  warningCount: number;
 }
 
 /** 把服务查询行转换为公开服务摘要。 */
@@ -124,8 +170,13 @@ function mapJob(row: JobRow): ScanJobRecord {
     currentPath: row.current_path,
     errorCode: row.error_code,
     errorMessage: row.error_message ? toSafeErrorMessage(row.error_message, "扫描任务失败") : null,
+    nextRetryAt: row.next_retry_at,
+    retryCount: Number(row.retry_count ?? 0),
     snapshot: parseJsonObject(row.snapshot_json),
     controlAction: row.control_action,
+    checkpointUpdatedAt: row.checkpoint_updated_at,
+    resumeSupported: Boolean(row.checkpoint_updated_at)
+      && (row.status === "queued" || row.status === "running" || row.status === "retry_waiting" || row.status === "paused"),
     createdAt: row.created_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
@@ -140,6 +191,59 @@ function chunkStrings(values: string[], size = 400): string[][] {
     chunks.push(values.slice(index, index + size));
   }
   return chunks;
+}
+
+/** 安全解析只允许字符串的 JSON 数组。 */
+function parseStringArray(value: unknown): string[] {
+  if (typeof value !== "string" || !value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 把检查点数据库行转换为 Worker 使用的结构。 */
+function mapScanJobCheckpoint(row: Record<string, unknown>): ScanJobCheckpointRecord {
+  const rawProgress = parseJsonObject(row.progress_json);
+  const readProgressStrings = (key: string): string[] => Array.isArray(rawProgress[key])
+    ? (rawProgress[key] as unknown[]).filter((item): item is string => typeof item === "string")
+    : [];
+  const readProgressNumber = (key: string): number => {
+    const value = Number(rawProgress[key] ?? 0);
+    return Number.isFinite(value) && value >= 0 ? value : 0;
+  };
+  return {
+    jobId: String(row.job_id),
+    tenantId: String(row.tenant_id),
+    serviceId: String(row.service_id),
+    libraryId: String(row.library_id),
+    checkpointVersion: Number(row.checkpoint_version),
+    scanSessionId: String(row.scan_session_id),
+    generationId: String(row.generation_id),
+    providerType: String(row.provider_type),
+    providerState: parseJsonObject(row.provider_state_json),
+    progress: {
+      enumeratedEntryCount: readProgressNumber("enumeratedEntryCount"),
+      scannedMediaCount: readProgressNumber("scannedMediaCount"),
+      skippedCount: readProgressNumber("skippedCount"),
+      currentScanPath: typeof rawProgress.currentScanPath === "string" ? rawProgress.currentScanPath : null,
+      scannedDirectoryCount: readProgressNumber("scannedDirectoryCount"),
+      providerWarningKeys: readProgressStrings("providerWarningKeys"),
+      taskKeys: readProgressStrings("taskKeys"),
+      processedKeys: readProgressStrings("processedKeys"),
+      matchedKeys: readProgressStrings("matchedKeys"),
+      unmatchedKeys: readProgressStrings("unmatchedKeys"),
+      failedKeys: readProgressStrings("failedKeys"),
+      movieTaskKeys: readProgressStrings("movieTaskKeys"),
+      seriesTaskKeys: readProgressStrings("seriesTaskKeys"),
+    },
+    nfoSidecars: parseJsonObject(row.nfo_sidecars_json),
+    changedItemIds: parseStringArray(row.changed_item_ids_json),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
 }
 
 // 关键变量：每条目录变化包含 7 个绑定值，400 条可兼容 SQLite、PostgreSQL 和 MySQL 的参数上限。
@@ -669,7 +773,7 @@ export class ServiceRepository {
         }
         const conflicting = await transaction("scan_jobs")
           .where({ service_id: input.serviceId })
-          .whereIn("status", ["queued", "running", "paused"])
+          .whereIn("status", ["queued", "running", "retry_waiting", "paused"])
           .first();
         if (conflicting) {
           throw new ApiError(409, "scan_job_conflict", "该服务已有未结束的扫描任务");
@@ -706,6 +810,8 @@ export class ServiceRepository {
           current_path: null,
           error_code: null,
           error_message: null,
+          next_retry_at: null,
+          retry_count: 0,
           snapshot_json: JSON.stringify(snapshot),
           control_action: "none",
           created_at: now,
@@ -745,7 +851,14 @@ export class ServiceRepository {
     return transaction("scan_jobs as j")
       .join("cloud_services as s", "s.id", "j.service_id")
       .join("user_accounts as u", "u.id", "s.owner_user_id")
-      .select("j.*", "s.display_name as service_name", "s.data_type", "u.username as owner_username");
+      .leftJoin("scan_job_checkpoints as cp", "cp.job_id", "j.id")
+      .select(
+        "j.*",
+        "s.display_name as service_name",
+        "s.data_type",
+        "u.username as owner_username",
+        "cp.updated_at as checkpoint_updated_at",
+      );
   }
 
   /** 查询单个任务并按需校验租户。 */
@@ -763,6 +876,178 @@ export class ServiceRepository {
       throw new ApiError(404, "scan_job_not_found", "扫描任务不存在");
     }
     return mapJob(row);
+  }
+
+  /** 读取任务检查点；没有保存过时返回 null。 */
+  public async getScanJobCheckpoint(jobId: string): Promise<ScanJobCheckpointRecord | null> {
+    const row = await this.database.query("scan_job_checkpoints").where({ job_id: jobId }).first();
+    return row ? mapScanJobCheckpoint(row as Record<string, unknown>) : null;
+  }
+
+  /** 为新任务建立固定扫描会话和 generation；恢复任务时复用原记录。 */
+  public async getOrCreateScanJobCheckpoint(
+    job: ScanJobRecord,
+    providerType: string,
+  ): Promise<{ checkpoint: ScanJobCheckpointRecord; restored: boolean }> {
+    const existing = await this.getScanJobCheckpoint(job.id);
+    if (existing) {
+      if (existing.checkpointVersion !== 1) {
+        throw new ApiError(409, "scan_checkpoint_version_unsupported", "扫描检查点版本不受当前服务支持");
+      }
+      if (existing.providerType !== providerType) {
+        throw new ApiError(409, "scan_checkpoint_provider_mismatch", "扫描检查点与当前网盘类型不一致");
+      }
+      return { checkpoint: existing, restored: true };
+    }
+    const now = new Date().toISOString();
+    const emptyProgress: ScanCheckpointProgress = {
+      enumeratedEntryCount: 0,
+      scannedMediaCount: 0,
+      skippedCount: 0,
+      currentScanPath: null,
+      scannedDirectoryCount: 0,
+      providerWarningKeys: [],
+      taskKeys: [],
+      processedKeys: [],
+      matchedKeys: [],
+      unmatchedKeys: [],
+      failedKeys: [],
+      movieTaskKeys: [],
+      seriesTaskKeys: [],
+    };
+    await this.database.query("scan_job_checkpoints").insert({
+      job_id: job.id,
+      tenant_id: job.tenantId,
+      service_id: job.serviceId,
+      library_id: job.libraryId,
+      checkpoint_version: 1,
+      scan_session_id: randomUUID(),
+      generation_id: randomUUID(),
+      provider_type: providerType,
+      provider_state_json: "{}",
+      progress_json: JSON.stringify(emptyProgress),
+      nfo_sidecars_json: "{}",
+      changed_item_ids_json: "[]",
+      created_at: now,
+      updated_at: now,
+    }).onConflict("job_id").ignore();
+    const checkpoint = await this.getScanJobCheckpoint(job.id);
+    if (!checkpoint) {
+      throw new ApiError(500, "scan_checkpoint_create_failed", "创建扫描检查点失败");
+    }
+    return { checkpoint, restored: false };
+  }
+
+  /** 原子保存目录游标和同一时刻的业务统计，不记录 Provider 凭据。 */
+  public async saveScanJobCheckpoint(input: {
+    checkpoint: ScanJobCheckpointRecord;
+    providerState: Record<string, unknown>;
+    progress: ScanCheckpointProgress;
+    nfoSidecars: Record<string, unknown>;
+    changedItemIds: string[];
+  }): Promise<void> {
+    const now = new Date().toISOString();
+    await this.database.query("scan_job_checkpoints")
+      .insert({
+        job_id: input.checkpoint.jobId,
+        tenant_id: input.checkpoint.tenantId,
+        service_id: input.checkpoint.serviceId,
+        library_id: input.checkpoint.libraryId,
+        checkpoint_version: input.checkpoint.checkpointVersion,
+        scan_session_id: input.checkpoint.scanSessionId,
+        generation_id: input.checkpoint.generationId,
+        provider_type: input.checkpoint.providerType,
+        provider_state_json: JSON.stringify(input.providerState),
+        progress_json: JSON.stringify(input.progress),
+        nfo_sidecars_json: JSON.stringify(input.nfoSidecars),
+        changed_item_ids_json: JSON.stringify([...new Set(input.changedItemIds)]),
+        created_at: input.checkpoint.createdAt,
+        updated_at: now,
+      })
+      .onConflict("job_id")
+      .merge({
+        provider_state_json: JSON.stringify(input.providerState),
+        progress_json: JSON.stringify(input.progress),
+        nfo_sidecars_json: JSON.stringify(input.nfoSidecars),
+        changed_item_ids_json: JSON.stringify([...new Set(input.changedItemIds)]),
+        updated_at: now,
+      });
+  }
+
+  /** 任务完成或取消后删除检查点，暂停和异常失败继续保留。 */
+  public async deleteScanJobCheckpoint(jobId: string): Promise<void> {
+    await this.database.query("scan_job_checkpoints").where({ job_id: jobId }).delete();
+  }
+
+  /** 建立或恢复单个扫描根运行记录，并固定该根的 generation。 */
+  public async startScanRootRun(input: {
+    job: ScanJobRecord;
+    rootKey: string;
+    rootResourceId: string;
+    displayPath: string;
+  }): Promise<ScanRootRunRecord> {
+    const existing = await this.database.query("scan_root_runs").where({
+      job_id: input.job.id,
+      root_key: input.rootKey,
+    }).first();
+    const now = new Date().toISOString();
+    const generationId = existing ? String(existing.generation_id) : randomUUID();
+    await this.database.query("scan_root_runs")
+      .insert({
+        id: createStableId("root-run", input.job.id, input.rootKey),
+        job_id: input.job.id,
+        tenant_id: input.job.tenantId,
+        service_id: input.job.serviceId,
+        library_id: input.job.libraryId,
+        root_key: input.rootKey,
+        root_resource_id: input.rootResourceId,
+        display_path: input.displayPath,
+        generation_id: generationId,
+        status: "running",
+        warning_count: existing ? Number(existing.warning_count ?? 0) : 0,
+        started_at: existing ? String(existing.started_at) : now,
+        finished_at: null,
+        updated_at: now,
+      })
+      .onConflict(["job_id", "root_key"])
+      .merge({ status: "running", finished_at: null, updated_at: now });
+    return {
+      rootKey: input.rootKey,
+      generationId,
+      status: "running",
+      warningCount: existing ? Number(existing.warning_count ?? 0) : 0,
+    };
+  }
+
+  /** 提交单个扫描根的完整性结果；带目录警告的根标记为 incomplete。 */
+  public async finishScanRootRun(input: {
+    jobId: string;
+    rootKey: string;
+    warningCount: number;
+  }): Promise<void> {
+    const now = new Date().toISOString();
+    await this.database.query("scan_root_runs").where({
+      job_id: input.jobId,
+      root_key: input.rootKey,
+    }).update({
+      status: input.warningCount > 0 ? "incomplete" : "completed",
+      warning_count: input.warningCount,
+      finished_at: now,
+      updated_at: now,
+    });
+  }
+
+  /** 返回已经完整枚举的扫描根及其稳定 generation。 */
+  public async listCompletedScanRootRuns(jobId: string): Promise<ScanRootRunRecord[]> {
+    const rows = await this.database.query("scan_root_runs")
+      .select("root_key", "generation_id", "status", "warning_count")
+      .where({ job_id: jobId, status: "completed" });
+    return rows.map((row) => ({
+      rootKey: String(row.root_key),
+      generationId: String(row.generation_id),
+      status: "completed",
+      warningCount: Number(row.warning_count ?? 0),
+    }));
   }
 
   /** 分页查询当前租户或管理端筛选范围内的任务。 */
@@ -811,6 +1096,9 @@ export class ServiceRepository {
         status: "running",
         stage: "enumerating",
         control_action: "none",
+        next_retry_at: null,
+        error_code: null,
+        error_message: null,
         started_at: row.started_at ?? now,
         updated_at: now,
       });
@@ -852,6 +1140,100 @@ export class ServiceRepository {
       }
     });
     return rows.length;
+  }
+
+  /** 把 TMDB 临时不可用的运行任务转为等待状态，并保留现有安全检查点。 */
+  public async waitForJobRetry(jobId: string, input: {
+    nextRetryAt: string;
+    errorCode: string;
+    errorMessage: string;
+  }): Promise<ScanJobRecord> {
+    const current = await this.getJob(jobId);
+    if (current.status !== "running") {
+      throw new ApiError(409, "scan_job_not_running", "只有运行中的扫描任务可以进入延迟恢复");
+    }
+    const checkpoint = await this.getScanJobCheckpoint(current.id);
+    const now = new Date().toISOString();
+    // 关键变量：至少延迟一秒，避免异常时间值造成 Worker 紧密重复领取同一任务。
+    const parsedRetryAt = Date.parse(input.nextRetryAt);
+    const nextRetryAt = new Date(Math.max(Date.now() + 1_000, Number.isFinite(parsedRetryAt) ? parsedRetryAt : Date.now() + 60_000)).toISOString();
+    const waitingPatch: Record<string, unknown> = {
+      status: "retry_waiting",
+      error_code: input.errorCode,
+      error_message: input.errorMessage,
+      next_retry_at: nextRetryAt,
+      retry_count: current.retryCount + 1,
+      control_action: "none",
+      finished_at: null,
+      updated_at: now,
+    };
+    if (checkpoint) {
+      // 页面回退到最近安全检查点的统计口径，等待期间不展示尚未提交游标的窗口进度。
+      waitingPatch.processed_count = checkpoint.progress.processedKeys.length + checkpoint.progress.failedKeys.length;
+      waitingPatch.total_count = checkpoint.progress.taskKeys.length;
+      waitingPatch.discovered_count = checkpoint.progress.scannedMediaCount;
+      waitingPatch.skipped_count = checkpoint.progress.skippedCount;
+      waitingPatch.matched_count = checkpoint.progress.matchedKeys.length;
+      waitingPatch.unmatched_count = checkpoint.progress.unmatchedKeys.length;
+      waitingPatch.error_count = checkpoint.progress.failedKeys.length;
+      waitingPatch.current_path = checkpoint.progress.currentScanPath;
+    }
+    await this.database.query.transaction(async (transaction) => {
+      await transaction("scan_jobs").where({ id: current.id, status: "running" }).update(waitingPatch);
+      await transaction("cloud_services").where({ id: current.serviceId, status: "scanning" }).update({
+        status: "active",
+        updated_at: now,
+      });
+      await this.insertJobEvent(transaction, current.tenantId, current.id, "retry_waiting", {
+        status: "retry_waiting",
+        stage: current.stage,
+        nextRetryAt,
+        retryCount: current.retryCount + 1,
+        errorCode: input.errorCode,
+        errorMessage: input.errorMessage,
+        checkpointUpdatedAt: checkpoint?.updatedAt ?? current.checkpointUpdatedAt,
+      });
+    });
+    return this.getJob(current.id);
+  }
+
+  /** 把到达恢复时间的 TMDB 等待任务重新放回队列。 */
+  public async requeueDueRetryJobs(limit = 100): Promise<number> {
+    const now = new Date().toISOString();
+    return this.database.query.transaction(async (transaction) => {
+      // 关键变量：按到期时间和创建时间稳定领取，防止大量等待任务恢复时顺序抖动。
+      const rows = await transaction("scan_jobs")
+        .select("id", "tenant_id", "service_id", "retry_count")
+        .where({ status: "retry_waiting" })
+        .whereNotNull("next_retry_at")
+        .where("next_retry_at", "<=", now)
+        .orderBy("next_retry_at", "asc")
+        .orderBy("created_at", "asc")
+        .limit(limit);
+      let changedCount = 0;
+      for (const row of rows) {
+        const changed = await transaction("scan_jobs")
+          .where({ id: row.id, status: "retry_waiting" })
+          .where("next_retry_at", "<=", now)
+          .update({
+            status: "queued",
+            stage: "queued",
+            next_retry_at: null,
+            error_code: null,
+            error_message: null,
+            control_action: "none",
+            updated_at: now,
+          });
+        if (changed !== 1) continue;
+        changedCount += 1;
+        await this.insertJobEvent(transaction, String(row.tenant_id), String(row.id), "queued", {
+          status: "queued",
+          delayedRetry: true,
+          retryCount: Number(row.retry_count ?? 0),
+        });
+      }
+      return changedCount;
+    });
   }
 
   /** 更新任务阶段和进度并写入可重放事件。 */
@@ -908,6 +1290,7 @@ export class ServiceRepository {
         stage: input.status === "completed" ? "completed" : current.stage,
         error_code: input.errorCode ?? null,
         error_message: input.errorMessage ?? null,
+        next_retry_at: null,
         control_action: "none",
         finished_at: finishedAt,
         updated_at: now,
@@ -919,6 +1302,9 @@ export class ServiceRepository {
       };
       if (input.status === "completed") servicePatch.last_scan_at = now;
       await transaction("cloud_services").where({ id: current.serviceId }).update(servicePatch);
+      if (input.status === "completed" || input.status === "cancelled") {
+        await transaction("scan_job_checkpoints").where({ job_id: current.id }).delete();
+      }
       await this.insertJobEvent(transaction, current.tenantId, current.id, input.status, {
         status: input.status,
         stage: input.status === "completed" ? "completed" : current.stage,
@@ -932,13 +1318,13 @@ export class ServiceRepository {
   /** 写入任务控制请求，Worker 在安全检查点执行。 */
   public async requestJobControl(jobId: string, tenantId: string | undefined, action: "pause" | "cancel"): Promise<ScanJobRecord> {
     const job = await this.getJob(jobId, tenantId);
-    if (!(["queued", "running", "paused"] as JobStatus[]).includes(job.status)) {
+    if (!(["queued", "running", "retry_waiting", "paused"] as JobStatus[]).includes(job.status)) {
       throw new ApiError(409, "job_not_controllable", "当前任务状态不能执行该操作");
     }
-    if ((job.status === "queued" || job.status === "paused") && action === "cancel") {
+    if ((job.status === "queued" || job.status === "retry_waiting" || job.status === "paused") && action === "cancel") {
       return this.finishJob(job.id, { status: "cancelled" });
     }
-    if (job.status === "queued" && action === "pause") {
+    if ((job.status === "queued" || job.status === "retry_waiting") && action === "pause") {
       return this.finishJob(job.id, { status: "paused" });
     }
     if (job.status === "paused") {
@@ -954,7 +1340,7 @@ export class ServiceRepository {
   /** 删除已经进入终态的扫描任务及其事件；运行中任务必须先取消。 */
   public async deleteScanJob(jobId: string, tenantId?: string): Promise<void> {
     const job = await this.getJob(jobId, tenantId);
-    if ((["queued", "running", "paused"] as JobStatus[]).includes(job.status)) {
+    if ((["queued", "running", "retry_waiting", "paused"] as JobStatus[]).includes(job.status)) {
       throw new ApiError(409, "scan_job_active", "请先终止扫描任务，再删除任务记录");
     }
     await this.database.query.transaction(async (transaction) => {
@@ -970,12 +1356,35 @@ export class ServiceRepository {
     if (job.status !== "paused") {
       throw new ApiError(409, "job_not_paused", "只有暂停任务可以继续");
     }
-    await this.database.query("scan_jobs").where({ id: job.id }).update({
+    const checkpoint = await this.getScanJobCheckpoint(job.id);
+    const progress = checkpoint?.progress;
+    const patch: Record<string, unknown> = {
       status: "queued",
+      stage: "queued",
       control_action: "none",
+      next_retry_at: null,
+      error_code: null,
+      error_message: null,
       updated_at: new Date().toISOString(),
+    };
+    if (progress) {
+      // 关键变量：页面先回到安全检查点口径，避免显示尚未提交游标的窗口进度。
+      patch.processed_count = progress.processedKeys.length + progress.failedKeys.length;
+      patch.total_count = progress.taskKeys.length;
+      patch.discovered_count = progress.scannedMediaCount;
+      patch.skipped_count = progress.skippedCount;
+      patch.matched_count = progress.matchedKeys.length;
+      patch.unmatched_count = progress.unmatchedKeys.length;
+      patch.error_count = progress.failedKeys.length;
+      patch.current_path = progress.currentScanPath;
+    }
+    await this.database.query("scan_jobs").where({ id: job.id }).update(patch);
+    await this.addJobEvent(job.tenantId, job.id, "queued", {
+      status: "queued",
+      resumed: true,
+      checkpointRestored: Boolean(checkpoint),
+      checkpointUpdatedAt: checkpoint?.updatedAt ?? null,
     });
-    await this.addJobEvent(job.tenantId, job.id, "queued", { status: "queued", resumed: true });
     return this.getJob(job.id);
   }
 
@@ -1028,7 +1437,7 @@ export class ServiceRepository {
     if (status === "disabled") {
       const activeJob = await this.database.query("scan_jobs")
         .where({ service_id: serviceId })
-        .whereIn("status", ["queued", "running", "paused"])
+        .whereIn("status", ["queued", "running", "retry_waiting", "paused"])
         .first();
       if (activeJob) throw new ApiError(409, "service_has_active_job", "服务仍有未结束任务，不能停用");
     }
@@ -1046,7 +1455,7 @@ export class ServiceRepository {
       if (tenantId) serviceQuery.where({ tenant_id: tenantId });
       const service = await serviceQuery.first();
       if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
-      const running = await transaction("scan_jobs").where({ service_id: serviceId }).whereIn("status", ["queued", "running", "paused"]).first();
+      const running = await transaction("scan_jobs").where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first();
       if (running) throw new ApiError(409, "service_has_active_job", "服务仍有未结束任务");
       const now = new Date().toISOString();
       await transaction("media_items").where({ service_id: serviceId }).whereNull("deleted_at").update({ deleted_at: now, updated_at: now });
@@ -1068,7 +1477,7 @@ export class ServiceRepository {
       if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
       const activeJob = await transaction("scan_jobs")
         .where({ service_id: serviceId })
-        .whereIn("status", ["queued", "running", "paused"])
+        .whereIn("status", ["queued", "running", "retry_waiting", "paused"])
         .first();
       if (activeJob) throw new ApiError(409, "service_has_active_job", "请先终止该服务的扫描任务，再清空媒体库");
 
@@ -1114,6 +1523,7 @@ export class ServiceRepository {
       return null;
     }
     const unchanged = row.status === "active"
+      && String(row.scan_root_key ?? "") === input.scanRootKey
       && String(row.parent_resource_id ?? "") === String(input.parentResourceId ?? "")
       && String(row.path) === input.path
       && String(row.name) === input.name
@@ -1125,6 +1535,7 @@ export class ServiceRepository {
       return null;
     }
     await this.database.query("source_files").where({ id: row.id }).update({
+      scan_root_key: input.scanRootKey,
       generation_id: input.generationId,
       updated_at: new Date().toISOString(),
     });
@@ -1148,6 +1559,7 @@ export class ServiceRepository {
         size: input.size,
         modified_at: input.modifiedAt,
         etag: input.etag,
+        scan_root_key: input.scanRootKey,
         generation_id: input.generationId,
         locator_json: JSON.stringify(input.locator),
         status: "active",
@@ -1163,6 +1575,7 @@ export class ServiceRepository {
         size: input.size,
         modified_at: input.modifiedAt,
         etag: input.etag,
+        scan_root_key: input.scanRootKey,
         generation_id: input.generationId,
         locator_json: JSON.stringify(input.locator),
         status: "active",
@@ -1387,6 +1800,8 @@ export class ServiceRepository {
     serviceId: string;
     libraryId: string;
     generationId: string;
+    /** 只允许这些完整扫描根推进缺失状态。 */
+    completedRootGenerations: Array<{ rootKey: string; generationId: string }>;
     deleteMissing: boolean;
     /** 枚举不完整时为 false，禁止执行任何可能删除已有目录内容的清理。 */
     allowDestructiveCleanup: boolean;
@@ -1394,36 +1809,27 @@ export class ServiceRepository {
   }): Promise<number> {
     return this.database.query.transaction(async (transaction) => {
       const now = new Date().toISOString();
-      const missingGenerationItems = input.deleteMissing
-        ? await transaction("media_items")
-          .select("id")
-          .where({ tenant_id: input.tenantId, library_id: input.libraryId })
-          .whereNot({ generation_id: input.generationId })
-          .whereNull("deleted_at")
+      const missingGenerationItemIds = input.deleteMissing
+        ? await this.cleanupCompletedRootMissingFiles(
+          transaction,
+          input.tenantId,
+          input.libraryId,
+          input.completedRootGenerations,
+          now,
+        )
         : [];
-      if (input.deleteMissing) {
-        await transaction("source_files")
-          .where({ tenant_id: input.tenantId, library_id: input.libraryId })
-          .whereNot({ generation_id: input.generationId })
-          .update({ status: "missing", updated_at: now });
-        await transaction("media_items")
-          .where({ tenant_id: input.tenantId, library_id: input.libraryId })
-          .whereNot({ generation_id: input.generationId })
-          .whereNull("deleted_at")
-          .update({ deleted_at: now, updated_at: now });
-      }
       // Flymby APP 在任一目录枚举失败后跳过本轮过期清理，避免把未访问目录中的旧数据误删。
       const excludedItemIds = input.allowDestructiveCleanup
         ? await this.cleanupExcludedCatalogPaths(transaction, input.tenantId, input.libraryId, now)
         : [];
-      const orphanParentIds = input.allowDestructiveCleanup
+      const orphanParentIds = input.allowDestructiveCleanup || input.deleteMissing
         ? await this.cleanupOrphanCatalogParents(transaction, input.tenantId, input.libraryId, now)
         : [];
       const library = await transaction("media_libraries").where({ id: input.libraryId, tenant_id: input.tenantId }).first();
       if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
       const previousCatalogVersion = Number(library.catalog_version);
       const deletedItemIds = new Set([
-        ...missingGenerationItems.map((item) => String(item.id)),
+        ...missingGenerationItemIds,
         ...excludedItemIds,
         ...orphanParentIds,
       ]);
@@ -1452,6 +1858,59 @@ export class ServiceRepository {
       await transaction("cloud_services").where({ id: input.serviceId }).update({ last_scan_at: now, updated_at: now });
       return catalogVersion;
     });
+  }
+
+  /** 只把完整扫描根中未出现在本 generation 的源文件标记缺失，并软删除无活动文件条目。 */
+  private async cleanupCompletedRootMissingFiles(
+    transaction: Knex.Transaction,
+    tenantId: string,
+    libraryId: string,
+    completedRoots: Array<{ rootKey: string; generationId: string }>,
+    now: string,
+  ): Promise<string[]> {
+    const missingSourceIds: string[] = [];
+    for (const root of completedRoots) {
+      const rows = await transaction("source_files")
+        .select("id")
+        .where({
+          tenant_id: tenantId,
+          library_id: libraryId,
+          scan_root_key: root.rootKey,
+          status: "active",
+        })
+        .whereNot({ generation_id: root.generationId });
+      missingSourceIds.push(...rows.map((row) => String(row.id)));
+    }
+    if (missingSourceIds.length === 0) return [];
+
+    const linkedItemIds: string[] = [];
+    for (const sourceIdChunk of chunkStrings([...new Set(missingSourceIds)])) {
+      const linkedRows = await transaction("file_links")
+        .distinct("item_id")
+        .whereIn("source_file_id", sourceIdChunk);
+      linkedItemIds.push(...linkedRows.map((row) => String(row.item_id)));
+      await transaction("source_files").whereIn("id", sourceIdChunk).update({ status: "missing", updated_at: now });
+    }
+    const candidateItemIds = [...new Set(linkedItemIds)];
+    if (candidateItemIds.length === 0) return [];
+
+    const activeItemIds = new Set<string>();
+    for (const itemIdChunk of chunkStrings(candidateItemIds)) {
+      const activeRows = await transaction("file_links as fl")
+        .join("source_files as f", "f.id", "fl.source_file_id")
+        .distinct("fl.item_id")
+        .whereIn("fl.item_id", itemIdChunk)
+        .where("f.status", "active");
+      activeRows.forEach((row) => activeItemIds.add(String(row.item_id)));
+    }
+    const deletedItemIds = candidateItemIds.filter((itemId) => !activeItemIds.has(itemId));
+    for (const itemIdChunk of chunkStrings(deletedItemIds)) {
+      await transaction("media_items")
+        .whereIn("id", itemIdChunk)
+        .whereNull("deleted_at")
+        .update({ deleted_at: now, updated_at: now });
+    }
+    return deletedItemIds;
   }
 
   /** 把 APP 默认排除目录中的旧扫描文件标记缺失，并软删除已经没有活动文件的媒体条目。 */
@@ -2140,7 +2599,7 @@ export class ServiceRepository {
     const [serviceCount, mediaCount, runningCount, failedCount, reviewCount] = await Promise.all([
       services.clone().count<{ count: string | number }[]>({ count: "id" }).first(),
       media.clone().count<{ count: string | number }[]>({ count: "m.id" }).first(),
-      jobs.clone().whereIn("status", ["queued", "running", "paused"]).count<{ count: string | number }[]>({ count: "id" }).first(),
+      jobs.clone().whereIn("status", ["queued", "running", "retry_waiting", "paused"]).count<{ count: string | number }[]>({ count: "id" }).first(),
       jobs.clone().where("status", "failed").count<{ count: string | number }[]>({ count: "id" }).first(),
       media.clone().where("m.match_state", "needs_review").count<{ count: string | number }[]>({ count: "m.id" }).first(),
     ]);

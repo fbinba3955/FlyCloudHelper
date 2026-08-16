@@ -8,6 +8,7 @@ import {
   type ProviderDirectoryListing,
   type ProviderEntry,
   type ProviderEnumerationOptions,
+  type ProviderEnumerationCheckpoint,
   type ProviderEnumerationWarning,
   type ProviderValidationResult,
   type ScanRoot,
@@ -64,6 +65,31 @@ function readWebDavResponseStatus(error: unknown): number | null {
     return 403;
   }
   return error.statusCode;
+}
+
+/** 校验并读取 WebDAV 枚举检查点，损坏或其他 Provider 的游标直接忽略。 */
+function readWebDavCheckpoint(value: Record<string, unknown> | null | undefined): ProviderEnumerationCheckpoint | null {
+  if (!value
+    || value.providerType !== "webdav"
+    || Number(value.version) !== 1
+    || !Number.isInteger(Number(value.rootIndex))
+    || !Array.isArray(value.pendingDirectories)) {
+    return null;
+  }
+  const pendingDirectories = value.pendingDirectories.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const rawItem = item as Record<string, unknown>;
+    if (typeof rawItem.resourcePath !== "string" || !rawItem.resourcePath) return [];
+    return [{ resourcePath: rawItem.resourcePath, isRoot: rawItem.isRoot === true }];
+  });
+  return {
+    providerType: "webdav",
+    version: 1,
+    checkpointSequence: Math.max(0, Number(value.checkpointSequence) || 0),
+    rootIndex: Math.max(0, Number(value.rootIndex) || 0),
+    rootWarningCount: Math.max(0, Number(value.rootWarningCount) || 0),
+    pendingDirectories,
+  };
 }
 
 /** 标准 RFC 4918 WebDAV Provider。 */
@@ -177,16 +203,52 @@ export class WebDavProvider implements ProviderAdapter {
       this.networkOptions,
     );
     const selectedRoots = roots.length > 0 ? roots : [{ displayPath: "/" }];
-    for (const root of selectedRoots) {
+    const resumeCheckpoint = readWebDavCheckpoint(options?.resumeState);
+    const resumeRootIndex = resumeCheckpoint && resumeCheckpoint.rootIndex < selectedRoots.length
+      ? resumeCheckpoint.rootIndex
+      : 0;
+    let nextCheckpointSequence = resumeCheckpoint?.checkpointSequence ?? 0;
+    for (let rootIndex = resumeRootIndex; rootIndex < selectedRoots.length; rootIndex += 1) {
+      const root = selectedRoots[rootIndex];
+      if (!root) continue;
       const rootPath = root.resourceId || root.displayPath || "/";
       const rootUrl = this.resolveSameOriginPath(baseUrl, rootPath);
       // 关键变量：根目录异常必须终止，扫描过程中任一子目录读取异常则按 APP 的容错语义跳过。
-      const queue: Array<{ url: URL; isRoot: boolean }> = [{ url: rootUrl, isRoot: true }];
+      const resumedDirectories = resumeCheckpoint && rootIndex === resumeRootIndex
+        ? resumeCheckpoint.pendingDirectories
+        : [];
+      const queue: Array<{ url: URL; isRoot: boolean }> = resumedDirectories.length > 0
+        ? resumedDirectories.map((directory) => ({
+          url: this.resolveEnumeratedPath(baseUrl, directory.resourcePath),
+          isRoot: directory.isRoot,
+        }))
+        : [{ url: rootUrl, isRoot: true }];
       const visited = new Set<string>();
       const directoryConcurrency = Math.max(1, options?.directoryConcurrency ?? 1);
+      const checkpointDirectoryInterval = Math.max(1, options?.checkpointDirectoryInterval ?? 20);
+      let completedDirectoryBatchCount = 0;
+      let rootWarningCount = resumeCheckpoint && rootIndex === resumeRootIndex
+        ? resumeCheckpoint.rootWarningCount
+        : 0;
+      await options?.onRootStart?.({ rootIndex, root, warningCount: rootWarningCount });
       while (queue.length > 0) {
         if (signal?.aborted) {
           return;
+        }
+        if (completedDirectoryBatchCount === 0) {
+          // 关键变量：游标包含尚未处理的当前批次；Worker 崩溃或暂停后最多重放一个检查点窗口。
+          options?.onCheckpoint?.({
+            providerType: "webdav",
+            version: 1,
+            checkpointSequence: nextCheckpointSequence,
+            rootIndex,
+            rootWarningCount,
+            pendingDirectories: queue.map((directory) => ({
+              resourcePath: decodePath(directory.url.pathname),
+              isRoot: directory.isRoot,
+            })),
+          });
+          nextCheckpointSequence += 1;
         }
         // 关键变量：一批目录并行读取，但每个目录的条目仍连续产出，保证 Worker 可以按目录聚合影片。
         const directoryBatch = queue.splice(0, directoryConcurrency)
@@ -207,6 +269,7 @@ export class WebDavProvider implements ProviderAdapter {
             if (!result.queuedDirectory.isRoot) {
               const errorCode = result.error instanceof ApiError ? result.error.code : "provider_directory_unavailable";
               const errorMessage = result.error instanceof Error ? result.error.message : "WebDAV 子目录访问失败";
+              rootWarningCount += 1;
               onWarning?.({ code: errorCode, message: errorMessage, path: decodePath(directoryUrl.pathname) });
               this.networkOptions.logConnectionFailure?.({
                 日志关键字: "codex-flycloud-helper-webdav-directory",
@@ -250,7 +313,9 @@ export class WebDavProvider implements ProviderAdapter {
             }
           }
         }
+        completedDirectoryBatchCount = (completedDirectoryBatchCount + 1) % checkpointDirectoryInterval;
       }
+      await options?.onRootComplete?.({ rootIndex, root, warningCount: rootWarningCount });
     }
   }
 

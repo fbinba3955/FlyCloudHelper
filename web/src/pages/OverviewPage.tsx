@@ -22,6 +22,7 @@ const serviceStatusLabels: Record<ServiceStatus, string> = {
 const jobStatusLabels: Record<JobStatus, string> = {
   queued: "排队中",
   running: "运行中",
+  retry_waiting: "等待 TMDB 恢复",
   paused: "已暂停",
   completed: "已完成",
   failed: "失败",
@@ -92,7 +93,7 @@ export function OverviewPage() {
                     <p className="truncate text-sm font-medium">{job.serviceName}</p>
                     <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{job.id} · {job.scanMode === "full" ? "全量" : "增量"} · {job.stage}</p>
                   </div>
-                  <StatusPill tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : "primary"}>{jobStatusLabels[job.status]}</StatusPill>
+                  <StatusPill tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{jobStatusLabels[job.status]}</StatusPill>
                 </div>
                 <div className="mt-2.5 flex items-center gap-3">
                   <ProgressMeter value={job.processedCount} total={job.totalCount} />
