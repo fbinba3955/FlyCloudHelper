@@ -1,0 +1,27 @@
+{
+  "name": "flycloud-helper",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "web",
+    "api"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "concurrently --kill-others --names API,WEB --prefix-colors blue,magenta \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "npm --workspace api run dev",
+    "dev:web": "npm --workspace web run dev",
+    "start:api": "npm --workspace api run start",
+    "check": "npm run check:api && npm run check:web",
+    "check:api": "npm --workspace api run check",
+    "build:api": "npm --workspace api run build",
+    "build:web": "npm --workspace web run build",
+    "build": "npm run build:api && npm run build:web",
+    "check:web": "npm --workspace web run check"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

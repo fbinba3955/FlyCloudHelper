@@ -1,0 +1,154 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-display: "Space Grotesk", "Noto Sans SC", system-ui, sans-serif;
+  --font-sans: Inter, "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-soft: var(--primary-soft);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-border: var(--sidebar-border);
+}
+
+:root {
+  --radius: 0.875rem;
+  --background: oklch(0.168 0.026 264);
+  --foreground: oklch(0.965 0.006 264);
+  --card: oklch(0.213 0.028 264);
+  --card-foreground: oklch(0.965 0.006 264);
+  --primary: oklch(0.533 0.245 262.5);
+  --primary-foreground: oklch(0.99 0.005 264);
+  --primary-soft: oklch(0.62 0.19 262.5);
+  --secondary: oklch(0.262 0.03 264);
+  --secondary-foreground: oklch(0.93 0.01 264);
+  --muted: oklch(0.248 0.028 264);
+  --muted-foreground: oklch(0.7 0.024 264);
+  --accent: oklch(0.29 0.06 262.5);
+  --accent-foreground: oklch(0.96 0.01 264);
+  --destructive: oklch(0.61 0.21 22);
+  --destructive-foreground: oklch(0.985 0.005 264);
+  --success: oklch(0.72 0.16 158);
+  --warning: oklch(0.79 0.15 78);
+  --info: oklch(0.72 0.13 232);
+  --border: oklch(1 0 0 / 9%);
+  --input: oklch(1 0 0 / 13%);
+  --ring: oklch(0.533 0.245 262.5);
+  --sidebar: oklch(0.19 0.027 264);
+  --sidebar-foreground: oklch(0.92 0.01 264);
+  --sidebar-accent: oklch(0.26 0.04 264);
+  --sidebar-border: oklch(1 0 0 / 8%);
+  --gradient-primary: linear-gradient(
+    135deg,
+    oklch(0.533 0.245 262.5),
+    oklch(0.63 0.2 250)
+  );
+  --gradient-surface: linear-gradient(
+    160deg,
+    oklch(0.24 0.032 264 / 0.9),
+    oklch(0.19 0.026 264 / 0.75)
+  );
+  --gradient-glow: radial-gradient(
+    circle at 50% 0%,
+    oklch(0.533 0.245 262.5 / 0.35),
+    transparent 70%
+  );
+  --shadow-elevated: 0 24px 60px -28px oklch(0.1 0.04 264 / 0.9);
+  --shadow-glow: 0 0 0 1px oklch(0.533 0.245 262.5 / 0.35),
+    0 18px 50px -22px oklch(0.533 0.245 262.5 / 0.55);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    min-width: 320px;
+    min-height: 100vh;
+    margin: 0;
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+
+  button,
+  a {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  h1,
+  h2,
+  h3,
+  .font-display {
+    font-family: var(--font-display);
+    letter-spacing: -0.02em;
+  }
+}
+
+@utility surface {
+  background-image: var(--gradient-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-elevated);
+  backdrop-filter: blur(14px);
+}
+
+@utility glow-ring {
+  box-shadow: var(--shadow-glow);
+}
+
+@utility text-gradient {
+  background-image: var(--gradient-primary);
+  background-clip: text;
+  color: transparent;
+}
+
+@utility grid-noise {
+  background-image:
+    linear-gradient(oklch(1 0 0 / 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, oklch(1 0 0 / 0.03) 1px, transparent 1px);
+  background-size: 64px 64px;
+}

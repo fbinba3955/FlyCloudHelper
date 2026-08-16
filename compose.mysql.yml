@@ -1,0 +1,29 @@
+services:
+  flycloud-helper:
+    environment:
+      FLYCLOUDHELPER_DATABASE_TYPE: mysql
+      FLYCLOUDHELPER_DATABASE_URL: "${FLYCLOUDHELPER_DATABASE_URL:-${FLYMBYSCANNER_DATABASE_URL:?请设置MySQL连接地址}}"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: "${MYSQL_DATABASE:-flycloud_helper}"
+      MYSQL_USER: "${MYSQL_USER:-flymby}"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:?请设置MySQL用户密码}"
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:?请设置MySQL root密码}"
+      TZ: Asia/Shanghai
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci"]
+    volumes:
+      - flycloud_helper_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  flycloud_helper_mysql:

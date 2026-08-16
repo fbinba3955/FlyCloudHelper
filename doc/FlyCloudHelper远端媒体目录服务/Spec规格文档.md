@@ -1,27 +1,27 @@
-# FlymbyScanner 远端媒体目录服务 Spec规格文档
+# FlyCloudHelper 远端媒体目录服务 Spec规格文档
 
 生成日期：2026-08-14
 
 ## 1. 需求概述
 
-FlymbyScanner 是可以通过 Docker 部署的可扩展云端媒体扫描与目录服务。一个服务实例必须支持多个用户，每个用户必须支持多个云端网盘服务。系统只保留用户名和密码这一套用户认证入口，用户名和密码都至少 4 个字符，不再支持 APP 托管、匿名、仅凭服务标记或逐任务临时凭据模式。实例首次使用且尚无超级管理员时必须进入 `/setup` 初始化向导，由部署者现场设置首个超级管理员用户名和密码，不能通过环境变量直接预置账号密码；初始化成功后该入口永久关闭。APP 在添加网盘服务时开启“云端模式”，输入云端地址并登录已有账号或创建新账号；登录成功后可以选择账号下已有云端服务，也可以把当前网盘连接、扫描路径、媒体类型和刮削配置创建为新的云端服务。服务端持久管理加密网盘凭据和版本化配置，统一枚举网盘文件，再按视频、音乐、有声书分流到独立媒体处理器，完成识别、标签/NFO 解析、元数据刮削、目录持久化和实时进度发布，并向 HarmonyOS APP 与 Android TV 提供统一媒体查询接口。内置 TMDB 来源支持通过 Docker 环境变量或 Secret 配置多个 Key，并根据健康 Key 数量动态调整刮削并发；服务同时提供登录、注册、普通用户个人控制台和 `super_admin` 超级管理员后台。普通用户只能管理本人服务、任务和媒体目录，超级管理员可以跨用户管理服务、插件、任务和系统配置。Web 前端不提供直接播放。数据库未配置时默认使用 SQLite，也可通过环境变量切换到 PostgreSQL 或 MySQL。
+FlyCloudHelper 是可以通过 Docker 部署的可扩展云端媒体扫描与目录服务。一个服务实例必须支持多个用户，每个用户必须支持多个云端网盘服务。系统只保留用户名和密码这一套用户认证入口，用户名和密码都至少 4 个字符，不再支持 APP 托管、匿名、仅凭服务标记或逐任务临时凭据模式。实例首次使用且尚无超级管理员时必须进入 `/setup` 初始化向导，由部署者现场设置首个超级管理员用户名和密码，不能通过环境变量直接预置账号密码；凭据主密钥未显式配置时由服务自动生成并持久化，管理员创建成功后必须完成复制或下载备份并确认，之后初始化入口永久关闭。APP 在添加网盘服务时开启“云端模式”，输入云端地址并登录已有账号或创建新账号；登录成功后可以选择账号下已有云端服务，也可以把当前网盘连接、扫描路径、媒体类型和刮削配置创建为新的云端服务。服务端持久管理加密网盘凭据和版本化配置，统一枚举网盘文件，再按视频、音乐、有声书分流到独立媒体处理器，完成识别、标签/NFO 解析、元数据刮削、目录持久化和实时进度发布，并向 HarmonyOS APP 与 Android TV 提供统一媒体查询接口。内置 TMDB 来源由超级管理员在“系统配置”页面维护多个 Key，使用凭据主密钥加密写入数据库，并根据健康 Key 数量动态调整刮削并发；服务同时提供登录、注册、普通用户个人控制台和 `super_admin` 超级管理员后台。普通用户只能管理本人服务、任务和媒体目录，超级管理员可以跨用户管理服务、插件、任务和系统配置。Web 前端不提供直接播放。数据库未配置时默认使用 SQLite，也可通过环境变量切换到 PostgreSQL 或 MySQL。
 
-网盘接入采用可安装 Provider 适配器，媒体处理采用可扩展 Processor/Metadata Provider，不把当前四类网盘或视频字段固化为核心枚举。播放由客户端根据远端目录返回的网盘文件定位信息，使用本地网盘凭据解析最终播放地址。FlymbyScanner 不代理、转码或持久化视频、音乐、有声书媒体流。
+网盘接入采用可安装 Provider 适配器，媒体处理采用可扩展 Processor/Metadata Provider，不把当前四类网盘或视频字段固化为核心枚举。播放由客户端根据远端目录返回的网盘文件定位信息，使用本地网盘凭据解析最终播放地址。FlyCloudHelper 不代理、转码或持久化视频、音乐、有声书媒体流。
 
 ## 2. 检查范围
 
 | 项目 | 内容 |
 | --- | --- |
-| 需求名称 | FlymbyScanner 远端媒体目录服务 |
+| 需求名称 | FlyCloudHelper 远端媒体目录服务 |
 | 用户最新口径 | 取消 APP 托管模式，统一用户名和密码且二者都至少 4 个字符；首次使用在 `/setup` 设置首个超级管理员账号密码；APP 开启云端模式后输入云端地址，登录已有账号或创建新账号，再选择已有云端服务或把当前服务创建为新云端服务；服务端持久管理连接、扫描和刮削配置；TMDB 可配置多个 Key，并按 Key 数量动态调整刮削并发；Web 前端提供登录、注册、普通用户个人控制台和 `super_admin` 超级管理员后台，支持服务管理、扫描触发、插件配置、实时进度和无播放海报墙；覆盖视频、音乐、有声书及更多网盘扩展；APP 直接播放 |
-| 新项目 | `/Users/shijianting/WebstormProjects/FlymbyScanner` |
+| 新项目 | `/Users/shijianting/WebstormProjects/FlyCloudHelper` |
 | HarmonyOS 代码依据 | `/Users/shijianting/WebstormProjects/flymby` |
 | Android TV 代码依据 | `/Users/shijianting/DevecostudioProjects/flymby2/androidtv` |
 | 音乐刮削代码依据 | `/Users/shijianting/WebstormProjects/FlymbyServer` |
 | 首批网盘 | WebDAV、光鸭、阿里云盘、百度网盘；协议和数据库必须允许后续增加 Provider |
 | 内置媒体类型 | `video`、`music`、`audiobook`；协议允许通过版本升级增加新的媒体处理器 |
-| 服务端接口 | 当前为方案契约，尚未实现 |
-| 交付范围 | 方案文档，不修改 Flymby 或 Android TV 业务代码 |
+| 服务端接口 | `/api/v1` 后台已实现首期代码；HarmonyOS/Android TV 客户端接入另行实施 |
+| 交付范围 | FlyCloudHelper 后台、Docker 部署文件与接入真实 API 的 Web 控制台；不修改 Flymby 或 Android TV 业务代码 |
 
 ## 3. 当前代码依据
 
@@ -42,10 +42,10 @@ FlymbyScanner 是可以通过 Docker 部署的可扩展云端媒体扫描与目�
 | 客户端媒体类型 | `main/src/main/ets/pages/download/AddDownloadPage/index.ets` | 已使用 `video`、`music`、`audiobook`，可作为首批通用媒体类型口径 |
 | 本地音频识别 | `common/src/main/ets/localmedia/LocalMediaConstants.ets` | 已有音视频扩展名集合，可作为文件分类参考，不能代替服务端媒体探测 |
 | 音频播放 | `common/src/main/ets/audio/AudioService.ets` | 音乐和有声书最终仍进入客户端音频播放链路，不由扫描服务播放 |
-| FlymbyServer 音乐聚合 | `FlymbyServer/backend/app/audio_scraper.py` | 已实现 `auto/musicbrainz/netease/qmusic/kugou/migu/kuwo` 来源、`fast/complete` 聚合、候选字段统一、MusicBrainz 限流和来源失败隔离；FlymbyScanner 可迁移领域方法，不应默认调用其线上接口 |
-| FlymbyServer 音乐来源适配 | `FlymbyServer/backend/app/audio_metadata_sources.py` | 各来源通过隔离适配器转换为相同字段，适合作为 FlymbyScanner `MusicMetadataProvider` 注册表和标准化层参考 |
+| FlymbyServer 音乐聚合 | `FlymbyServer/backend/app/audio_scraper.py` | 已实现 `auto/musicbrainz/netease/qmusic/kugou/migu/kuwo` 来源、`fast/complete` 聚合、候选字段统一、MusicBrainz 限流和来源失败隔离；FlyCloudHelper 可迁移领域方法，不应默认调用其线上接口 |
+| FlymbyServer 音乐来源适配 | `FlymbyServer/backend/app/audio_metadata_sources.py` | 各来源通过隔离适配器转换为相同字段，适合作为 FlyCloudHelper `MusicMetadataProvider` 注册表和标准化层参考 |
 | FlymbyServer 声纹识别 | `FlymbyServer/backend/app/audio_scraper.py`、`backend/app/main.py` | 当前上传受限音频到临时文件，由 `fpcalc` 生成 Chromaprint，再向 AcoustID 查询并回查 MusicBrainz；临时文件在成功或失败后删除，适合作为低置信度曲目的可选后备能力 |
-| FlymbyServer 音乐配置与前台 | `FlymbyServer/backend/app/config.py`、`backend/.env.example`、`app/pages/admin/tools/audio-scrape.vue` | 已有 AcoustID、fpcalc、MusicBrainz User-Agent、上传上限、上游超时和能力展示，可复用配置边界与管理交互，但认证和 API 契约需按 FlymbyScanner 重建 |
+| FlymbyServer 音乐配置与前台 | `FlymbyServer/backend/app/config.py`、`backend/.env.example`、`app/pages/admin/tools/audio-scrape.vue` | 已有 AcoustID、fpcalc、MusicBrainz User-Agent、上传上限、上游超时和能力展示，可复用配置边界与管理交互，但认证和 API 契约需按 FlyCloudHelper 重建 |
 | Android TV 服务类型 | `androidtv/core/model/.../ServiceModels.kt` | 当前没有 WebDAV、光鸭、阿里云盘和百度网盘 |
 | Android TV 播放 | `androidtv/core/player-api/.../PlaybackModels.kt` | `PlaybackRequest` 已支持 URI 和 Headers，可接收网盘解析结果 |
 
@@ -65,11 +65,11 @@ FlymbyScanner 是可以通过 Docker 部署的可扩展云端媒体扫描与目�
 10. Provider 注册、能力协商和版本管理，允许后续增加网盘而不修改扫描核心。
 11. 媒体处理器注册和能力协商，视频、音乐、有声书共享扫描基础设施但保留各自领域模型。
 12. 多用户、多设备和多网盘服务的数据归属：认证租户下每个服务端 `serviceId` 只对应一个远端媒体库，客户端服务 ID 只用于设备绑定。
-13. TMDB Key 池通过 Docker 环境变量配置，并允许使用 Docker Secret 文件覆盖明文环境变量；刮削并发随健康 Key 数量动态变化并受全局上限保护。
+13. TMDB Key 池由超级管理员通过“系统配置”页面维护，Key 密文保存在数据库中且读取接口不回显；保存后即时生效，刮削并发随健康 Key 数量动态变化并受全局上限保护。
 14. 同镜像提供 Web 前端，包含首次使用初始化向导、统一登录入口、普通用户注册入口、个人控制台和超级管理员后台；普通用户只访问本人数据，超级管理员可以跨用户管理。
 15. 超级管理员可从前台导入、预检、配置、启用、停用和升级声明式元数据插件。
 16. 未配置数据库类型时默认使用 SQLite；通过环境变量可选择 PostgreSQL 或 MySQL，三种数据库共享同一业务模型和迁移版本。
-17. 音乐处理器参考 FlymbyServer 已有多来源聚合与可选声纹识别方法，形成 FlymbyScanner 内部可扩展实现，不把 FlymbyServer 线上 API 设为必需依赖。
+17. 音乐处理器参考 FlymbyServer 已有多来源聚合与可选声纹识别方法，形成 FlyCloudHelper 内部可扩展实现，不把 FlymbyServer 线上 API 设为必需依赖。
 18. 普通用户个人控制台可管理本人的云端服务、媒体库和任务；所有跨租户管理访问都需要 `super_admin` 权限并写入审计日志。
 19. Web 前端通过 SSE 实时展示扫描与刮削阶段、计数、当前媒体类型、进度和脱敏错误。
 20. 普通用户按自己的服务、媒体库和媒体类型浏览海报墙；超级管理员可按用户、服务、媒体库和媒体类型浏览全局只读海报墙。
@@ -95,7 +95,7 @@ FlymbyScanner 是可以通过 Docker 部署的可扩展云端媒体扫描与目�
 | Web 普通用户 | 从登录或注册入口进入个人控制台，只管理本人云端服务、扫描任务和媒体目录；不直接播放 |
 | HarmonyOS APP | 管理本地播放授权、绑定云端服务、查询目录、触发扫描和直接播放 |
 | Android TV | 使用用户名和密码登录、选择云端服务、查询目录、使用本地网盘授权直接播放 |
-| FlymbyScanner API | 用户名密码认证、确定租户、管理云端服务及加密凭据、任务编排、目录查询和变更发布 |
+| FlyCloudHelper API | 用户名密码认证、确定租户、管理云端服务及加密凭据、任务编排、目录查询和变更发布 |
 | 扫描 Worker | 通过 Provider 枚举网盘、识别媒体类型、调用媒体处理器并事务落库 |
 | 超级管理员 | 使用 `super_admin` 角色进入全局管理后台，创建/管理用户和任意租户的云端服务，维护服务配置、触发扫描、配置声明式插件、查看全局任务和海报墙；不得查看网盘凭据明文或直接播放 |
 
@@ -128,7 +128,7 @@ flowchart LR
   SECRET["TMDB 多 Key 池 / Secret"] --> VIDEO
   AUTH --> SERVICE["账号下选择或创建 serviceId"]
   SERVICE --> VAULT["加密凭据库与配置修订"]
-  SERVICE --> API["FlymbyScanner API"]
+  SERVICE --> API["FlyCloudHelper API"]
   VAULT --> JOB["租户隔离的不可变任务快照"]
   API --> JOB
   JOB --> SCAN["通用扫描器"]
@@ -169,7 +169,7 @@ flowchart LR
 | `serverId` | string | APP 现有网盘服务稳定 ID，在绑定请求中作为 `clientServiceId`；仅表示本地服务别名 |
 | `cloudModeEnabled` | boolean | 是否启用云端目录 |
 | `cloudServiceUrl` | string | 云端服务基础地址 |
-| `cloudServiceInstanceId` | string | FlymbyScanner 部署实例稳定 ID，对应服务端 `serviceInstanceId` |
+| `cloudServiceInstanceId` | string | FlyCloudHelper 部署实例稳定 ID，对应服务端 `serviceInstanceId` |
 | `cloudProtocolVersion` | number | 上次验证的协议版本 |
 | `cloudServiceId` | string | 账号下选中或新建的云端服务 ID |
 | `cloudLibraryId` | string | 该云端服务对应的媒体库 ID，可缓存但不能作为授权依据 |
@@ -193,13 +193,13 @@ flowchart LR
 
 | 标识 | 产生方 | 是否由 APP 上送 | 用途 |
 | --- | --- | --- | --- |
-| `serviceInstanceId` | FlymbyScanner 部署实例 | APP 从 `/system/info` 获取后回传或本地校验 | 区分不同 FlymbyScanner 部署，防止地址变化或切换实例时误用旧绑定 |
-| `tenantId` | FlymbyScanner 认证系统 | 否 | 数据所有权和权限边界；必须从访问令牌或服务端会话得到 |
-| `serviceId` | FlymbyScanner | 创建后返回 | 账号下一个云端服务的规范身份，是连接、配置、任务和目录的归属主键 |
-| `libraryId` | FlymbyScanner | 创建后返回 | 由 `serviceId` 独占的媒体库资源 ID，用于目录、事件和导出路径 |
+| `serviceInstanceId` | FlyCloudHelper 部署实例 | APP 从 `/system/info` 获取后回传或本地校验 | 区分不同 FlyCloudHelper 部署，防止地址变化或切换实例时误用旧绑定 |
+| `tenantId` | FlyCloudHelper 认证系统 | 否 | 数据所有权和权限边界；必须从访问令牌或服务端会话得到 |
+| `serviceId` | FlyCloudHelper | 创建后返回 | 账号下一个云端服务的规范身份，是连接、配置、任务和目录的归属主键 |
+| `libraryId` | FlyCloudHelper | 创建后返回 | 由 `serviceId` 独占的媒体库资源 ID，用于目录、事件和导出路径 |
 | `clientServiceId` | APP | 绑定时上送 | 标识某设备中的本地网盘服务实例，只用于建立客户端绑定和播放关联，不决定云端归属 |
 
-FlymbyScanner 部署内部维护 `tenantId + serviceId + libraryId` 的所有权链：`serviceId` 和 `libraryId` 均由服务端生成，一个 `serviceId` 独占一个 `libraryId`。`clientServiceId` 存放于独立 `client_service_link` 中，同一云端服务可以被同一账号的多台设备分别绑定。跨部署的完整作用域为 `serviceInstanceId + tenantId + serviceId`。
+FlyCloudHelper 部署内部维护 `tenantId + serviceId + libraryId` 的所有权链：`serviceId` 和 `libraryId` 均由服务端生成，一个 `serviceId` 独占一个 `libraryId`。`clientServiceId` 存放于独立 `client_service_link` 中，同一云端服务可以被同一账号的多台设备分别绑定。跨部署的完整作用域为 `serviceInstanceId + tenantId + serviceId`。
 
 归属规则：
 
@@ -241,6 +241,7 @@ FlymbyScanner 部署内部维护 `tenantId + serviceId + libraryId` 的所有权
 ```json
 {
   "displayName": "我的阿里云盘电影库",
+  "dataType": "video",
   "clientDeviceId": "device-id",
   "clientServiceId": "local-service-id",
   "provider": {
@@ -252,16 +253,9 @@ FlymbyScanner 部署内部维护 `tenantId + serviceId + libraryId` 的所有权
     }
   },
   "scan": {
-    "mode": "incremental",
-    "mediaTypes": ["video", "music", "audiobook"],
-    "roots": [
-      {
-        "resourceId": "folder-id",
-        "displayPath": "/媒体",
-        "driveId": "resource-drive-id",
-        "mediaTypes": ["video", "music", "audiobook"]
-      }
-    ],
+    "mediaTypes": ["video"],
+    "fullRoots": [],
+    "incrementalRoots": [],
     "removedRootPolicy": "protect"
   },
   "metadata": {
@@ -274,32 +268,13 @@ FlymbyScanner 部署内部维护 `tenantId + serviceId + libraryId` 的所有权
         "language": "zh-CN",
         "region": "CN",
         "rescrapePolicy": "changed_only"
-      },
-      "music": {
-        "processorVersion": 1,
-        "embeddedTags": true,
-        "providerId": "auto",
-        "aggregateMode": "fast",
-        "requiredFields": {
-          "artist": true,
-          "album": true,
-          "cover": true
-        },
-        "fingerprintPolicy": "fallback",
-        "rescrapePolicy": "changed_only"
-      },
-      "audiobook": {
-        "processorVersion": 1,
-        "embeddedTags": true,
-        "providerId": null,
-        "rescrapePolicy": "changed_only"
       }
     }
   }
 }
 ```
 
-服务端验证连接成功后，为此服务生成 `serviceId + libraryId`，把连接 Secret 写入独立凭据库，把扫描和刮削配置写入版本化配置表，并返回不含 Secret 的摘要。
+服务端验证 `dataType` 和连接成功后，为此服务生成 `serviceId + libraryId`，把连接 Secret 写入独立凭据库，把服务数据类型、扫描和刮削配置写入版本化数据，并返回不含 Secret 的摘要。当前 `dataType` 只接受 `video`，`music` 与 `audiobook` 返回字段校验错误。创建服务只建立连接和媒体库归属，不得自动创建扫描任务或开始刮削；用户随后通过扫描配置接口分别保存 `fullRoots` 和 `incrementalRoots`。
 
 ### 7.2 触发扫描示例
 
@@ -323,7 +298,8 @@ FlymbyScanner 部署内部维护 `tenantId + serviceId + libraryId` 的所有权
 6. 入队时冻结 `credentialRevision + scanProfileRevision + metadataProfileRevision + Provider/Processor/插件版本及 configurationRevision`，任务开始后不可修改。
 7. 凭据失效时服务状态变为 `reauthorization_required`，当前任务以可识别错误暂停或失败；APP 或管理前台必须先更新服务连接并生成新凭据修订，再显式重试或新建任务，不能向旧任务补交临时凭据。
 8. 服务端按 Provider 和媒体处理器能力校验任务；不支持的组合必须在入队前返回明确错误。
-9. `mediaTypes` 未填写时不得默认为仅视频，需由协议默认值或 APP 显式值决定并记录快照版本。
+9. 全量任务只读取 `fullRoots`，增量任务只读取 `incrementalRoots`；对应数组为空时不得把 Provider 根目录作为隐式默认值，必须拒绝创建任务并提示先配置路径。
+9. 当前服务数据类型只支持 `video`，`scan.mediaTypes` 未填写时固定为 `["video"]`；提交其他类型或与 `dataType` 不一致时必须拒绝。
 10. 服务端将实际选中的 Provider 适配器、媒体 Processor、元数据来源版本，以及声明式插件 ID、版本、SHA-256 和 `configurationRevision` 写入任务快照，恢复任务时不得静默切换版本或配置修订。
 11. TMDB Key 池属于部署运行容量，不冻结某个 Key 到业务任务。每次任务执行尝试只记录不含敏感值的 `tmdbKeyPoolRevision` 便于诊断；具体 Key 由调度器逐请求选择，任务恢复时可以使用当前健康池。
 
@@ -372,7 +348,7 @@ FlymbyScanner 部署内部维护 `tenantId + serviceId + libraryId` 的所有权
 | 失败策略 | 元数据来源失败不跨媒体类型回退；按该媒体 Profile 上送的失败重试来源执行 |
 | 更换来源 | APP 显式选择 `changed_only`、`failed_only` 或 `all` |
 
-插件必须禁止请求回环、内网、链路本地和云主机元数据地址，防止 SSRF。不得将网盘凭据、用户身份或完整原始路径注入插件请求。
+插件请求仍必须限定在 Manifest 批准的主机范围内，但不限制目标主机解析到公网、内网、回环、链路本地或保留网段。不得将网盘凭据、用户身份或完整原始路径注入插件请求。
 
 声明式元数据 Manifest 与 Provider 适配器属于不同扩展面：前者不能执行代码；后者是超级管理员显式安装、锁定版本并纳入供应链审计的服务端组件，不能由单次扫描任务上传。
 
@@ -380,15 +356,14 @@ FlymbyScanner 部署内部维护 `tenantId + serviceId + libraryId` 的所有权
 
 | 配置项 | 默认值 | 规则 |
 | --- | --- | --- |
-| `FLYMBYSCANNER_TMDB_API_KEYS` | 无 | 逗号分隔的多个 TMDB Key；仅在未配置 Secret 文件时读取，不写入数据库、插件包、备份或前台表单 |
-| `FLYMBYSCANNER_TMDB_API_KEYS_FILE` | 无 | 指向 Docker Secret 挂载文件，每行一个 Key；同时配置时文件具有更高优先级，不与环境变量合并 |
-| `FLYMBYSCANNER_TMDB_CONCURRENCY_PER_KEY` | `1` | 单个健康 Key 同时允许的 TMDB 请求数；必须为正整数，实施时限制安全上限 |
-| `FLYMBYSCANNER_TMDB_MAX_CONCURRENCY` | `32` | 当前部署全部 Worker 的 TMDB 请求总并发上限；必须为正整数，防止 Key 数量过多拖垮网络、CPU、数据库和上游 |
+| 管理端 `/admin/config` | 空 Key 池 | `super_admin` 输入完整新 Key 列表并二次确认；服务使用凭据主密钥加密后写入 `system_secret_settings`，读取接口只返回脱敏状态 |
+| `FLYCLOUDHELPER_TMDB_PER_KEY_CONCURRENCY` | `1` | 单个健康 Key 同时允许的 TMDB 请求数；必须为正整数，实施时限制安全上限 |
+| `FLYCLOUDHELPER_TMDB_MAX_CONCURRENCY` | `32` | 当前部署全部 Worker 的 TMDB 请求总并发上限；必须为正整数，防止 Key 数量过多拖垮网络、CPU、数据库和上游 |
 
 配置规则：
 
-1. 服务启动时读取 Key 池。环境变量中的值按逗号拆分，Secret 文件按行拆分；只去除每项首尾空白并忽略空项，完全相同的 Key 只保留一份，重复项不能增加并发。环境变量或 Secret 文件变化后需要重启 API/Worker 才能形成新的 `tmdbKeyPoolRevision`。
-2. Key 状态至少包含 `healthy`、`cooldown` 和 `disabled`。新加载且格式通过基础校验的 Key 初始为 `healthy`；Key 原文、局部字符、哈希或可反推标识均不得写入日志、数据库、任务快照和 API。
+1. 超级管理员在系统配置页录入完整新 Key 列表；服务只去除每项首尾空白并忽略空项，完全相同的 Key 只保留一份，重复项不能增加并发。保存后立即替换运行中的 Key 池并形成新的配置修订，不要求重启 API/Worker。
+2. Key 状态至少包含 `healthy`、`cooldown` 和 `disabled`。新加载且格式通过基础校验的 Key 初始为 `healthy`；数据库只保存使用凭据主密钥产生的整体密文，Key 原文、局部字符或可反推标识均不得写入读取响应、日志、任务快照和备份。
 3. TMDB 实际并发按以下公式实时计算：`effectiveConcurrency = min(TMDB_MAX_CONCURRENCY, healthyKeyCount × TMDB_CONCURRENCY_PER_KEY, workerAvailableSlots)`。健康 Key 数量、Worker 可用槽位或配置修订变化时，调度器立即重新计算，不中断已经发出的请求。
 4. 请求优先分配给“在途请求数最少且未处于冷却”的 Key；在途数相同时使用轮询，避免总是消耗第一个 Key。不同用户和任务进入公平队列，单一媒体库不能长期占满整个 Key 池。
 5. 某个 Key 收到明确的认证/授权失败时，将该 Key 标记为 `disabled`，直到重启加载新配置；收到限流响应时，只将该 Key 置为 `cooldown`，优先遵循上游返回的等待时间，没有明确等待时间时使用有上限的退避。网络错误或上游 5xx 不直接永久禁用 Key。
@@ -396,12 +371,12 @@ FlymbyScanner 部署内部维护 `tenantId + serviceId + libraryId` 的所有权
 7. 未配置任何 Key 时服务仍可启动，但 `builtin.tmdb` 状态为 `unavailable`；所有 Key 暂时冷却时状态为 `degraded` 并等待最早恢复时间；所有 Key 均禁用时状态为 `unavailable`。TMDB 不可用不得影响 NFO、内嵌标签和已启用插件，也不得触发目录误删除。
 8. 多 Worker 部署必须使用部署级共享信号量和 Key 状态，确保 `TMDB_MAX_CONCURRENCY` 是整个部署的上限；未提供分布式协调组件时，只允许一个 TMDB 元数据调度器工作，不能把上限按 Worker 副本数放大。
 9. API 与 Worker 必须读取同一 `tmdbKeyPoolRevision`；修订不一致时健康检查失败并停止接受新的 TMDB 任务，避免 API 计算的能力与 Worker 实际 Key 池不一致。
-10. 普通 `/system/info` 只返回 `builtin.tmdb` 的 `available/degraded/unavailable`，不暴露 Key 数量和容量。管理前台配置状态页可展示配置来源、`configuredKeyCount`、`healthyKeyCount`、`cooldownKeyCount`、`disabledKeyCount`、`effectiveConcurrency` 和池修订，但不得展示任何 Key。
-11. 前台不提供在线修改 TMDB Key 的输入框，防止与 Docker 声明式配置产生双重配置源。旧草案中的单 Key 变量不再作为正式配置项，项目实现只采用复数变量。
+10. 普通 `/system/info` 只返回 `builtin.tmdb` 的 `available/degraded/unavailable`，不暴露 Key 数量和容量。管理员“系统状态”页可展示配置来源、`configuredKeyCount`、`healthyKeyCount`、`cooldownKeyCount`、`disabledKeyCount`、`effectiveConcurrency` 和池修订，但不得展示任何 Key。
+11. 管理员左侧提供独立“系统配置”入口。已有 Key 永不回显，保存语义为整组替换；更新和清空均要求二次确认、写入审计并记录不含 Key 内容的操作日志。旧草案中的单 Key、复数环境变量和 Secret 文件都不再作为正式配置项。
 
 ### 9.2 音乐元数据处理规格
 
-FlymbyScanner 的音乐元数据处理参考 FlymbyServer `AudioScrapeService` 与 `AudioMetadataSources` 的领域实现，但不直接复用 FlymbyServer 的用户鉴权、加密信封、匿名接口或管理端接口。默认部署必须在 FlymbyScanner Worker 内完成处理，避免 FlymbyServer 不可用时阻塞扫描，也避免把租户文件信息转发到另一业务服务。
+FlyCloudHelper 的音乐元数据处理参考 FlymbyServer `AudioScrapeService` 与 `AudioMetadataSources` 的领域实现，但不直接复用 FlymbyServer 的用户鉴权、加密信封、匿名接口或管理端接口。默认部署必须在 FlyCloudHelper Worker 内完成处理，避免 FlymbyServer 不可用时阻塞扫描，也避免把租户文件信息转发到另一业务服务。
 
 处理规则：
 
@@ -415,25 +390,25 @@ FlymbyScanner 的音乐元数据处理参考 FlymbyServer `AudioScrapeService` �
 8. 声纹识别只作为文字检索失败、低置信度或用户显式要求时的后备路径，不对扫描到的全部音乐文件自动执行。Worker 使用任务快照锁定的服务凭据修订，读取受大小限制的音频到独立临时目录，调用 `fpcalc` 生成 Chromaprint，只向 AcoustID 提交声纹和时长，再根据 Recording ID 查询 MusicBrainz。
 9. 声纹临时文件在成功、失败、取消或进程恢复清理时删除，不写入数据库、目录导出或长期对象存储；日志不得记录音频正文、声纹、AcoustID Key、完整原始路径或网盘请求头。
 10. 未安装 `fpcalc` 或未配置 AcoustID Key 时，服务正常启动且文字检索继续可用；能力接口将声纹标记为 `unavailable`，任务不得在运行到一半后才以未知错误失败。
-11. FlymbyServer 现有 `/api/v1/tools/audio-scrape/*` 仅作为代码与交互参考，不是 FlymbyScanner 首期依赖。以后若需要将其作为远程元数据来源，应通过独立声明式 Provider 接入，并按租户、限额和故障隔离重新设计。
+11. FlymbyServer 现有 `/api/v1/tools/audio-scrape/*` 仅作为代码与交互参考，不是 FlyCloudHelper 首期依赖。以后若需要将其作为远程元数据来源，应通过独立声明式 Provider 接入，并按租户、限额和故障隔离重新设计。
 
 音乐相关部署配置：
 
 | 配置项 | 默认值 | 规则 |
 | --- | --- | --- |
-| `FLYMBYSCANNER_MUSIC_METADATA_SOURCES` | `musicbrainz` | 逗号分隔的内置来源 ID；`auto` 只聚合这里启用且能力正常的来源，非法 ID 启动失败 |
-| `FLYMBYSCANNER_MUSICBRAINZ_USER_AGENT` | 无 | 启用 MusicBrainz 时必填，使用明确的应用名称、版本和联系方式 |
-| `FLYMBYSCANNER_ACOUSTID_API_KEY` | 无 | 可选声纹能力使用的 Key，不进入数据库、页面、日志、任务快照或导出 |
-| `FLYMBYSCANNER_ACOUSTID_API_KEY_FILE` | 无 | 指向 Docker Secret 文件；同时配置时优先读取文件内容 |
-| `FLYMBYSCANNER_FPCALC_PATH` | 从 `PATH` 查找 `fpcalc` | 只允许部署配置的固定可执行文件路径，不接受 APP 或任务上送命令 |
-| `FLYMBYSCANNER_AUDIO_TEMP_MAX_BYTES` | 实施前冻结 | 限制单个声纹临时文件；超过限制时跳过声纹并保留文字检索结果 |
-| `FLYMBYSCANNER_MUSIC_UPSTREAM_TIMEOUT_SECONDS` | `15` | 音乐元数据上游超时，实施时限制在安全范围内 |
+| `FLYCLOUDHELPER_MUSIC_METADATA_SOURCES` | `musicbrainz` | 逗号分隔的内置来源 ID；`auto` 只聚合这里启用且能力正常的来源，非法 ID 启动失败 |
+| `FLYCLOUDHELPER_MUSICBRAINZ_USER_AGENT` | 无 | 启用 MusicBrainz 时必填，使用明确的应用名称、版本和联系方式 |
+| `FLYCLOUDHELPER_ACOUSTID_API_KEY` | 无 | 可选声纹能力使用的 Key，不进入数据库、页面、日志、任务快照或导出 |
+| `FLYCLOUDHELPER_ACOUSTID_API_KEY_FILE` | 无 | 指向 Docker Secret 文件；同时配置时优先读取文件内容 |
+| `FLYCLOUDHELPER_FPCALC_PATH` | 从 `PATH` 查找 `fpcalc` | 只允许部署配置的固定可执行文件路径，不接受 APP 或任务上送命令 |
+| `FLYCLOUDHELPER_AUDIO_TEMP_MAX_BYTES` | 实施前冻结 | 限制单个声纹临时文件；超过限制时跳过声纹并保留文字检索结果 |
+| `FLYCLOUDHELPER_MUSIC_UPSTREAM_TIMEOUT_SECONDS` | `15` | 音乐元数据上游超时，实施时限制在安全范围内 |
 
 ### 9.3 声明式插件导入规格
 
 1. 首期前台只导入 `media_metadata` 声明式元数据插件，不导入 Provider 适配器或任意可执行代码。
 2. 导入包扩展名使用 `.flymby-plugin`，底层为 ZIP，必须包含 `manifest.json`；Manifest 声明插件 ID、名称、版本、协议版本、支持的媒体类型、允许访问的域名、请求模板、响应映射和字段能力。
-3. 插件导入属于 FlymbyScanner 实例级管理能力，只允许 `super_admin` 操作；普通用户只能在任务配置中选择超级管理员已启用的插件。
+3. 插件导入属于 FlyCloudHelper 实例级管理能力，只允许 `super_admin` 操作；普通用户只能在任务配置中选择超级管理员已启用的插件。
 4. 上传后先进入 `validating`，依次执行文件大小、压缩后大小、文件数量、目录穿越、重复路径、Manifest schema、插件 ID/版本、协议兼容、域名、HTTP 方法和禁止文件类型校验。
 5. 包内出现 ArkTS、JavaScript、Java、Kotlin、Python、Shell、HAR、HSP、SO、DLL、可执行文件或符号链接时直接拒绝。
 6. 校验通过后计算 SHA-256，展示插件能力、域名和版本差异，管理员确认后再原子安装到持久卷的版本目录。
@@ -441,51 +416,54 @@ FlymbyScanner 的音乐元数据处理参考 FlymbyServer `AudioScrapeService` �
 8. 停用插件只影响新任务；被任务快照、缓存或历史目录引用的版本不能直接物理删除。
 9. 导入、启用、停用和删除尝试均写入管理员审计日志，但日志不记录插件请求中的用户数据和网盘凭据。
 10. Manifest 可声明版本化 `configurationSchema`，首期字段类型限定为 `string`、`secret`、`number`、`boolean` 和 `select`，并声明标题、说明、必填、默认值、范围和选项；前端按 schema 生成配置表单，不执行插件提供的 UI 代码。
-11. 首期插件配置作用域为 FlymbyScanner 实例级，只允许 `super_admin` 修改。需要租户级或媒体库级配置时必须后续扩展明确的作用域与权限，不能在单次任务中任意上送插件 Secret。
+11. 首期插件配置作用域为 FlyCloudHelper 实例级，只允许 `super_admin` 修改。需要租户级或媒体库级配置时必须后续扩展明确的作用域与权限，不能在单次任务中任意上送插件 Secret。
 12. `secret` 字段加密保存且读取接口只返回 `configured=true/false`，编辑时留空表示保持原值；普通字段也必须经过 schema 校验、长度限制和敏感名称检查。
 13. 每次保存生成不可变 `configurationRevision`。新任务快照只引用插件 ID、版本、SHA-256 与配置修订号，不复制 Secret；运行中和历史任务继续使用原修订，不被后台编辑漂移。
-14. 插件可以声明由安全宿主执行的连接校验动作，但只能访问 Manifest 已批准域名，使用相同的 SSRF、超时、响应大小和限频策略；校验结果不得回显 Secret 或完整请求。
+14. 插件可以声明由宿主执行的连接校验动作，但只能访问 Manifest 已批准域名，并使用统一的超时、响应大小和限频策略；校验结果不得回显 Secret 或完整请求。
 15. 插件配置修改、校验、启停和删除均记录操作人、插件、修订号、结果和时间，不记录字段原值或请求正文。
 
 ### 9.4 Web 前端、登录注册与角色规格
 
-Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同时提供首次使用初始化、普通用户登录、用户注册、个人控制台和超级管理员后台；所有页面仍不支持直接播放。路由为 `/setup`、`/login`、`/register`、`/app` 和 `/admin`：
+Web 静态资源与 API 由同一 FlyCloudHelper 部署提供。前端必须同时提供首次使用初始化、普通用户登录、用户注册、个人控制台和超级管理员后台；所有页面仍不支持直接播放。路由为 `/setup`、`/login`、`/register`、`/app` 和 `/admin`：
 
 | 页面 | 能力 |
 | --- | --- |
-| `/setup` 首次使用向导 | 仅当实例 `initialSetupCompleted=false` 且不存在任何 `super_admin` 时可用，只填写超级管理员用户名、密码和确认密码，用户名和密码至少 4 个字符；不要求初始化凭证，不允许选择其他角色 |
+| `/setup` 首次使用向导 | 账号步骤只填写超级管理员用户名、密码和确认密码；未显式配置凭据主密钥时，创建成功后继续显示密钥复制、下载及确认备份步骤，不要求初始化凭证，不允许选择其他角色 |
 | `/login` 登录页 | 明确提供用户名、密码、“登录”按钮和“注册新用户”入口；两项至少 4 个字符。登录成功后，`user` 进入 `/app`，`super_admin` 进入 `/admin` 或原始授权目标 |
 | `/register` 注册页 | 明确提供用户名、密码、确认密码、“注册”按钮和“已有账号，去登录”入口；用户名和密码至少 4 个字符，公开注册固定创建 `user`，页面不得提供角色选择 |
 | `/app` 个人概览 | 只汇总当前用户的服务数、媒体库数、运行中/失败任务、媒体数量和 Scanner 能力状态 |
-| 个人服务页 | 当前用户创建、查看、编辑、验证、启停和删除自己的云端服务，维护连接/扫描/刮削配置并触发扫描；Secret 只写不读 |
-| 个人任务页 | 当前用户按服务、媒体库、媒体类型、状态和时间查看自己的任务及 SSE 实时进度 |
-| 个人海报墙 | 只浏览当前用户自己的视频、音乐和有声书；支持搜索、筛选、排序、分页和只读详情，不支持播放 |
+| 个人服务页 | 当前用户创建、查看、编辑、验证、启停和删除自己的云端服务，维护连接/扫描/刮削配置并触发扫描；服务详情提供固定当前服务的海报墙入口；Secret 只写不读 |
+| 个人任务页 | 当前用户按服务、媒体库、媒体类型、状态和时间查看自己的任务；页面每 5 秒刷新进度，支持终止活动任务、重试失败或已取消任务，以及删除已结束任务 |
+| 个人海报墙 | 先选择本人名下的一个服务，再进入 `/app/services/{serviceId}/catalog` 单服务海报墙；任何页面都不合并多个服务的数据，支持搜索、筛选、排序、分页和只读详情，不支持播放 |
 | `/admin` 超级管理员概览 | 全局用户数、服务数、媒体库数、运行中/失败任务数，以及 API、Worker、数据库、队列、存储、协议版本和 Provider/Processor 状态 |
 | 超级管理员用户页 | 搜索和筛选用户，支持创建普通用户、查看详情、重置密码、授予/撤销受保护角色、启用/停用、撤销会话和受保护删除 |
-| 超级管理员服务页 | 按用户、Provider、状态筛选全部云端服务；支持代用户创建/维护服务、触发扫描、启停和受保护删除 |
-| 超级管理员任务页 | 按用户、服务、媒体库、媒体类型、状态和时间查看全局任务及 SSE 实时进度 |
-| 超级管理员海报墙 | 按用户、服务、媒体库和媒体类型查看全局只读目录，不支持直接播放 |
+| 超级管理员服务页 | 按用户、Provider、状态筛选全部云端服务；支持代用户创建/维护服务、触发扫描、查看固定当前服务的海报墙、启停和受保护删除 |
+| 超级管理员任务页 | 按用户、服务、媒体库、媒体类型、状态和时间查看全局任务；页面每 5 秒刷新进度，支持终止、重试和删除任务 |
+| 超级管理员海报墙 | 先选择目标用户的一个服务，再进入 `/admin/services/{serviceId}/catalog` 单服务只读海报墙；不合并多个用户或服务的数据，不支持直接播放 |
 | 媒体详情页 | 只读展示通用字段、类型扩展、来源、图片、子项关系和文件数量；不展示播放按钮、播放器、临时 URL、网盘 Headers 或可直接播放的 `playbackLocator` |
 | 超级管理员配置状态页 | 展示 TMDB Key 池来源、各状态数量、动态有效并发、音乐来源、声纹能力、数据库和插件持久卷状态；Key 原文、连接地址和凭据全部隐藏 |
 | 超级管理员插件页 | 列表、详情、导入预检、版本差异、schema 驱动配置、连接校验、配置修订、启用、停用和受保护删除 |
 | 超级管理员审计页 | 按操作人、角色、操作类型、目标用户/服务/插件、结果和时间筛选脱敏审计记录 |
 
-实例的持久化 `initialSetupCompleted=false` 时处于 `setup_required`。访问 Web 根路径、`/login`、`/register`、`/app` 或 `/admin` 都跳转 `/setup`；除系统信息、初始化状态和初始化提交外，注册、登录、服务、任务、目录与管理业务接口都拒绝处理。初始化提交必须在数据库事务和初始化锁内同时检查“首次设置未完成”和“当前不存在超级管理员”，原子创建 `super_admin` 并写入 `initialSetupCompletedAt`，只能成功一次；成功后建立安全登录会话并跳转 `/admin`，之后访问 `/setup` 应跳转 `/login` 或返回“初始化已完成”。即使管理员数据被异常删除，也不能自动把已初始化实例重新开放为首次设置状态。初始化请求不要求一次性凭证，因此部署者必须先完成首次设置，再通过反向代理、防火墙或端口映射把实例开放到公网。
+实例的持久化 `initialSetupCompleted=false` 时处于 `setup_required`。访问 Web 根路径、`/login`、`/register`、`/app` 或 `/admin` 都跳转 `/setup`；除系统信息、初始化状态和初始化提交外，注册、登录、服务、任务、目录与管理业务接口都拒绝处理。初始化提交必须在数据库事务内同时检查“首次设置未完成”和“当前不存在超级管理员”，原子创建 `super_admin` 并写入 `initialSetupCompletedAt`，只能成功一次。若主密钥由服务自动生成，成功响应和受保护的待备份接口向该超级管理员返回密钥原文；管理员必须复制或下载并确认，确认操作写入审计，之后接口不再返回原文并进入 `/admin`。即使管理员数据被异常删除，也不能自动把已初始化实例重新开放为首次设置状态。初始化请求不要求一次性凭证，因此部署者必须先完成首次设置和密钥备份，再通过反向代理、防火墙或端口映射把实例开放到公网。
 
 登录页和注册页都必须能相互跳转。未登录访问 `/app` 或 `/admin` 时跳转 `/login` 并携带站内安全回跳目标；普通用户访问 `/admin` 或 `/api/v1/admin/*` 必须返回 `403`，不能仅依赖前端隐藏菜单。公开注册请求不得接受 `role`，首个超级管理员只能由首次使用向导创建；后续超级管理员只能由已有超级管理员通过受保护接口授予，并需要二次确认、最近重新认证、撤销目标用户旧会话和完整审计。
 
-用户和服务管理采用软停用与受保护删除：停用阻止新认证或新任务但保留目录；删除前必须展示影响范围并进行二次确认，异步清理目录、任务、导出和临时数据。采用 Cookie 会话时必须启用 CSRF 防护、`HttpOnly`、`Secure` 和合适的 `SameSite`；同时配置 CSP、注册/登录限频和操作审计。反向代理部署时允许另外限制 `/admin` 和 `/api/v1/admin/*` 的来源 IP。
+用户和服务管理采用软停用与受保护删除：停用阻止新认证或新任务但保留目录；删除前必须展示影响范围并进行二次确认，异步清理目录、任务、导出和临时数据。采用 Cookie 会话时必须启用 CSRF 防护、`HttpOnly`、`Secure` 和合适的 `SameSite`；同时配置 CSP 和操作审计。反向代理部署时允许另外限制 `/admin` 和 `/api/v1/admin/*` 的来源 IP。
 
-海报墙必须使用管理端专用只读 DTO。即使底层目录实体包含客户端播放所需定位信息，管理接口也必须删除 `playbackLocator`、网盘资源请求头、临时 URL 和凭据引用，避免通过浏览器调试工具绕过“无播放”界面限制。图片只使用已允许的封面/海报地址或服务端缓存，不以媒体文件生成预览片段。
+海报墙必须使用 Web 前端专用只读 DTO。即使底层目录实体包含客户端播放所需定位信息，普通用户和管理接口也必须删除 `playbackLocator`、网盘资源请求头、临时 URL 和凭据引用，避免通过浏览器调试工具绕过“无播放”界面限制。图片只使用已允许的封面/海报地址或服务端缓存，不以媒体文件生成预览片段。
 
 海报墙展示规则：
 
-1. 普通用户海报墙固定使用认证用户的 `tenantId`，不能选择其他用户；超级管理员海报墙先选择目标用户和服务，再选择媒体库与 `video/music/audiobook`，且不允许默认混合多个用户或服务。
-2. 视频电影/剧集优先使用纵向海报，音乐专辑和有声书优先使用方形封面；缺图时按媒体类型使用本地占位，不使用媒体帧截图。
-3. 卡片至少展示标题、类型、年份或发布日期摘要、匹配状态和最近更新时间；扫描中的新增条目可展示“处理中”状态，但只显示已事务提交的数据。
-4. 点击卡片进入只读详情，不以单击、双击、长按、右键或键盘快捷键触发播放、预览或下载。
-5. 搜索、facets、排序和分页状态写入前端路由查询参数，刷新或返回时可恢复当前用户、服务、媒体类型和列表位置，但 URL 不包含敏感标识以外的配置值。
-6. SSE 只负责通知条目或计数变化；海报墙收到事件后按 `catalogVersion` 增量刷新，不把完整媒体记录塞入事件流。
+1. 普通用户海报墙固定使用认证用户的 `tenantId`，不能选择其他用户；超级管理员先选择目标用户的单个服务，再选择该服务的媒体库与 `video/music/audiobook`，任何页面都不混合多个用户或服务的数据。
+2. 服务详情的海报墙必须把路由中的 `serviceId` 作为强制作用域，联合校验 `tenantId + serviceId + libraryId`；用户端不得通过查询参数切换到其他服务，管理员端不得混入其他用户或其他服务的数据。
+3. 视频电影/剧集优先使用纵向海报，并在卡片上明确标注“电影”或“节目”；音乐专辑和有声书优先使用方形封面；缺图时按媒体类型使用本地占位，不使用媒体帧截图。
+4. 卡片至少展示标题、类型、年份或发布日期摘要、匹配状态和最近更新时间；扫描中的新增条目可展示“处理中”状态，但只显示已事务提交的数据。
+5. 点击卡片进入只读详情，不以单击、双击、长按、右键或键盘快捷键触发播放、预览或下载。
+6. 搜索、facets、排序和分页状态写入前端路由查询参数，刷新或返回时可恢复当前用户、服务、媒体类型和列表位置，但 URL 不包含敏感标识以外的配置值。
+7. SSE 只负责通知条目或计数变化；海报墙收到事件后按 `catalogVersion` 增量刷新，不把完整媒体记录塞入事件流。
+8. 匹配状态筛选默认选择“已匹配”，用户可以切换待确认、未匹配、处理中或全部；影视类型支持电影、节目和全部。
+9. 影视详情可以展示只读文件路径，并提供电影/节目 TMDB 手动匹配和清除匹配；路径响应不得包含播放定位、请求头、临时 URL 或凭据，清除匹配必须二次确认。
 
 ## 10. 服务端接口规格
 
@@ -493,16 +471,16 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
 
 #### `GET /api/v1/system/info`
 
-用于 APP 添加网盘服务时检测 FlymbyScanner 身份，不接收网盘凭据。
+用于 APP 添加网盘服务时检测 FlyCloudHelper 身份，不接收网盘凭据。
 
 ```json
 {
-  "service": "flymby-scanner",
+  "service": "flycloud-helper",
   "serviceInstanceId": "scanner-01",
   "protocolVersion": 1,
   "status": "ready",
   "setupRequired": false,
-  "supportedMediaTypes": ["video", "music", "audiobook"],
+  "supportedMediaTypes": ["video"],
   "providers": [
     {
       "type": "webdav",
@@ -519,7 +497,7 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
   ],
   "metadataProviders": [
     {"id": "builtin.tmdb", "status": "available", "supportedMediaTypes": ["video"]},
-    {"id": "builtin.musicbrainz", "status": "available", "supportedMediaTypes": ["music"]},
+    {"id": "builtin.musicbrainz", "status": "unavailable", "reasonCode": "media_type_not_enabled", "supportedMediaTypes": ["music"]},
     {"id": "builtin.acoustid", "status": "unavailable", "reasonCode": "missing_configuration", "supportedMediaTypes": ["music"]}
   ],
   "features": {
@@ -550,8 +528,10 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/api/v1/setup/status` | 返回 `setupRequired`，不返回现有超级管理员用户名、数量或其他账号信息 |
-| POST | `/api/v1/setup/super-admin` | 仅在 `initialSetupCompleted=false` 且不存在 `super_admin` 时，使用用户名、密码和确认密码创建首个超级管理员并原子完成初始化；不要求初始化凭证，成功后建立安全会话 |
+| GET | `/api/v1/setup/status` | 返回 `setupRequired` 和 `credentialKeyBackupRequired`，不返回密钥、管理员用户名、数量或其他账号信息 |
+| POST | `/api/v1/setup/super-admin` | 仅在 `initialSetupCompleted=false` 且不存在 `super_admin` 时创建首个超级管理员并建立安全会话；自动生成密钥仍待备份时在成功响应中返回一次备份 DTO |
+| GET | `/api/v1/setup/credential-key-backup` | 仅允许已登录超级管理员在待备份状态读取自动生成主密钥；确认后返回 `410` |
+| POST | `/api/v1/setup/credential-key-backup/acknowledge` | 要求 `confirmed=true`，清除待备份状态并写入不含密钥的审计记录 |
 | POST | `/api/v1/auth/register` | 使用至少 4 个字符的用户名、至少 4 个字符的密码、确认密码和可选注册码创建普通用户账号；成功后返回访问令牌、刷新令牌和账号摘要 |
 | POST | `/api/v1/auth/login` | 使用用户名和密码登录；返回短期访问令牌和可轮换刷新令牌 |
 | POST | `/api/v1/auth/refresh` | 轮换刷新令牌并取得新访问令牌 |
@@ -564,7 +544,7 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
 2. 密码最少 4 个 Unicode 字符。密码按用户输入原值处理，不自动去除首尾空白或改变大小写；注册和重置时确认密码必须完全一致。
 3. 注册、超级管理员创建用户、首次使用初始化超级管理员和密码重置必须使用同一长度校验。用户名或密码少于 4 个字符时返回 `400 validation_error`，字段错误分别为“用户名至少需要4个字符”和“密码至少需要4个字符”。
 4. 登录接口即使收到少于 4 个字符的输入，也只返回统一的“用户名或密码错误”，不借格式错误暴露账号是否存在。
-5. 密码只保存 Argon2id 哈希及参数，永不保存可逆明文；登录、注册和重置密码均需限频并写入不含密码的安全审计。
+5. 密码只保存 Argon2id 哈希及参数，永不保存可逆明文；账号管理操作写入不含密码的安全审计。
 6. APP 不持久化用户名对应的明文密码，只把访问令牌和刷新令牌写入系统安全存储；Web 使用安全 Cookie 或等价安全会话，刷新令牌必须支持轮换和撤销。
 7. 角色首期固定为 `user` 和 `super_admin`。公开注册只能创建 `user`，请求体中的 `role` 字段必须拒绝；首个 `super_admin` 只能通过首次使用向导产生，后续只能由现有超级管理员的受审计操作产生。
 8. 首期每个账号（包括 `super_admin`）都对应一个个人 `tenantId`，角色提升不改变原租户。注册入口必须存在；是否直接开放提交、要求注册码或要求超级管理员审核由部署策略决定，页面需展示当前策略结果。
@@ -577,21 +557,24 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | GET | `/api/v1/services` | 列出当前账号可访问的云端服务；支持按 `providerType`、状态和关键字筛选，供多端选择 |
-| POST | `/api/v1/services` | 把 APP 当前服务创建为新的云端服务；提交连接、扫描和刮削配置，验证后生成 `serviceId + libraryId` |
+| POST | `/api/v1/services` | 把 APP 当前服务创建为新的云端服务；`dataType` 必填且当前只接受 `video`，提交连接、扫描和刮削配置后生成 `serviceId + libraryId` |
 | GET | `/api/v1/services/{serviceId}` | 查询云端服务、媒体库、配置修订、连接状态和最近任务，不返回 Secret |
+| GET | `/api/v1/services/{serviceId}/directories` | 使用服务端已保存凭据读取 Provider 根目录或指定目录的直接子目录，供扫描路径选择器逐级浏览；不返回文件和凭据 |
 | POST | `/api/v1/services/{serviceId}/client-bindings` | 将当前设备的 `clientServiceId` 绑定到已有云端服务，不覆盖服务端配置 |
 | POST | `/api/v1/services/{serviceId}/connection/validate` | 验证待保存的网盘连接，结果不回显 Secret |
 | PUT | `/api/v1/services/{serviceId}/connection` | 更新并加密保存连接信息，验证成功后生成新的 `credentialRevision` |
 | PUT | `/api/v1/services/{serviceId}/scan-profile` | 更新扫描路径、媒体类型和删除保护策略，生成新的 `scanProfileRevision` |
-| PUT | `/api/v1/services/{serviceId}/metadata-profile` | 更新视频、音乐、有声书刮削配置，生成新的 `metadataProfileRevision` |
+| PUT | `/api/v1/services/{serviceId}/metadata-profile` | 更新与服务 `dataType` 一致的刮削配置，生成新的 `metadataProfileRevision`；当前只接受影视配置 |
+| DELETE | `/api/v1/services/{serviceId}/catalog` | 二次确认后清空当前服务的媒体条目、文件索引和目录变更，保留连接、扫描配置、刮削配置和任务历史；存在活动任务时拒绝 |
 | POST | `/api/v1/services/{serviceId}/scan-jobs` | 使用服务当前配置修订触发扫描；请求不携带连接、路径和刮削配置 |
 | GET | `/api/v1/libraries/{libraryId}` | 查询媒体库、目录版本和最近任务 |
-| GET | `/api/v1/scan-jobs/{jobId}` | 查询任务状态、阶段、计数和错误摘要 |
+| GET | `/api/v1/scan-jobs/{jobId}` | 查询任务状态、阶段、当前扫描路径和计数；影视扫描文件数按视频文件统计，处理、匹配、未匹配和错误按完整电影或节目聚合 |
 | GET | `/api/v1/scan-jobs/{jobId}/events` | SSE 接收进度、重新授权状态和目录变更 |
 | POST | `/api/v1/scan-jobs/{jobId}/pause` | 暂停可恢复任务 |
 | POST | `/api/v1/scan-jobs/{jobId}/resume` | 按原配置快照继续 |
 | POST | `/api/v1/scan-jobs/{jobId}/cancel` | 取消任务并释放检查点资源，不删除云端服务凭据 |
 | POST | `/api/v1/scan-jobs/{jobId}/retry` | 在明确选择后使用服务的最新有效配置修订创建重试任务；不得修改原任务快照 |
+| DELETE | `/api/v1/scan-jobs/{jobId}` | 二次确认后删除已完成、失败或已取消任务及其进度事件；活动任务必须先终止 |
 
 服务创建、列表和绑定接口均不接收可用于授权的 `tenantId`。后续所有带 `serviceId`、`libraryId`、`jobId` 或 `exportId` 的接口都必须从认证上下文追加租户过滤条件，并校验资源链最终属于当前租户。客户端即使能够猜到其他租户的 UUID，也只能得到 `403` 或不泄露资源存在性的统一拒绝响应。
 
@@ -606,7 +589,7 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
 | GET | `/api/v1/libraries/{libraryId}/items/{itemId}/children` | 按关系查询剧集、曲目、章节、分卷等子项 |
 | GET | `/api/v1/libraries/{libraryId}/items/{itemId}/files` | 查询条目或子项关联的网盘文件定位 |
 | GET | `/api/v1/libraries/{libraryId}/search` | 按媒体类型搜索标题、原始标题、艺术家、作者、演播者、人物和类型 |
-| GET | `/api/v1/libraries/{libraryId}/changes` | 按 `afterVersion` 拉取新增、修改和删除变更 |
+| GET | `/api/v1/libraries/{libraryId}/changes` | 按 `afterVersion` 拉取新增、修改和删除变更；每条变化使用独立递增版本，响应返回 `nextVersion` 与 `hasMore`，客户端继续使用 `nextVersion` 拉取时不会跳过同一扫描批次的剩余条目 |
 
 列表接口使用 `cursor + limit`，响应统一带上 `catalogVersion`。扫描期间不建议只使用 offset，避免持续插入数据导致重复或遗漏。
 
@@ -628,6 +611,7 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
 | --- | --- | --- |
 | GET | `/api/v1/admin/status` | 查询用户/服务/媒体/任务汇总，以及 API、Worker、数据库、队列、存储和版本状态 |
 | GET | `/api/v1/admin/config/status` | 查询 TMDB Key 池来源、各状态数量、有效并发和修订，以及音乐来源、声纹、数据库连接/schema 状态，不返回敏感值 |
+| PUT | `/api/v1/admin/config/tmdb-keys` | 使用完整新列表替换或清空系统 TMDB Key 池；只保存凭据主密钥加密的整体密文，响应不返回任何 Key |
 | GET | `/api/v1/admin/users` | 按关键字、状态和分页查询已有用户及服务数、媒体数、任务状态、配额和最近活动 |
 | POST | `/api/v1/admin/users` | 超级管理员创建普通用户；用户名和初始密码都至少 4 个字符，用户名冲突返回 `409`，密码只进入哈希流程 |
 | GET | `/api/v1/admin/users/{userId}` | 查询用户详情、设备摘要、服务绑定、媒体库、任务和容量统计，不返回认证密文 |
@@ -637,17 +621,22 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
 | POST | `/api/v1/admin/users/{userId}/sessions/revoke` | 撤销用户当前登录会话和设备令牌 |
 | DELETE | `/api/v1/admin/users/{userId}` | 二次确认后创建受保护的异步删除任务 |
 | GET | `/api/v1/admin/services` | 按用户、Provider、状态和分页查询云端服务及媒体库摘要 |
-| POST | `/api/v1/admin/services` | 为指定用户创建云端服务，验证并加密保存连接，生成服务、媒体库和配置修订 |
+| POST | `/api/v1/admin/services` | 为指定用户创建云端服务；`dataType` 必填且当前只接受 `video`，验证并加密保存连接 |
 | GET | `/api/v1/admin/services/{serviceId}` | 查询服务、客户端绑定、脱敏连接状态、扫描/刮削配置、媒体统计、目录版本和最近任务 |
+| GET | `/api/v1/admin/services/{serviceId}/directories` | 管理员按目标服务逐级读取网盘目录，返回统一目录 DTO，不回显连接 Secret |
 | POST | `/api/v1/admin/services/{serviceId}/connection/validate` | 管理员验证待保存连接；输入 Secret 不写日志，响应不回显 |
 | PUT | `/api/v1/admin/services/{serviceId}/connection` | 更新连接并生成新凭据修订，Secret 只写不读 |
 | PUT | `/api/v1/admin/services/{serviceId}/scan-profile` | 更新扫描路径和媒体类型并生成新配置修订 |
-| PUT | `/api/v1/admin/services/{serviceId}/metadata-profile` | 更新三类媒体刮削配置并生成新配置修订 |
+| PUT | `/api/v1/admin/services/{serviceId}/metadata-profile` | 更新与服务 `dataType` 一致的刮削配置并生成新配置修订；当前只接受影视配置 |
 | POST | `/api/v1/admin/services/{serviceId}/scan-jobs` | 以服务当前配置修订触发扫描并写入管理员审计 |
 | PATCH | `/api/v1/admin/services/{serviceId}/status` | 启用或停用服务；停用阻止新任务但保留目录和配置 |
+| DELETE | `/api/v1/admin/services/{serviceId}/catalog` | 二次确认后清空目标单一服务的扫描与刮削结果；存在活动任务时拒绝并写入审计 |
 | DELETE | `/api/v1/admin/services/{serviceId}` | 二次确认后删除目标服务及其媒体库和加密凭据，不影响同用户其他服务 |
 | GET | `/api/v1/admin/jobs` | 按用户、服务、媒体库、媒体类型、状态和时间分页查询任务摘要与脱敏错误 |
 | GET | `/api/v1/admin/jobs/{jobId}` | 查询任务快照摘要、阶段、计数、百分比、吞吐、检查点和脱敏错误 |
+| POST | `/api/v1/admin/jobs/{jobId}/cancel` | 终止排队中、运行中或暂停中的任务并写入审计 |
+| POST | `/api/v1/admin/jobs/{jobId}/retry` | 为失败或已取消任务创建新的关联重试任务；保留原任务并在新任务快照记录 `retryOfJobId` |
+| DELETE | `/api/v1/admin/jobs/{jobId}` | 二次确认后删除已结束任务及其事件；活动任务必须先终止并写入审计 |
 | GET | `/api/v1/admin/jobs/events` | 使用 SSE 推送跨租户任务进度；必须支持用户、服务和任务过滤及断线续传 |
 | GET | `/api/v1/admin/catalog/items` | 按用户、服务、媒体库、媒体类型、facets、搜索、排序和游标返回海报墙只读 DTO |
 | GET | `/api/v1/admin/catalog/items/{itemId}` | 查询海报墙只读详情，不返回 `playbackLocator`、临时 URL 或网盘 Headers |
@@ -680,8 +669,7 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
 | 413 | 插件包、解压大小或文件数量超过限制 |
 | 415 | 插件包格式或文件类型不允许 |
 | 422 | Provider、插件或协议能力不支持 |
-| 429 | 请求、扫描或插件限频 |
-| 503 | Worker、数据库或目标网盘暂时不可用 |
+| 503 | Worker、数据库或目标网盘暂时不可用；Provider 连接阶段使用 `provider_dns_resolution_failed`、`provider_resolved_address_invalid`、`provider_connection_refused`、`provider_network_unreachable`、`provider_connection_timeout`、`provider_tls_failed` 或 `provider_unavailable` 区分原因，并在中文消息中给出地址、端口、DNS 或代理方面的处理建议 |
 
 ## 11. 媒体目录数据规格
 
@@ -689,12 +677,12 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
 
 | 实体 | 核心信息 |
 | --- | --- |
-| `system_state` | 稳定 `serviceInstanceId`、`initialSetupCompletedAt`、协议/schema 版本和实例级状态；初始化完成时间只能由首次设置事务写入，不能因管理员异常缺失而自动清空 |
+| `system_state` | 稳定 `serviceInstanceId`、`initialSetupCompletedAt`、主密钥不可逆指纹、密钥来源、待备份状态、协议/schema 版本和实例级状态；不得保存主密钥原文 |
 | `user_account` | 运营模式下的用户身份、`role`（`user`/`super_admin`）、状态、配额、最近活动和删除状态；认证密文与管理 DTO 分离 |
 | `user_password` | 用户名唯一比较值、Argon2id 哈希、算法参数、密码版本和修改时间；与用户管理 DTO 分离 |
 | `tenant_space` | `tenantId`、租户状态、配额和数据保留策略；个人账号也映射到独立租户空间 |
 | `client_device` | 设备 ID、平台、协议版本和最近在线时间 |
-| `cloud_service` | `serviceId`、`tenantId`、显示名称、`providerType`、`libraryId`、创建来源、连接状态和启停/删除状态 |
+| `cloud_service` | `serviceId`、`tenantId`、显示名称、`providerType`、`dataType`、`libraryId`、创建来源、连接状态和启停/删除状态；当前 `dataType` 只允许 `video` |
 | `client_service_link` | `tenantId`、`serviceId`、`clientDeviceId`、`clientServiceId`、本地 Provider 和最近绑定时间；只用于客户端本地播放关联 |
 | `service_credential` | `tenantId`、`serviceId`、`credentialRevision`、密文、密钥版本、Provider schema 版本、状态和更新时间；Secret 只写不读 |
 | `service_scan_profile` | `tenantId`、`serviceId`、`scanProfileRevision`、扫描根、媒体类型和删除保护策略 |
@@ -735,25 +723,26 @@ Web 静态资源与 API 由同一 FlymbyScanner 部署提供。前端必须同�
 
 | 环境变量 | 默认值 | 规则 |
 | --- | --- | --- |
-| `FLYMBYSCANNER_DATABASE_TYPE` | `sqlite` | 可选值为 `sqlite`、`postgres`、`mysql`；未配置或为空时使用 SQLite，其他值启动失败 |
-| `FLYMBYSCANNER_SQLITE_PATH` | `/data/database/flymby-scanner.db` | 仅 SQLite 使用；父目录必须位于持久卷并可写 |
-| `FLYMBYSCANNER_DATABASE_URL` | 无 | PostgreSQL/MySQL 必填，例如 `postgresql://...` 或 `mysql://...`；属于敏感配置，不得回显 |
-| `FLYMBYSCANNER_DATABASE_URL_FILE` | 无 | 指向包含数据库连接地址的 Docker Secret 文件；同时配置时优先于 `FLYMBYSCANNER_DATABASE_URL` |
-| `FLYMBYSCANNER_CREDENTIAL_MASTER_KEY` | 无 | 服务凭据库主密钥；仅适合受控开发环境，生产环境优先使用 Secret 文件 |
-| `FLYMBYSCANNER_CREDENTIAL_MASTER_KEY_FILE` | 无 | 指向服务凭据库主密钥的 Docker Secret 文件；同时配置时优先于明文环境变量 |
+| `FLYCLOUDHELPER_DATABASE_TYPE` | `sqlite` | 可选值为 `sqlite`、`postgres`、`mysql`；未配置或为空时使用 SQLite，其他值启动失败 |
+| `FLYCLOUDHELPER_SQLITE_PATH` | `/data/database/flycloud-helper.db` | 仅 SQLite 使用；父目录必须位于持久卷并可写 |
+| `FLYCLOUDHELPER_DATABASE_URL` | 无 | PostgreSQL/MySQL 必填，例如 `postgresql://...` 或 `mysql://...`；属于敏感配置，不得回显 |
+| `FLYCLOUDHELPER_DATABASE_URL_FILE` | 无 | 指向包含数据库连接地址的 Docker Secret 文件；同时配置时优先于 `FLYCLOUDHELPER_DATABASE_URL` |
+| `FLYCLOUDHELPER_CREDENTIAL_MASTER_KEY` | 无 | 可选的外部主密钥；配置时至少 32 个字符，仅适合受控开发环境 |
+| `FLYCLOUDHELPER_CREDENTIAL_MASTER_KEY_FILE` | 无 | 可选 Docker Secret 文件；同时配置时优先于明文环境变量和自动生成文件 |
+| `FLYCLOUDHELPER_GENERATED_CREDENTIAL_KEY_PATH` | `/data/secrets/credential-master-key` | 外部主密钥均未配置时，保存自动生成主密钥的持久化文件 |
 
 后端规则：
 
 1. 未配置数据库环境变量时自动创建或打开默认 SQLite 文件，不要求额外部署数据库容器。
-2. SQLite 启用外键、WAL 和合理的 busy timeout，只支持本机持久卷与受控单写入模型，不支持把同一文件挂载给多个 FlymbyScanner 副本或放在不保证文件锁语义的网络文件系统上。
+2. SQLite 启用外键、WAL 和合理的 busy timeout，只支持本机持久卷与受控单写入模型，不支持把同一文件挂载给多个 FlyCloudHelper 副本或放在不保证文件锁语义的网络文件系统上。
 3. PostgreSQL 和 MySQL 使用独立数据库服务；PostgreSQL 建议用于官方多租户和高并发部署，MySQL 要求 8.0 及以上并使用 `utf8mb4`、严格模式和 UTC 时区。
 4. API、Worker、迁移命令必须读取同一套数据库配置。数据库不可连接、SQLite 目录不可写、类型不支持或连接地址缺失时，服务启动失败并输出不包含密码的中文错误。
 5. 三种数据库使用同一逻辑 schema 和迁移版本，但通过方言适配器处理自增、时间、JSON、全文搜索、分页和索引差异；核心表不使用数据库原生 Provider/媒体类型枚举。
 6. 跨数据库的一致排序不能依赖数据库默认 collation，应使用业务层明确维护的排序字段，保证中文名称和混合字符在三种后端中结果稳定。
 7. 启动时只能由一个迁移执行者获取迁移锁并升级 schema；其他 API/Worker 等待完成后再提供服务。
-8. 修改 `FLYMBYSCANNER_DATABASE_TYPE` 或连接地址不会自动复制旧数据。需要保留数据时必须先停止写入，再使用专用数据库迁移/导出导入命令；不允许 API 与 Worker 分别连接不同数据库。
+8. 修改 `FLYCLOUDHELPER_DATABASE_TYPE` 或连接地址不会自动复制旧数据。需要保留数据时必须先停止写入，再使用专用数据库迁移/导出导入命令；不允许 API 与 Worker 分别连接不同数据库。
 9. 管理前台只展示数据库类型、连接状态、schema 版本和迁移状态，不返回 SQLite 宿主路径、数据库主机、用户名、密码或完整连接地址。
-10. 由于当前方案只支持云端托管凭据模式，凭据主密钥未配置、长度不合规或无法读取时，服务不得进入 `ready`，也不得接受注册、创建服务和扫描请求。
+10. 外部主密钥未配置时自动生成 32 字节随机值并以 `0600` 权限写入持久卷；数据库保存 SHA-256 指纹。既有指纹不一致，或旧数据库已有加密凭据但原密钥缺失时，服务拒绝启动，不能静默生成新密钥覆盖。
 11. 主密钥轮换必须使用显式运维命令逐批重加密 `service_credential`，保留密钥版本和可恢复检查点；仅修改环境变量不得导致现有凭据永久不可读。
 
 ### 11.3 播放定位
@@ -791,24 +780,24 @@ APP 必须在本地存在与 `libraryId` 关联的网盘服务实例后才能播
 
 | 风险 | 强制措施 |
 | --- | --- |
-| 账号密码泄露 | 密码使用 Argon2id 哈希；登录/注册限频；登录失败不暴露账号存在性；APP 不持久化明文密码；重置密码后撤销旧会话 |
+| 账号密码泄露 | 密码使用 Argon2id 哈希；登录失败不暴露账号存在性；APP 不持久化明文密码；重置密码后撤销旧会话 |
 | 未初始化实例被抢占 | 首次设置不要求初始化凭证，公网访客可能先创建超级管理员 | `setup_required` 时关闭全部业务接口；部署文档和启动提示要求先在受控网络完成 `/setup`，完成后再开放公网；初始化事务只允许成功一次 |
 | 公开注册提权 | 注册 DTO 不接收 `role`，服务端固定写入 `user`；角色授予只允许 `super_admin`，要求最近重新认证、二次确认、撤销目标旧会话并记录审计 |
 | 超级管理员全部失效 | 禁止停用、删除或撤销实例最后一个有效 `super_admin`；首次部署初始化和后续角色变更都检查至少保留一个可登录超级管理员 |
 | 网盘凭据泄露 | 长期密文与目录分表、独立主密钥、每服务作用域、密钥版本、最小权限、Secret 只写不读、永不记录日志或进入导出 |
 | 跨租户越权 | `tenantId` 只从认证上下文取得；每个 Repository 查询、任务、SSE、导出、缓存和对象路径同时限定 `tenantId + libraryId` |
 | 伪造服务绑定 | 所有服务、扫描和目录请求校验 `tenantId + serviceId + libraryId` 所有权链；客户端绑定另行校验设备、本地服务和 Provider 类型 |
-| SSRF | 域名允许列表、DNS/IP 双校验、禁止内网/回环/元数据地址和跨主机重定向 |
-| 密钥或备份泄露 | 主密钥不进入数据库卷、数据库快照或目录导出；服务凭据不进入 APP 备份和目录导出，数据库备份与主密钥分开保管 |
+| Provider 出站地址不受限制 | 系统不拦截公网、内网、回环、链路本地或保留网段；保留 URL 格式、协议开关、超时和同源扫描根校验，部署者自行控制 Provider 配置权限和容器网络边界 |
+| 密钥或备份泄露 | 主密钥原文不进入数据库文件、数据库快照或目录导出；自动生成文件位于持久卷但必须由管理员另行备份，服务凭据不进入 APP 备份和目录导出 |
 | 日志泄露 | 安全审计日志与扫描业务日志分离，对 URL、Headers、文件路径和用户标识脱敏 |
-| TMDB Key 池泄露或滥用 | 多 Key 只从环境变量或 Secret 文件读取；普通 API 不返回数量，管理 API 只返回计数/状态/并发；Key 原文、局部值、哈希和可反推标识禁止写入数据库、日志、备份和任务快照；动态并发受部署级上限和公平队列约束 |
+| TMDB Key 池泄露或滥用 | 仅 `super_admin` 可在系统配置页整组替换；数据库只保存凭据主密钥加密的整体密文，读取 API 只返回计数/状态/并发；Key 原文、局部值和可反推标识禁止进入日志、备份和任务快照；写操作要求二次确认和审计，动态并发受部署级上限和公平队列约束 |
 | 音乐来源配置泄露 | AcoustID Key 只从环境变量或 Secret 文件读取；管理 API 只返回能力状态，日志不得记录 Key、声纹或 MusicBrainz User-Agent 联系信息 |
 | 声纹临时文件残留 | 受限临时目录、单文件大小限制、固定 `fpcalc` 路径、任务终态删除和启动恢复清理；音频及声纹不进入数据库、导出或长期存储 |
 | 数据库连接信息泄露 | URL 只从环境变量或 Secret 文件读取；日志、管理 API、错误、诊断包和页面不得返回密码或完整连接地址 |
 | SQLite 文件损坏或锁冲突 | 使用本机持久卷、WAL、外键、busy timeout 和单迁移/受控写入；禁止多副本共享同一 SQLite 文件 |
 | 插件上传攻击 | 仅 `super_admin` 可导入声明式包；限制上传/解压规模，阻止目录穿越、符号链接、压缩炸弹、可执行文件和覆盖安装 |
 | 第三方插件 | 仅允许受限声明式 Manifest，审核来源、访问权限和请求边界；任务固定插件版本与 SHA-256 |
-| 管理前台越权 | 服务端强制校验 `super_admin`，管理路由隔离，配合登录限频、CSRF/CSP、安全 Cookie、操作审计和可选反向代理 IP 限制；不能只隐藏前端菜单 |
+| 管理前台越权 | 服务端强制校验 `super_admin`，管理路由隔离，配合 CSRF/CSP、安全 Cookie、操作审计和可选反向代理 IP 限制；不能只隐藏前端菜单 |
 | 跨租户管理查询串库 | 管理 API 先解析目标用户到 `tenantId`，再以租户和资源 ID 联合查询；缓存、搜索、SSE 和海报墙 DTO 保留租户作用域 |
 | 海报墙形成播放入口 | 管理 DTO 删除 `playbackLocator`、临时 URL、网盘 Headers 和凭据引用；页面不渲染播放器、播放按钮或媒体预览 |
 | 用户/服务误删除 | 默认软停用；永久删除展示影响范围、二次确认并异步执行，任务可审计且不影响其他服务绑定 |
@@ -841,13 +830,13 @@ APP 必须在本地存在与 `libraryId` 关联的网盘服务实例后才能播
 
 | 系统 | 证据来源 | 影响范围 | 修改类型 | 依赖系统 | 结论 |
 | --- | --- | --- | --- | --- | --- |
-| FlymbyScanner | 用户最新需求 | 全新 Docker 服务、数据库、Worker、API | 新增 | 网盘、元数据源 | 明确涉及 |
-| HarmonyOS Flymby | 用户确认 APP 负责配置与播放 | 服务添加、扫描、目录 Repository、详情、搜索、备份 | 修改 | FlymbyScanner | 明确涉及 |
-| Android TV | 用户确认需要 TV 使用 | 网盘服务、远端目录、播放定位 | 新增/修改 | FlymbyScanner、网盘 | 明确涉及 |
+| FlyCloudHelper | 用户最新需求 | 全新 Docker 服务、数据库、Worker、API | 新增 | 网盘、元数据源 | 明确涉及 |
+| HarmonyOS Flymby | 用户确认 APP 负责配置与播放 | 服务添加、扫描、目录 Repository、详情、搜索、备份 | 修改 | FlyCloudHelper | 明确涉及 |
+| Android TV | 用户确认需要 TV 使用 | 网盘服务、远端目录、播放定位 | 新增/修改 | FlyCloudHelper、网盘 | 明确涉及 |
 | 网盘 Provider | 现有 CloudDriveProvider | 扫描枚举与客户端播放解析 | 适配 | 用户授权 | 明确涉及 |
 | 媒体处理器 | 用户最新补充 | 视频、音乐、有声书识别、领域关系和目录投影 | 新增 | Scanner、Catalog | 明确涉及 |
-| 元数据来源 | TMDB 多 Key 池、内嵌标签与声明式插件 | 视频/音乐/有声书详情、图片、字段、缓存；TMDB 增加 Key 池调度、健康状态、冷却/禁用、部署级动态并发和公平队列 | 集成 | FlymbyScanner Worker/任务调度 | 明确涉及 |
-| FlymbyServer 音乐刮削实现 | 用户指定参考现有方法 | 参考聚合策略、统一字段、来源适配、能力状态和可选声纹链路；不修改 FlymbyServer，不建立默认在线依赖 | 参考/迁移 | FlymbyScanner 音乐 Processor | 明确涉及 |
+| 元数据来源 | TMDB 多 Key 池、内嵌标签与声明式插件 | 视频/音乐/有声书详情、图片、字段、缓存；TMDB 增加 Key 池调度、健康状态、冷却/禁用、部署级动态并发和公平队列 | 集成 | FlyCloudHelper Worker/任务调度 | 明确涉及 |
+| FlymbyServer 音乐刮削实现 | 用户指定参考现有方法 | 参考聚合策略、统一字段、来源适配、能力状态和可选声纹链路；不修改 FlymbyServer，不建立默认在线依赖 | 参考/迁移 | FlyCloudHelper 音乐 Processor | 明确涉及 |
 | Web 前端 | 用户最新补充 | `/login` 登录、`/register` 普通用户注册、`/app` 个人控制台、`/admin` 超级管理员后台；包含服务管理、实时任务进度、三类媒体海报墙、插件与审计，不支持直接播放 | 新增 | 账户认证、RBAC、管理 API、Catalog、SSE、插件持久卷 | 明确涉及 |
 | 数据库存储 | 用户最新补充 | SQLite 默认后端、PostgreSQL/MySQL 环境变量切换、方言迁移和管理状态 | 新增 | 配置加载、迁移器、持久卷/外部数据库 | 明确涉及 |
 | 认证/账户系统 | 用户最新明确统一用户名和密码 | 用户名和密码至少 4 个字符；注册、登录、密码哈希、会话轮换、`user/super_admin` RBAC、租户上下文、设备绑定、服务和媒体库权限 | 新增 | 注册开放策略、用户名/密码最大长度、会话策略 | 明确涉及 |
@@ -868,7 +857,7 @@ APP 必须在本地存在与 `libraryId` 关联的网盘服务实例后才能播
 | AC-09 | 查询电视剧详情 | 主节目、剧集和文件定位关联完整，不出现半提交 |
 | AC-10 | 查询音乐专辑 | 艺术家、专辑、曲目顺序、碟号和文件定位关联完整 |
 | AC-11 | 查询有声书 | 作者、演播者、分卷、章节、时长和文件定位关联完整 |
-| AC-12 | HarmonyOS 播放 | 使用本地网盘凭据解析，媒体流不经 FlymbyScanner |
+| AC-12 | HarmonyOS 播放 | 使用本地网盘凭据解析，媒体流不经 FlyCloudHelper |
 | AC-13 | Android TV 播放 | 绑定对应网盘后，将本地解析的 URI 和 Headers 交给对应音视频播放器 |
 | AC-14 | 新增网盘 Provider | 注册适配器后可被能力接口发现，不需要修改媒体目录主表或通用扫描器 |
 | AC-15 | 导出目录快照 | 导出文件可被 APP 识别，不包含任何可复用凭据 |
@@ -888,9 +877,9 @@ APP 必须在本地存在与 `libraryId` 关联的网盘服务实例后才能播
 | AC-29 | 导入含脚本、二进制、目录穿越或超限内容的插件包 | 导入被拒绝，不产生可用版本，不覆盖现有插件，并记录脱敏审计结果 |
 | AC-30 | 插件升级时存在运行中任务 | 运行中任务继续使用快照固定版本，新任务才使用新启用版本 |
 | AC-31 | 尝试删除仍被任务或目录引用的插件版本 | 服务拒绝物理删除，允许先停用并保留历史解析能力 |
-| AC-32 | 不配置任何数据库环境变量启动 | 使用 `/data/database/flymby-scanner.db` 创建 SQLite，完成迁移后正常提供服务 |
-| AC-33 | 配置 `FLYMBYSCANNER_DATABASE_TYPE=postgres` 和有效连接地址 | API、Worker 和迁移器连接同一个 PostgreSQL schema，管理前台只显示类型、状态和版本 |
-| AC-34 | 配置 `FLYMBYSCANNER_DATABASE_TYPE=mysql` 和有效连接地址 | 使用 MySQL 8.0+ 完成同版本迁移，三类媒体查询和租户约束语义与其他后端一致 |
+| AC-32 | 不配置任何数据库环境变量启动 | 使用 `/data/database/flycloud-helper.db` 创建 SQLite，完成迁移后正常提供服务 |
+| AC-33 | 配置 `FLYCLOUDHELPER_DATABASE_TYPE=postgres` 和有效连接地址 | API、Worker 和迁移器连接同一个 PostgreSQL schema，管理前台只显示类型、状态和版本 |
+| AC-34 | 配置 `FLYCLOUDHELPER_DATABASE_TYPE=mysql` 和有效连接地址 | 使用 MySQL 8.0+ 完成同版本迁移，三类媒体查询和租户约束语义与其他后端一致 |
 | AC-35 | 数据库类型非法、连接地址缺失或 SQLite 目录不可写 | 服务拒绝启动，返回不含连接密码的明确中文配置错误 |
 | AC-36 | 将已有 SQLite 部署直接改为 PostgreSQL/MySQL | 服务不声称自动迁移旧数据；必须通过停写后的专用迁移或导出导入流程处理 |
 | AC-37 | API 与 Worker 指向不同数据库或 schema 版本 | 健康检查失败并阻止任务执行，避免目录和任务状态分裂 |
@@ -899,32 +888,34 @@ APP 必须在本地存在与 `libraryId` 关联的网盘服务实例后才能播
 | AC-40 | 曲目只有低置信度候选 | 不自动覆盖本地标签，保存为 `needs_review` 或保持未匹配状态 |
 | AC-41 | 未安装 `fpcalc` 或未配置 AcoustID Key | 文字检索正常可用，系统能力和管理前台明确显示声纹不可用，不泄露配置值 |
 | AC-42 | 对单首低置信度曲目启用声纹后备 | 临时读取受大小限制的文件，完成或失败后删除临时文件，目录和日志中不保留音频正文或声纹 |
-| AC-43 | FlymbyServer 停止运行或其公网接口不可达 | FlymbyScanner 内置音乐文字检索和扫描不受影响，证明两者没有默认运行时依赖 |
+| AC-43 | FlymbyServer 停止运行或其公网接口不可达 | FlyCloudHelper 内置音乐文字检索和扫描不受影响，证明两者没有默认运行时依赖 |
 | AC-44 | 超级管理员进入用户页 | 可创建普通用户，并可分页、搜索和筛选用户，看到角色、服务数、媒体数、任务状态、配额和最近活动 |
 | AC-45 | 管理员停用一个用户 | 用户新认证和新扫描被拒绝，已有目录保留；其他用户不受影响，操作写入审计 |
 | AC-46 | 管理员创建或维护某用户的云端服务 | 可填写连接、扫描路径和刮削配置并触发扫描；Secret 保存后只显示配置状态，不显示密码、Token、Cookie 或完整请求头 |
 | AC-47 | 管理员停用或删除单个云端服务 | 停用只阻止新任务；受保护删除只清理目标服务、凭据、配置和媒体库，不影响同用户其他服务 |
-| AC-48 | 扫描和刮削任务运行中打开任务页 | 页面通过 SSE 实时更新阶段、计数、百分比、吞吐和脱敏错误，断线后可续传 |
+| AC-48 | 扫描和刮削任务运行中打开任务页 | 页面在可见时每 5 秒刷新阶段、计数、百分比、吞吐和脱敏错误，不产生并发重复请求 |
 | AC-49 | 任务增量提交视频、音乐或有声书 | 对应条目立即出现在当前用户和服务的海报墙，筛选、排序、分页和目录版本一致 |
 | AC-50 | 管理员打开海报墙详情并检查页面及网络响应 | 只能查看元数据、图片、关系和文件数量；不存在播放器、播放按钮、媒体预览、`playbackLocator`、临时 URL 或网盘 Headers |
 | AC-51 | 插件 Manifest 声明配置 schema | 前端生成受限表单并完成校验；Secret 保存后只显示是否已配置，不能从接口或页面回显原值 |
 | AC-52 | 运行中任务期间修改插件配置 | 新配置生成新的 `configurationRevision`，运行中任务继续使用旧修订，新任务才使用新修订 |
 | AC-53 | 管理员以其他用户的资源 ID 请求服务、任务或海报墙详情 | 管理 API 按目标用户租户和完整资源链重新校验，不发生串库，拒绝结果不泄露敏感信息 |
 | AC-54 | 云端网盘凭据过期 | 服务进入 `reauthorization_required`，不误删目录；更新服务连接后生成新凭据修订，旧任务快照不被改写 |
-| AC-55 | 未配置凭据主密钥启动 | 服务不得进入 `ready`，不接受账号注册、服务创建和扫描，并输出不含 Secret 的中文配置错误 |
+| AC-55 | 未配置凭据主密钥启动全新实例 | 自动生成并持久化主密钥，创建超级管理员后显示复制、下载和确认步骤；确认后任何接口均不再返回原文 |
 | AC-56 | 登录失败、令牌刷新和退出 | 登录错误不暴露用户名是否存在；刷新令牌轮换；退出或管理员撤销后旧令牌不可继续使用 |
 | AC-57 | 配置 4 行 Key，其中一行为空、一行与其他行重复 | `configuredKeyCount` 只计算 2 个唯一非空 Key，重复或空行不增加动态并发 |
 | AC-58 | 一个健康 Key 被限流，其他 Key 正常 | 只把该 Key 置为冷却，`healthyKeyCount` 和有效并发立即下降；其他 Key 继续处理，冷却结束后容量自动恢复 |
 | AC-59 | 一个 Key 认证失败 | 只禁用该 Key且不在日志或错误中暴露内容；如果仍有健康 Key，任务继续，否则 TMDB 进入不可用且目录数据不被误删 |
-| AC-60 | 多个 Worker 同时执行 TMDB 刮削 | 部署级在途请求总数不超过 `FLYMBYSCANNER_TMDB_MAX_CONCURRENCY`，不会按 Worker 数量重复放大 |
+| AC-60 | 多个 Worker 同时执行 TMDB 刮削 | 部署级在途请求总数不超过 `FLYCLOUDHELPER_TMDB_MAX_CONCURRENCY`，不会按 Worker 数量重复放大 |
 | AC-61 | API 与 Worker 的 `tmdbKeyPoolRevision` 不一致 | 健康检查失败并停止接收新 TMDB 任务；NFO、标签和其他插件处理不受影响 |
 | AC-62 | 注册、超级管理员创建用户或重置密码时输入 3 个字符的用户名或密码 | 请求返回 `400 validation_error` 和对应中文字段错误，不创建账号、不修改密码；输入恰好 4 个字符时通过长度校验 |
 | AC-63 | 浏览器打开 Web 前端 | `/login` 明确提供注册入口，`/register` 明确提供返回登录入口；登录后 `user` 进入 `/app`，`super_admin` 进入 `/admin` 或原授权目标 |
 | AC-64 | 公开注册请求提交 `role=super_admin` | 请求被拒绝且不创建账号；合法公开注册只能创建 `user`，不能通过修改前端请求提升角色 |
 | AC-65 | 超级管理员授予或撤销 `super_admin` | 只有已重新认证的 `super_admin` 可操作，必须二次确认、撤销目标旧会话并写审计；实例最后一个有效超级管理员不能被降级、停用或删除 |
 | AC-66 | 空数据库实例首次打开 Web | 自动进入 `/setup`，页面只要求超级管理员用户名、密码和确认密码，不要求一次性初始化凭证；用户名和密码少于 4 个字符时不提交成功 |
-| AC-67 | 首次初始化成功 | 原子创建唯一首个 `super_admin`、建立安全会话并进入 `/admin`；再次访问或并发提交初始化入口时不能再创建另一个超级管理员 |
+| AC-67 | 首次初始化成功 | 原子创建唯一首个 `super_admin` 并建立安全会话；自动生成密钥时必须先完成备份确认再进入 `/admin`，并发提交不能创建另一个超级管理员 |
 | AC-68 | 实例仍处于 `setup_required` | 注册、登录、服务、扫描、目录和管理业务接口均不可用；部署者完成初始化并重新检查后才对公网开放地址 |
+| AC-69 | 切换数据库类型或连接地址 | 新数据库不自动获得原管理员、用户、服务、任务、目录和插件数据；独立持久卷中的主密钥继续保留，切回原数据库后旧数据仍可读取 |
+| AC-69 | 用户或超级管理员从某个服务详情进入海报墙 | 页面固定目标 `serviceId`，直接展示该服务的视频、音乐和有声书；筛选、详情和实时刷新都不能混入其他服务数据，且不提供播放能力 |
 
 ## 17. 待确认项
 
@@ -939,7 +930,7 @@ APP 必须在本地存在与 `libraryId` 关联的网盘服务实例后才能播
 | Q-07 | 播放记录和收藏是否进入远端同步 | 需要新增用户数据 API，不属于扫描目录核心 | 产品 |
 | Q-08 | Android TV 是否允许直接发起扫描 | TV 端配置页和权限模型 | 产品 |
 | Q-09 | 图片由客户端直连元数据 CDN，还是服务端缓存 | 带宽、离线能力、缓存失效和存储成本 | 产品/服务端 |
-| Q-10 | 备份导出是完全兼容现有本地快照，还是定义 FlymbyScanner 新格式 | 导入兼容和长期版本迁移 | 产品/客户端 |
+| Q-10 | 备份导出是完全兼容现有本地快照，还是定义 FlyCloudHelper 新格式 | 导入兼容和长期版本迁移 | 产品/客户端 |
 | Q-11 | 公网运营主体、部署地区和收费模式 | ICP/许可、数据出境、隐私和服务协议 | 运营/合规 |
 | Q-12 | 混合扫描根如何处理类型冲突和同文件多归属 | 媒体识别、重复条目和用户纠错流程 | 产品/客户端/服务端 |
 | Q-13 | 首批音乐和有声书支持的格式、标签和章节标准 | 处理器范围、Range 读取和验收数据 | 产品/客户端/服务端 |
@@ -950,9 +941,8 @@ APP 必须在本地存在与 `libraryId` 关联的网盘服务实例后才能播
 | Q-18 | 音乐候选自动采用阈值、拒绝阈值和人工确认入口 | 防止错误候选覆盖可靠的本地标签 | 产品/客户端/服务端 |
 | Q-19 | 首期是否启用 Chromaprint/AcoustID 后备及单文件临时读取上限 | Docker 镜像依赖、网盘下载量、任务耗时和资源上限 | 产品/服务端/运维 |
 | Q-20 | 管理员重置密码时使用一次性临时密码，还是生成短时重置链接 | 用户通知方式、强制改密和会话撤销 | 产品/安全 |
-| Q-21 | 管理前台是否开放暂停、继续和取消扫描，还是首期只开放触发与重试 | 任务页操作权限和误操作防护 | 产品/运营 |
 | Q-22 | 海报墙图片采用浏览器直连来源、服务端缓存还是两种模式 | 页面加载、隐私、缓存成本和来源失效处理 | 产品/服务端 |
 | Q-23 | 是否需要只读运维员等第三种低权限后台角色 | 首期角色已固定为 `user` 和 `super_admin`；新增角色会影响用户、服务、插件和审计页面的菜单、按钮与接口权限 | 产品/安全 |
 | Q-24 | 服务凭据主密钥首期是否支持在线轮换，还是仅提供停机运维命令 | 凭据库可恢复性、部署复杂度和密钥泄露响应 | 安全/运维 |
 | Q-25 | 选择已有云端服务时，是否要求本地网盘账号与云端扫描账号一致 | 播放可用性提示、多人共享边界和 Provider 兼容校验 | 产品/客户端/安全 |
-| Q-26 | `FLYMBYSCANNER_TMDB_CONCURRENCY_PER_KEY=1` 和 `FLYMBYSCANNER_TMDB_MAX_CONCURRENCY=32` 是否作为正式默认值 | 默认吞吐、上游限流概率和不同硬件部署容量 | 技术/运维 |
+| Q-26 | `FLYCLOUDHELPER_TMDB_PER_KEY_CONCURRENCY=1` 和 `FLYCLOUDHELPER_TMDB_MAX_CONCURRENCY=32` 是否作为正式默认值 | 默认吞吐、上游限流概率和不同硬件部署容量 | 技术/运维 |

@@ -1,0 +1,26 @@
+services:
+  flycloud-helper:
+    environment:
+      FLYCLOUDHELPER_DATABASE_TYPE: postgres
+      FLYCLOUDHELPER_DATABASE_URL: "${FLYCLOUDHELPER_DATABASE_URL:-${FLYMBYSCANNER_DATABASE_URL:?请设置PostgreSQL连接地址}}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-flycloud_helper}"
+      POSTGRES_USER: "${POSTGRES_USER:-flymby}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?请设置PostgreSQL密码}"
+    volumes:
+      - flycloud_helper_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  flycloud_helper_postgres:
