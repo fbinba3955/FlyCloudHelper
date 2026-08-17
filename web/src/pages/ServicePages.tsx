@@ -22,6 +22,7 @@ import {
   updateServiceStatus,
   type CloudService,
   type CreateCloudServiceInput,
+  type JobStatus,
   type MediaType,
   type ProviderDirectory,
   type ProviderDescriptor,
@@ -42,6 +43,26 @@ const dataTypeLabels: Record<MediaType, string> = {
   audiobook: "有声书",
 };
 
+// 关键变量：服务详情最近任务卡片只展示中文状态，不修改接口返回的原始状态值。
+const jobStatusLabels: Record<JobStatus, string> = {
+  queued: "排队中",
+  running: "运行中",
+  retry_waiting: "等待 TMDB 恢复",
+  paused: "已暂停",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
+const jobStageLabels: Record<string, string> = {
+  queued: "等待执行",
+  enumerating: "扫描与刮削",
+  classifying: "识别媒体",
+  scraping: "扫描刮削",
+  persisting: "写入目录",
+  completed: "已完成",
+};
+
 // 关键变量：单个服务海报墙每页读取 60 个顶层条目，避免一次加载整个媒体库。
 const SERVICE_CATALOG_PAGE_SIZE = 60;
 
@@ -56,6 +77,11 @@ function getServiceTone(status: ServiceStatus): StatusTone {
 /** 把 ISO 时间转换为控制台可读时间。 */
 function formatTime(value: string | null): string {
   return value ? new Date(value).toLocaleString("zh-CN") : "尚未扫描";
+}
+
+/** 将任务阶段转换为中文；未知的新阶段统一显示为处理中，避免页面泄露英文枚举。 */
+function getJobStageLabel(stage: string): string {
+  return jobStageLabels[stage] ?? "处理中";
 }
 
 interface ScanRootValue {
@@ -536,6 +562,8 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     recommendedScanSettings?.scrapeTaskConcurrency.min ?? 1,
     recommendedScanSettings?.scrapeTaskConcurrency.max ?? 4,
   );
+  // 关键变量：最近一条任务用于服务详情顶部状态卡片。
+  const recentJob = service.recentJobs[0];
 
   return (
     <>
@@ -544,7 +572,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="媒体条目" value={service.itemCount.toLocaleString()} hint="当前已入库" />
         <StatCard label="目录版本" value={`v${service.catalogVersion}`} hint={formatTime(service.lastScanAt)} tone="info" />
-        <StatCard label="最近任务" value={service.recentJobs[0]?.status ?? "暂无"} hint={service.recentJobs[0]?.stage ?? "尚未扫描"} tone="warning" />
+        <StatCard label="最近任务" value={recentJob ? jobStatusLabels[recentJob.status] : "暂无"} hint={recentJob ? getJobStageLabel(recentJob.stage) : "尚未扫描"} tone="warning" />
         <StatCard
           label="连接状态"
           value={serviceStatusLabels[service.status]}

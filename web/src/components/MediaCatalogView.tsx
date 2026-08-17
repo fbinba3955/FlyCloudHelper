@@ -89,6 +89,24 @@ function getDisplayMetadata(metadata: Record<string, unknown>): Array<{ label: s
   });
 }
 
+/** 将节目单集的季号、集号转换为中文位置；元数据不完整时保留原始标题。 */
+function getSeriesEpisodeLabel(child: MediaItem): string {
+  const seasonNumber = Number(child.metadata.seasonNumber);
+  const episodeNumber = Number(child.metadata.episodeNumber);
+  if (!Number.isInteger(seasonNumber) || seasonNumber < 0 || !Number.isInteger(episodeNumber) || episodeNumber < 1) {
+    return child.title;
+  }
+  return `第 ${seasonNumber} 季 第 ${episodeNumber} 集`;
+}
+
+/** 生成节目单集副标题，保留单集名称、补充标题和年份。 */
+function getSeriesEpisodeDescription(child: MediaItem): string {
+  const parts = [child.title];
+  if (child.subtitle && child.subtitle !== child.title) parts.push(child.subtitle);
+  if (child.year) parts.push(String(child.year));
+  return parts.join(" · ");
+}
+
 /** 将文件大小转换为适合详情页展示的文本。 */
 function formatFileSize(size: number): string {
   if (!Number.isFinite(size) || size <= 0) return "大小未知";
@@ -132,6 +150,8 @@ function MediaDetailDialog({
   const metadata = getDisplayMetadata(item.metadata);
   const externalIds = Object.entries(item.externalIds).filter(([, value]) => Boolean(value));
   const canMatchVideo = item.mediaType === "video" && (item.itemType === "video.movie" || item.itemType === "video.series");
+  // 关键变量：只有节目详情使用季集位置展示子项，电影及其他媒体保持原展示。
+  const isSeries = item.itemType === "video.series";
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center p-3 sm:p-6">
@@ -211,12 +231,21 @@ function MediaDetailDialog({
           </div>
 
           <div>
-            <h3 className="text-sm font-semibold">子项</h3>
+            <h3 className="text-sm font-semibold">{isSeries ? "剧集列表" : "子项"}</h3>
             {loading ? <p className="mt-3 text-sm text-muted-foreground">正在读取详情…</p> : error ? <p className="mt-3 text-sm text-destructive">{error}</p> : children.length > 0 ? (
               <ul className="mt-3 max-h-96 space-y-2 overflow-y-auto pr-1">
-                {children.map((child) => <li key={child.id} className="rounded-lg border border-border bg-secondary/30 p-3"><p className="text-sm">{child.title}</p><p className="mt-1 text-xs text-muted-foreground">{child.subtitle || itemTypeLabels[child.itemType] || "子项"}{child.year ? ` · ${child.year}` : ""}</p></li>)}
+                {children.map((child) => (
+                  <li key={child.id} className="rounded-lg border border-border bg-secondary/30 p-3">
+                    <p className="text-sm">{isSeries ? getSeriesEpisodeLabel(child) : child.title}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {isSeries
+                        ? getSeriesEpisodeDescription(child)
+                        : `${child.subtitle || itemTypeLabels[child.itemType] || "子项"}${child.year ? ` · ${child.year}` : ""}`}
+                    </p>
+                  </li>
+                ))}
               </ul>
-            ) : <p className="mt-3 text-sm text-muted-foreground">当前条目没有子项</p>}
+            ) : <p className="mt-3 text-sm text-muted-foreground">{isSeries ? "当前节目没有剧集" : "当前条目没有子项"}</p>}
             <div className="mt-5 rounded-xl border border-border bg-secondary/30 p-4 text-xs leading-6 text-muted-foreground">
               所属用户：{item.ownerUsername}<br />所属服务：{item.serviceName}<br />该页面不提供播放、下载或网盘地址。
             </div>
@@ -328,6 +357,19 @@ export function MediaCatalogView({
       setSelectedItem(detail);
       setSelectedChildren(children);
       setSelectedPaths(paths);
+      if (detail.itemType === "video.series") {
+        const missingPositionCount = children.filter((child) => {
+          const seasonNumber = Number(child.metadata.seasonNumber);
+          const episodeNumber = Number(child.metadata.episodeNumber);
+          return !Number.isInteger(seasonNumber) || seasonNumber < 0 || !Number.isInteger(episodeNumber) || episodeNumber < 1;
+        }).length;
+        console.info("codex-media-series-children", {
+          事件: "加载节目剧集列表",
+          节目ID: detail.id,
+          子项数量: children.length,
+          缺少季集位置数量: missingPositionCount,
+        });
+      }
     } catch (error) {
       setDetailError(error instanceof Error ? error.message : "媒体详情读取失败");
     } finally {

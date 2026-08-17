@@ -125,12 +125,26 @@ export function ServicePathPicker({ serviceId, admin, label, value, onConfirm }:
   /** 添加当前目录或列表中的一个目录，并避免重复选择。 */
   function selectDirectory(directory: ProviderDirectory): void {
     if (selectedKeys.has(getDirectoryKey(directory))) return;
+    console.info("codex-path-picker-dialog", {
+      事件: "选择扫描目录",
+      服务ID: serviceId,
+      目录路径: directory.displayPath,
+      选择前数量: draftValue.length,
+      选择后数量: draftValue.length + 1,
+    });
     setDraftValue((current) => [...current, directory]);
   }
 
   /** 从弹窗的临时选择集中移除一个目录。 */
   function removeDraftDirectory(directory: ProviderDirectory): void {
     const removedKey = getDirectoryKey(directory);
+    console.info("codex-path-picker-dialog", {
+      事件: "移除已选扫描目录",
+      服务ID: serviceId,
+      目录路径: directory.displayPath,
+      移除前数量: draftValue.length,
+      移除后数量: Math.max(0, draftValue.length - 1),
+    });
     setDraftValue((current) => current.filter((item) => getDirectoryKey(item) !== removedKey));
   }
 
@@ -181,7 +195,7 @@ export function ServicePathPicker({ serviceId, admin, label, value, onConfirm }:
 
       {open && createPortal(
         <div className="fixed inset-0 z-[1000] grid place-items-center bg-black/65 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label={`${label}路径选择`}>
-          <div className="surface flex max-h-[82vh] w-full max-w-3xl flex-col overflow-hidden p-0">
+          <div className="surface flex h-[82vh] w-full max-w-3xl flex-col overflow-hidden p-0">
             <header className="flex items-center justify-between gap-4 border-b border-border px-5 py-4">
               <div className="min-w-0">
                 <h3 className="text-base font-semibold">选择{label}</h3>
@@ -195,12 +209,12 @@ export function ServicePathPicker({ serviceId, admin, label, value, onConfirm }:
               <PrimaryButton onClick={() => listing && selectDirectory(listing.current)} disabled={!listing || loading || (listing ? selectedKeys.has(getDirectoryKey(listing.current)) : true)}><Check className="size-4" /> 选择当前目录</PrimaryButton>
             </div>
 
-            <div className="border-b border-border px-5 py-3">
+            <div className="flex h-40 shrink-0 flex-col border-b border-border px-5 py-3">
               <p className="text-xs text-muted-foreground">已选目录 · {draftValue.length}</p>
               {draftValue.length === 0 ? (
-                <p className="mt-2 rounded-lg border border-dashed border-border px-3 py-3 text-center text-xs text-muted-foreground">尚未选择目录</p>
+                <p className="mt-2 grid min-h-0 flex-1 place-items-center rounded-lg border border-dashed border-border px-3 text-center text-xs text-muted-foreground">尚未选择目录</p>
               ) : (
-                <ul className="mt-2 max-h-32 space-y-1.5 overflow-y-auto pr-1">
+                <ul className="mt-2 min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-1 [scrollbar-gutter:stable]">
                   {draftValue.map((directory) => (
                     <li key={getDirectoryKey(directory)} className="flex items-center gap-2 rounded-lg border border-border bg-secondary/35 px-3 py-2">
                       <Folder className="size-3.5 shrink-0 text-muted-foreground" />
@@ -212,7 +226,7 @@ export function ServicePathPicker({ serviceId, admin, label, value, onConfirm }:
               )}
             </div>
 
-            <div className="min-h-64 flex-1 overflow-y-auto p-4">
+            <div className="min-h-0 flex-1 overflow-y-auto p-4 [scrollbar-gutter:stable]">
               {loading && <div className="grid min-h-52 place-items-center text-sm text-muted-foreground"><span className="inline-flex items-center gap-2"><LoaderCircle className="size-4 animate-spin" /> 正在读取网盘目录…</span></div>}
               {!loading && error && <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive"><p>{error}</p><button type="button" onClick={() => void loadDirectory(currentParent ?? undefined)} className="mt-3 rounded-md border border-destructive/40 px-3 py-1.5 text-xs">重新读取</button></div>}
               {!loading && !error && listing?.items.length === 0 && <div className="grid min-h-52 place-items-center text-sm text-muted-foreground">当前目录没有子目录，可以直接选择当前目录。</div>}
@@ -226,7 +240,7 @@ export function ServicePathPicker({ serviceId, admin, label, value, onConfirm }:
                           <Folder className="size-4 shrink-0 text-muted-foreground" />
                           <span className="min-w-0"><span className="block truncate text-sm">{directory.name}</span><span className="block truncate text-[10px] text-muted-foreground">{directory.displayPath}</span></span>
                         </button>
-                        <button type="button" onClick={() => selectDirectory(directory)} disabled={selected} className="rounded-md border border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45">{selected ? "已选择" : "选择"}</button>
+                        <button type="button" onClick={() => selectDirectory(directory)} disabled={selected} className="w-16 rounded-md border border-border px-2 py-2 text-xs text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45">{selected ? "已选择" : "选择"}</button>
                         <button type="button" onClick={() => enterDirectory(directory)} aria-label={`进入 ${directory.name}`} className="grid size-9 place-items-center rounded-md border border-border text-muted-foreground hover:text-foreground"><ChevronRight className="size-4" /></button>
                       </li>
                     );
