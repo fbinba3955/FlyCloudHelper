@@ -2,7 +2,6 @@ export type AuthRole = "user" | "super_admin";
 
 export interface AuthUser {
   userId: string;
-  tenantId: string;
   username: string;
   role: AuthRole;
   status: "active" | "disabled" | "pending_delete";
@@ -125,8 +124,7 @@ export interface AdminConfigStatus {
 
 export interface CloudService {
   id: string;
-  tenantId: string;
-  ownerUserId: string;
+  userId: string;
   ownerUsername: string;
   libraryId: string;
   displayName: string;
@@ -159,7 +157,7 @@ export interface CreateCloudServiceInput {
 
 export interface ScanJob {
   id: string;
-  tenantId: string;
+  userId: string;
   serviceId: string;
   libraryId: string;
   ownerUsername: string;
@@ -205,7 +203,7 @@ export interface ServiceDetail extends CloudService {
 
 export interface MediaItem {
   id: string;
-  tenantId: string;
+  userId: string;
   serviceId: string;
   libraryId: string;
   mediaType: MediaType;

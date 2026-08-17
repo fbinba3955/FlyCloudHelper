@@ -9,7 +9,6 @@ export type MatchState = "matched" | "needs_review" | "unmatched" | "processing"
 
 export interface PublicUserRecord {
   id: string;
-  tenantId: string;
   username: string;
   role: UserRole;
   status: UserStatus;
@@ -31,8 +30,7 @@ export interface SystemStateRecord {
 
 export interface CloudServiceRecord {
   id: string;
-  tenantId: string;
-  ownerUserId: string;
+  userId: string;
   ownerUsername: string;
   libraryId: string;
   displayName: string;
@@ -60,7 +58,7 @@ export interface ServiceDetailRecord extends CloudServiceRecord {
 
 export interface ScanJobRecord {
   id: string;
-  tenantId: string;
+  userId: string;
   serviceId: string;
   libraryId: string;
   ownerUsername: string;
@@ -99,7 +97,7 @@ export interface ScanJobRecord {
 
 export interface SourceFileRecord {
   id: string;
-  tenantId: string;
+  userId: string;
   serviceId: string;
   libraryId: string;
   providerResourceId: string;
@@ -118,7 +116,7 @@ export interface SourceFileRecord {
 
 export interface MediaItemRecord {
   id: string;
-  tenantId: string;
+  userId: string;
   serviceId: string;
   libraryId: string;
   mediaType: MediaType;
@@ -143,7 +141,7 @@ export interface MediaItemRecord {
 
 export interface JobEventRecord {
   sequence: number;
-  tenantId: string;
+  userId: string;
   jobId: string;
   eventType: string;
   payload: Record<string, unknown>;
@@ -152,7 +150,7 @@ export interface JobEventRecord {
 
 export interface ExportRecord {
   id: string;
-  tenantId: string;
+  userId: string;
   libraryId: string;
   exportType: "binding" | "snapshot";
   status: "completed" | "failed";

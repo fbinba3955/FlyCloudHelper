@@ -136,7 +136,7 @@ export function AdminOverviewPage() {
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="用户总数" value={String(status.userCount)} hint="全部已注册账号" tone="primary" />
         <StatCard label="服务总数" value={String(status.serviceCount)} hint={`${services.filter((item) => item.status !== "active").length} 个需处理`} tone="warning" />
-        <StatCard label="媒体总数" value={status.mediaCount.toLocaleString()} hint="跨全部租户" tone="info" />
+        <StatCard label="媒体总数" value={status.mediaCount.toLocaleString()} hint="跨全部用户" tone="info" />
         <StatCard label="活动任务" value={String(status.activeJobCount)} hint={`失败 ${status.failedJobCount}`} tone="muted" />
       </div>
       <div className="mt-4 grid gap-4 xl:grid-cols-3">

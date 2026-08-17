@@ -165,7 +165,6 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     validatePasswordConfirmation(password, request.body.passwordConfirmation);
     const user = await runtime.database.createUser({
       userId: randomUUID(),
-      tenantId: randomUUID(),
       username,
       usernameLookup: createUsernameLookup(username),
       passwordHash: await hashPassword(password),
@@ -179,9 +178,9 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     await requireSuperAdmin(request, runtime.database);
     const user = await runtime.database.findPublicUserById(request.params.userId);
     const [services, jobs, overview] = await Promise.all([
-      runtime.repository.listServices({ tenantId: user.tenantId, limit: 200, offset: 0 }),
-      runtime.repository.listJobs({ tenantId: user.tenantId, limit: 50, offset: 0 }),
-      runtime.repository.getOverview(user.tenantId),
+      runtime.repository.listServices({ userId: user.id, limit: 200, offset: 0 }),
+      runtime.repository.listJobs({ userId: user.id, limit: 50, offset: 0 }),
+      runtime.repository.getOverview(user.id),
     ]);
     return { user: toUserDto(user), overview, services: services.items, recentJobs: jobs.items };
   });
@@ -253,7 +252,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/services", async (request) => {
     await requireSuperAdmin(request, runtime.database);
     return runtime.repository.listServices({
-      ownerUserId: typeof request.query.userId === "string" ? request.query.userId : undefined,
+      userId: typeof request.query.userId === "string" ? request.query.userId : undefined,
       providerType: typeof request.query.providerType === "string" ? request.query.providerType : undefined,
       status: typeof request.query.status === "string" ? request.query.status as ServiceStatus : undefined,
       keyword: typeof request.query.search === "string" ? request.query.search : undefined,
@@ -281,8 +280,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const service = await runtime.repository.createService({
       serviceId: randomUUID(),
       libraryId: randomUUID(),
-      tenantId: owner.tenantId,
-      ownerUserId: owner.id,
+      userId: owner.id,
       displayName: requireString(request.body, "displayName", "服务名称", 100),
       providerType,
       dataType,
@@ -328,7 +326,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.get<{ Params: { serviceId: string }; Querystring: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/directories", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-    const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, service.tenantId));
+    const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, service.userId));
     const listing = await runtime.providers.get(service.providerType).browseDirectories(
       connection,
       readProviderDirectoryParent(request.query),
@@ -358,7 +356,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     await validateProviderAccess(adapter, connection, service.scanProfile);
     const updated = await runtime.repository.updateConnection({
       serviceId: service.id,
-      tenantId: service.tenantId,
+      userId: service.userId,
       encryptedConnection: runtime.vault.encrypt(connection),
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
     });
@@ -380,7 +378,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
     const adapter = runtime.providers.get(service.providerType);
     const connection = runtime.vault.decrypt(
-      await runtime.repository.getActiveEncryptedConnection(service.id, service.tenantId),
+      await runtime.repository.getActiveEncryptedConnection(service.id, service.userId),
     );
     try {
       await validateProviderAccess(adapter, connection, service.scanProfile);
@@ -397,7 +395,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       });
       throw error;
     }
-    const updated = await runtime.repository.restoreServiceConnection(service.id, service.tenantId);
+    const updated = await runtime.repository.restoreServiceConnection(service.id, service.userId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-provider-reconnect",
       事件: "管理员使用当前配置重连成功",
@@ -421,11 +419,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       service.dataType,
       runtime.providers.get(service.providerType).descriptor.recommendedScanSettings,
     );
-    const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, service.tenantId));
+    const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, service.userId));
     await validateConfiguredScanRoots(runtime.providers.get(service.providerType), connection, scanProfile);
     const updated = await runtime.repository.updateScanProfile(
       service.id,
-      service.tenantId,
+      service.userId,
       scanProfile,
     );
     runtime.logBusinessEvent("info", {
@@ -447,7 +445,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
     const updated = await runtime.repository.updateMetadataProfile(
       service.id,
-      service.tenantId,
+      service.userId,
       validateMetadataProfile(requireObject(request.body, "metadata", "元数据配置"), service.dataType),
     );
     runtime.logBusinessEvent("info", {
@@ -471,7 +469,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     }
     const job = await runtime.repository.createScanJob({
       jobId: randomUUID(),
-      tenantId: service.tenantId,
+      userId: service.userId,
       serviceId: service.id,
       requestedByUserId: operator.id,
       requestId: requireString(request.body, "requestId", "请求 ID", 200),
@@ -524,7 +522,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/jobs", async (request) => {
     await requireSuperAdmin(request, runtime.database);
     return runtime.repository.listJobs({
-      ownerUserId: typeof request.query.userId === "string" ? request.query.userId : undefined,
+      userId: typeof request.query.userId === "string" ? request.query.userId : undefined,
       serviceId: typeof request.query.serviceId === "string" ? request.query.serviceId : undefined,
       status: typeof request.query.status === "string" ? request.query.status as JobStatus : undefined,
       ...readPagination(request.query),
@@ -599,10 +597,10 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     if (sourceJob.status !== "failed" && sourceJob.status !== "cancelled") {
       throw new ApiError(409, "job_not_retryable", "只有失败或已取消任务可以重试");
     }
-    const service = await runtime.repository.getServiceDetail(sourceJob.serviceId, sourceJob.tenantId);
+    const service = await runtime.repository.getServiceDetail(sourceJob.serviceId, sourceJob.userId);
     const job = await runtime.repository.createScanJob({
       jobId: randomUUID(),
-      tenantId: sourceJob.tenantId,
+      userId: sourceJob.userId,
       serviceId: sourceJob.serviceId,
       requestedByUserId: operator.id,
       requestId: requireString(request.body, "requestId", "请求 ID", 200),
@@ -628,15 +626,15 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/jobs/events", async (request, reply) => {
     await requireSuperAdmin(request, runtime.database);
     const jobId = typeof request.query.jobId === "string" ? request.query.jobId : undefined;
-    let tenantId: string | undefined;
+    let userId: string | undefined;
     if (typeof request.query.userId === "string") {
-      tenantId = (await runtime.database.findPublicUserById(request.query.userId)).tenantId;
+      userId = (await runtime.database.findPublicUserById(request.query.userId)).id;
     }
-    if (jobId) await runtime.repository.getJob(jobId, tenantId);
+    if (jobId) await runtime.repository.getJob(jobId, userId);
     const headerValue = request.headers["last-event-id"];
     const sequence = Math.max(0, Number.parseInt(String(headerValue ?? request.query.afterSequence ?? 0), 10) || 0);
     streamJobEvents(reply, sequence, (afterSequence) => runtime.repository.listJobEvents({
-      tenantId,
+      userId,
       jobId,
       afterSequence,
       limit: 200,
@@ -645,14 +643,14 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
 
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/catalog/items", async (request) => {
     await requireSuperAdmin(request, runtime.database);
-    const ownerUserId = typeof request.query.userId === "string" ? request.query.userId : undefined;
+    const userId = typeof request.query.userId === "string" ? request.query.userId : undefined;
     const serviceId = typeof request.query.serviceId === "string" ? request.query.serviceId : undefined;
-    if (!ownerUserId && !serviceId) {
+    if (!userId && !serviceId) {
       throw validationError("userId", "全局海报墙必须指定用户或服务范围");
     }
     const sortValue = request.query.sort;
     return runtime.repository.listCatalogItems({
-      ownerUserId,
+      userId,
       serviceId,
       libraryId: typeof request.query.libraryId === "string" ? request.query.libraryId : undefined,
       mediaType: typeof request.query.mediaType === "string" ? request.query.mediaType as MediaType : undefined,

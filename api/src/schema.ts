@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 
-export const currentSchemaVersion = 13;
+export const currentSchemaVersion = 14;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -72,19 +72,6 @@ async function createIdentityTables(database: Knex): Promise<void> {
     });
   }
 
-  if (!(await database.schema.hasTable("tenants"))) {
-    await database.schema.createTable("tenants", (table) => {
-      table.string("id", 64).primary();
-      table.string("user_id", 64).notNullable().unique().references("id").inTable("user_accounts").onDelete("CASCADE");
-      table.string("status", 32).notNullable().defaultTo("active");
-      table.string("created_at", 40).notNullable();
-    });
-  } else {
-    await addColumnIfMissing(database, "tenants", "status", (table) => {
-      table.string("status", 32).notNullable().defaultTo("active");
-    });
-  }
-
   if (!(await database.schema.hasTable("user_sessions"))) {
     await database.schema.createTable("user_sessions", (table) => {
       table.string("id", 64).primary();
@@ -120,8 +107,7 @@ async function createServiceTables(database: Knex): Promise<void> {
   if (!(await database.schema.hasTable("cloud_services"))) {
     await database.schema.createTable("cloud_services", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable().references("id").inTable("tenants").onDelete("CASCADE");
-      table.string("owner_user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
       table.string("library_id", 64).notNullable().unique();
       table.string("display_name", 255).notNullable();
       table.string("provider_type", 64).notNullable();
@@ -135,8 +121,7 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
       table.string("deleted_at", 40).nullable();
-      table.index(["tenant_id", "status"], "idx_cloud_services_tenant_status");
-      table.index(["owner_user_id"], "idx_cloud_services_owner");
+      table.index(["user_id", "status"], "idx_cloud_services_user_status");
     });
   } else {
     await addColumnIfMissing(database, "cloud_services", "data_type", (table) => {
@@ -147,21 +132,21 @@ async function createServiceTables(database: Knex): Promise<void> {
   if (!(await database.schema.hasTable("media_libraries"))) {
     await database.schema.createTable("media_libraries", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable().references("id").inTable("tenants").onDelete("CASCADE");
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
       table.string("service_id", 64).notNullable().unique().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.string("provider_type", 64).notNullable();
       table.bigInteger("catalog_version").notNullable().defaultTo(0);
       table.string("status", 32).notNullable();
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
-      table.index(["tenant_id"], "idx_media_libraries_tenant");
+      table.index(["user_id"], "idx_media_libraries_user");
     });
   }
 
   if (!(await database.schema.hasTable("service_credentials"))) {
     await database.schema.createTable("service_credentials", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.integer("revision").notNullable();
       table.text("encrypted_payload").notNullable();
@@ -169,45 +154,45 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.integer("schema_version").notNullable();
       table.string("status", 32).notNullable();
       table.string("created_at", 40).notNullable();
-      table.unique(["tenant_id", "service_id", "revision"], { indexName: "uq_service_credentials_revision" });
+      table.unique(["user_id", "service_id", "revision"], { indexName: "uq_service_credentials_revision" });
     });
   }
 
   if (!(await database.schema.hasTable("service_scan_profiles"))) {
     await database.schema.createTable("service_scan_profiles", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.integer("revision").notNullable();
       table.text("configuration_json").notNullable();
       table.string("created_at", 40).notNullable();
-      table.unique(["tenant_id", "service_id", "revision"], { indexName: "uq_service_scan_profiles_revision" });
+      table.unique(["user_id", "service_id", "revision"], { indexName: "uq_service_scan_profiles_revision" });
     });
   }
 
   if (!(await database.schema.hasTable("service_metadata_profiles"))) {
     await database.schema.createTable("service_metadata_profiles", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.integer("revision").notNullable();
       table.text("configuration_json").notNullable();
       table.string("created_at", 40).notNullable();
-      table.unique(["tenant_id", "service_id", "revision"], { indexName: "uq_service_metadata_profiles_revision" });
+      table.unique(["user_id", "service_id", "revision"], { indexName: "uq_service_metadata_profiles_revision" });
     });
   }
 
   if (!(await database.schema.hasTable("client_service_links"))) {
     await database.schema.createTable("client_service_links", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.string("client_device_id", 200).notNullable();
       table.string("client_service_id", 200).notNullable();
       table.string("provider_type", 64).notNullable();
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
-      table.unique(["tenant_id", "client_device_id", "client_service_id"], { indexName: "uq_client_service_links_device" });
+      table.unique(["user_id", "client_device_id", "client_service_id"], { indexName: "uq_client_service_links_device" });
     });
   }
 }
@@ -217,7 +202,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
   if (!(await database.schema.hasTable("scan_jobs"))) {
     await database.schema.createTable("scan_jobs", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
       table.string("requested_by_user_id", 64).notNullable();
@@ -244,8 +229,8 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("started_at", 40).nullable();
       table.string("finished_at", 40).nullable();
       table.string("updated_at", 40).notNullable();
-      table.unique(["tenant_id", "client_device_id", "request_id"], { indexName: "uq_scan_jobs_request" });
-      table.index(["tenant_id", "status"], "idx_scan_jobs_tenant_status");
+      table.unique(["user_id", "client_device_id", "request_id"], { indexName: "uq_scan_jobs_request" });
+      table.index(["user_id", "status"], "idx_scan_jobs_user_status");
       table.index(["service_id", "status"], "idx_scan_jobs_service_status");
       table.index(["status", "next_retry_at"], "idx_scan_jobs_retry_due");
     });
@@ -271,20 +256,20 @@ async function createCatalogTables(database: Knex): Promise<void> {
   if (!(await database.schema.hasTable("scan_job_events"))) {
     await database.schema.createTable("scan_job_events", (table) => {
       table.increments("sequence").primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("job_id", 64).notNullable().references("id").inTable("scan_jobs").onDelete("CASCADE");
       table.string("event_type", 64).notNullable();
       table.text("payload_json").notNullable();
       table.string("created_at", 40).notNullable();
       table.index(["job_id", "sequence"], "idx_scan_job_events_job_sequence");
-      table.index(["tenant_id", "sequence"], "idx_scan_job_events_tenant_sequence");
+      table.index(["user_id", "sequence"], "idx_scan_job_events_user_sequence");
     });
   }
 
   if (!(await database.schema.hasTable("scan_job_checkpoints"))) {
     await database.schema.createTable("scan_job_checkpoints", (table) => {
       table.string("job_id", 64).primary().references("id").inTable("scan_jobs").onDelete("CASCADE");
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
       table.integer("checkpoint_version").notNullable();
@@ -297,7 +282,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.text("changed_item_ids_json").notNullable();
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
-      table.index(["tenant_id", "updated_at"], "idx_scan_job_checkpoints_tenant_updated");
+      table.index(["user_id", "updated_at"], "idx_scan_job_checkpoints_user_updated");
       table.index(["service_id", "updated_at"], "idx_scan_job_checkpoints_service_updated");
     });
   }
@@ -306,7 +291,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
     await database.schema.createTable("scan_root_runs", (table) => {
       table.string("id", 64).primary();
       table.string("job_id", 64).notNullable().references("id").inTable("scan_jobs").onDelete("CASCADE");
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
       table.string("root_key", 64).notNullable();
@@ -326,7 +311,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
   if (!(await database.schema.hasTable("source_files"))) {
     await database.schema.createTable("source_files", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
       table.string("provider_resource_id", 512).notNullable();
@@ -343,7 +328,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("status", 32).notNullable();
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
-      table.unique(["tenant_id", "library_id", "provider_resource_id"], { indexName: "uq_source_files_resource" });
+      table.unique(["user_id", "library_id", "provider_resource_id"], { indexName: "uq_source_files_resource" });
       table.index(["library_id", "generation_id"], "idx_source_files_generation");
       table.index(["library_id", "scan_root_key", "generation_id"], "idx_source_files_root_generation");
     });
@@ -355,7 +340,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
   if (!(await database.schema.hasTable("media_items"))) {
     await database.schema.createTable("media_items", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("service_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
       table.string("identity_key", 128).notNullable();
@@ -376,53 +361,53 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
       table.string("deleted_at", 40).nullable();
-      table.unique(["tenant_id", "library_id", "identity_key"], { indexName: "uq_media_items_identity" });
-      table.index(["tenant_id", "library_id", "media_type"], "idx_media_items_library_type");
+      table.unique(["user_id", "library_id", "identity_key"], { indexName: "uq_media_items_identity" });
+      table.index(["user_id", "library_id", "media_type"], "idx_media_items_library_type");
       table.index(["service_id", "media_type"], "idx_media_items_service_type");
-      table.index(["tenant_id", "library_id", "deleted_at", "created_at"], "idx_media_items_catalog_created");
-      table.index(["tenant_id", "library_id", "deleted_at", "sort_title"], "idx_media_items_catalog_title");
-      table.index(["tenant_id", "library_id", "deleted_at", "year"], "idx_media_items_catalog_year");
-      table.index(["tenant_id", "library_id", "deleted_at", "premiere_date"], "idx_media_items_catalog_premiere");
-      table.index(["tenant_id", "deleted_at", "match_state"], "idx_media_items_tenant_match");
+      table.index(["user_id", "library_id", "deleted_at", "created_at"], "idx_media_items_catalog_created");
+      table.index(["user_id", "library_id", "deleted_at", "sort_title"], "idx_media_items_catalog_title");
+      table.index(["user_id", "library_id", "deleted_at", "year"], "idx_media_items_catalog_year");
+      table.index(["user_id", "library_id", "deleted_at", "premiere_date"], "idx_media_items_catalog_premiere");
+      table.index(["user_id", "deleted_at", "match_state"], "idx_media_items_user_match");
     });
   }
 
   if (!(await database.schema.hasTable("media_relations"))) {
     await database.schema.createTable("media_relations", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
       table.string("parent_item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
       table.string("child_item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
       table.string("relation_type", 64).notNullable();
       table.integer("sort_order").notNullable().defaultTo(0);
-      table.unique(["tenant_id", "parent_item_id", "child_item_id", "relation_type"], { indexName: "uq_media_relations_pair" });
+      table.unique(["user_id", "parent_item_id", "child_item_id", "relation_type"], { indexName: "uq_media_relations_pair" });
     });
   }
 
   if (!(await database.schema.hasTable("file_links"))) {
     await database.schema.createTable("file_links", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
       table.string("item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
       table.string("source_file_id", 64).notNullable().references("id").inTable("source_files").onDelete("CASCADE");
       table.text("locator_json").notNullable();
-      table.unique(["tenant_id", "item_id", "source_file_id"], { indexName: "uq_file_links_item_file" });
+      table.unique(["user_id", "item_id", "source_file_id"], { indexName: "uq_file_links_item_file" });
     });
   }
 
   if (!(await database.schema.hasTable("catalog_changes"))) {
     await database.schema.createTable("catalog_changes", (table) => {
       table.increments("id").primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
       table.bigInteger("catalog_version").notNullable();
       table.string("entity_type", 64).notNullable();
       table.string("entity_id", 64).notNullable();
       table.string("change_type", 32).notNullable();
       table.string("created_at", 40).notNullable();
-      table.index(["tenant_id", "library_id", "catalog_version"], "idx_catalog_changes_version");
+      table.index(["user_id", "library_id", "catalog_version"], "idx_catalog_changes_version");
     });
   }
 }
@@ -456,10 +441,10 @@ async function migrateCatalogChangeVersions(database: Knex): Promise<void> {
 /** 为媒体目录分页、排序和概览统计补充查询索引。 */
 async function migrateCatalogQueryIndexes(database: Knex): Promise<void> {
   await database.schema.alterTable("media_items", (table) => {
-    table.index(["tenant_id", "library_id", "deleted_at", "created_at"], "idx_media_items_catalog_created");
-    table.index(["tenant_id", "library_id", "deleted_at", "sort_title"], "idx_media_items_catalog_title");
-    table.index(["tenant_id", "library_id", "deleted_at", "year"], "idx_media_items_catalog_year");
-    table.index(["tenant_id", "deleted_at", "match_state"], "idx_media_items_tenant_match");
+    table.index(["user_id", "library_id", "deleted_at", "created_at"], "idx_media_items_catalog_created");
+    table.index(["user_id", "library_id", "deleted_at", "sort_title"], "idx_media_items_catalog_title");
+    table.index(["user_id", "library_id", "deleted_at", "year"], "idx_media_items_catalog_year");
+    table.index(["user_id", "deleted_at", "match_state"], "idx_media_items_user_match");
   });
 }
 
@@ -496,7 +481,7 @@ async function migrateMediaPremiereDate(database: Knex): Promise<void> {
   });
   await database.schema.alterTable("media_items", (table) => {
     table.index(
-      ["tenant_id", "library_id", "deleted_at", "premiere_date"],
+      ["user_id", "library_id", "deleted_at", "premiere_date"],
       "idx_media_items_catalog_premiere",
     );
   });
@@ -518,7 +503,7 @@ async function createOperationTables(database: Knex): Promise<void> {
   if (!(await database.schema.hasTable("library_exports"))) {
     await database.schema.createTable("library_exports", (table) => {
       table.string("id", 64).primary();
-      table.string("tenant_id", 64).notNullable();
+      table.string("user_id", 64).notNullable();
       table.string("library_id", 64).notNullable();
       table.string("export_type", 32).notNullable();
       table.string("status", 32).notNullable();

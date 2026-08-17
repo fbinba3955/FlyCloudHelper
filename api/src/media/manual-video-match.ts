@@ -78,7 +78,7 @@ export async function applyManualVideoMatch(
   }
   const updatedItem = await runtime.repository.applyManualVideoMatch({
     itemId: item.id,
-    tenantId: item.tenantId,
+    userId: item.userId,
     metadata,
   });
   runtime.logBusinessEvent("info", {
@@ -94,7 +94,7 @@ export async function applyManualVideoMatch(
 /** 清除当前条目的刮削结果并恢复本地识别信息。 */
 export async function clearManualVideoMatch(runtime: ApiRuntime, item: MediaItemRecord): Promise<MediaItemRecord> {
   requireManualVideoItem(item);
-  const updatedItem = await runtime.repository.clearVideoMatch(item.id, item.tenantId);
+  const updatedItem = await runtime.repository.clearVideoMatch(item.id, item.userId);
   runtime.logBusinessEvent("info", {
     日志关键字: "codex-flycloud-helper-manual-match",
     事件: "清除影视匹配结果",

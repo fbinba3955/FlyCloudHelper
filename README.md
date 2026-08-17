@@ -20,6 +20,7 @@ FlyCloudHelper 是面向 Flymby 客户端的自部署云端媒体扫描、刮削
 
 - 用户注册、登录和多用户数据隔离。
 - 一个用户可创建多个独立网盘服务和媒体库。
+- 服务、任务和媒体目录全部直接使用用户 ID 归属。
 - 支持 WebDAV、光鸭、阿里云盘、百度网盘 Provider 接口。
 - 配置全量扫描目录、增量扫描目录、本地 NFO、元数据规则和服务级任务并发。
 - 扫描任务进度、当前路径、WebDAV 检查点暂停/继续、终止、删除和失败重试。
@@ -210,20 +211,12 @@ PostgreSQL 与 MySQL 使用拆分字段时，服务会自动处理密码中的�
 
 切换 SQLite、PostgreSQL 或 MySQL 不会自动迁移数据，需要自行执行导出、导入或数据库迁移。
 
+当前项目尚未发布，schema 14 已改为用户直接归属的数据结构。使用旧开发数据库时需要删除并重新初始化，首次启动后重新设置超级管理员。
+
 ## 项目结构
 
 ```text
 api/       Fastify API、数据库、Provider、扫描 Worker 与刮削逻辑
 web/       React 管理前端
-doc/       规格、页面、接口和开发计划文档
 data/      本地数据库、密钥、插件和导出文件（不会提交到 Git）
 ```
-
-## 更多文档
-
-- [项目说明](项目说明.md)
-- [Spec 规格文档](doc/FlyCloudHelper远端媒体目录服务/Spec规格文档.md)
-- [前端页面功能文档](doc/FlyCloudHelper远端媒体目录服务/前端页面功能文档.md)
-- [后台接口与 Docker 部署说明](doc/FlyCloudHelper远端媒体目录服务/后台接口与Docker部署说明.md)
-- [开发计划文档](doc/FlyCloudHelper远端媒体目录服务/开发计划文档.md)
-- [需求与接口对照文档](doc/FlyCloudHelper远端媒体目录服务/需求与接口对照文档.md)

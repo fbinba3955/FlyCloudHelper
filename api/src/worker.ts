@@ -961,8 +961,8 @@ export class ScanWorker {
       activeDirectoryItems.push(candidate);
       try {
         const sourceFileInput: SourceFileRecord = {
-          id: createStableId("src", job.tenantId, job.libraryId, entry.resourceId),
-          tenantId: job.tenantId,
+          id: createStableId("src", job.userId, job.libraryId, entry.resourceId),
+          userId: job.userId,
           serviceId: job.serviceId,
           libraryId: job.libraryId,
           providerResourceId: entry.resourceId.length <= 500
@@ -1085,7 +1085,7 @@ export class ScanWorker {
         && completedRootRuns.length > 0,
     });
     await this.repository.finalizeGeneration({
-      tenantId: job.tenantId,
+      userId: job.userId,
       serviceId: job.serviceId,
       libraryId: job.libraryId,
       generationId,
@@ -1156,8 +1156,8 @@ export class ScanWorker {
       const parentMetadata = metadata.parent ?? metadata;
       const parentIdentityKey = resolveCatalogIdentityKey(input.descriptor, parentMetadata, true);
       const parentResult = await this.repository.upsertMediaItem({
-        id: createStableId("itm", input.job.tenantId, input.job.libraryId, parentIdentityKey),
-        tenantId: input.job.tenantId,
+        id: createStableId("itm", input.job.userId, input.job.libraryId, parentIdentityKey),
+        userId: input.job.userId,
         serviceId: input.job.serviceId,
         libraryId: input.job.libraryId,
         identityKey: createStableId("identity", parentIdentityKey),
@@ -1180,8 +1180,8 @@ export class ScanWorker {
     }
     const itemIdentityKey = resolveCatalogIdentityKey(input.descriptor, metadata, false);
     const itemResult = await this.repository.upsertMediaItem({
-      id: createStableId("itm", input.job.tenantId, input.job.libraryId, itemIdentityKey),
-      tenantId: input.job.tenantId,
+      id: createStableId("itm", input.job.userId, input.job.libraryId, itemIdentityKey),
+      userId: input.job.userId,
       serviceId: input.job.serviceId,
       libraryId: input.job.libraryId,
       identityKey: createStableId("identity", itemIdentityKey),
@@ -1201,7 +1201,7 @@ export class ScanWorker {
     });
     if (itemResult.changed || input.forceCatalogChange) changedItemIds.push(itemResult.itemId);
     await this.repository.linkItemFile({
-      tenantId: input.job.tenantId,
+      userId: input.job.userId,
       libraryId: input.job.libraryId,
       itemId: itemResult.itemId,
       sourceFileId: input.sourceFile.id,
@@ -1209,7 +1209,7 @@ export class ScanWorker {
     });
     if (parentItemId && input.descriptor.parent) {
       await this.repository.linkMediaRelation({
-        tenantId: input.job.tenantId,
+        userId: input.job.userId,
         libraryId: input.job.libraryId,
         parentItemId,
         childItemId: itemResult.itemId,

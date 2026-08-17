@@ -16,7 +16,6 @@ import { currentSchemaVersion, migrateDatabase } from "./schema.js";
 
 interface UserRow {
   id: string;
-  tenant_id: string;
   username: string;
   role: UserRole;
   status: UserStatus;
@@ -165,7 +164,6 @@ async function ensureRemoteDatabase(
 function mapPublicUser(row: UserRow): PublicUserRecord {
   return {
     id: row.id,
-    tenantId: row.tenant_id,
     username: row.username,
     role: row.role,
     status: row.status,
@@ -356,10 +354,9 @@ export class FlyCloudHelperDatabase {
     return (await this.getSystemState()).setupRequired;
   }
 
-  /** 原子创建首个超级管理员、个人租户和初始化完成标记。 */
+  /** 原子创建首个超级管理员并写入初始化完成标记。 */
   public async initializeSuperAdmin(input: {
     userId: string;
-    tenantId: string;
     username: string;
     usernameLookup: string;
     passwordHash: string;
@@ -383,7 +380,6 @@ export class FlyCloudHelperDatabase {
         }
         await this.insertUser(transaction, {
           userId: input.userId,
-          tenantId: input.tenantId,
           username: input.username,
           usernameLookup: input.usernameLookup,
           passwordHash: input.passwordHash,
@@ -411,10 +407,9 @@ export class FlyCloudHelperDatabase {
     }
   }
 
-  /** 创建普通用户或管理员指定角色用户及其个人租户。 */
+  /** 创建普通用户或管理员指定角色用户。 */
   public async createUser(input: {
     userId: string;
-    tenantId: string;
     username: string;
     usernameLookup: string;
     passwordHash: string;
@@ -442,12 +437,11 @@ export class FlyCloudHelperDatabase {
     }
   }
 
-  /** 在事务中写入用户、密码和个人租户。 */
+  /** 在事务中写入用户及密码。 */
   private async insertUser(
     transaction: Knex.Transaction,
     input: {
       userId: string;
-      tenantId: string;
       username: string;
       usernameLookup: string;
       passwordHash: string;
@@ -470,12 +464,6 @@ export class FlyCloudHelperDatabase {
       password_hash: input.passwordHash,
       password_changed_at: input.now,
     });
-    await transaction("tenants").insert({
-      id: input.tenantId,
-      user_id: input.userId,
-      status: "active",
-      created_at: input.now,
-    });
   }
 
   /** 按用户 ID 查询公开用户。 */
@@ -484,10 +472,8 @@ export class FlyCloudHelperDatabase {
     transaction: Knex | Knex.Transaction = this.query,
   ): Promise<PublicUserRecord> {
     const row = (await transaction("user_accounts as u")
-      .join("tenants as t", "t.user_id", "u.id")
       .select(
         "u.id",
-        "t.id as tenant_id",
         "u.username",
         "u.role",
         "u.status",
@@ -505,11 +491,9 @@ export class FlyCloudHelperDatabase {
   /** 按大小写不敏感用户名查询认证记录。 */
   public async findAuthenticationByUsername(usernameLookup: string): Promise<AuthenticationRecord | null> {
     const row = (await this.query("user_accounts as u")
-      .join("tenants as t", "t.user_id", "u.id")
       .join("user_passwords as p", "p.user_id", "u.id")
       .select(
         "u.id",
-        "t.id as tenant_id",
         "u.username",
         "u.role",
         "u.status",
@@ -555,10 +539,8 @@ export class FlyCloudHelperDatabase {
     const now = new Date().toISOString();
     const row = (await this.query("user_sessions as s")
       .join("user_accounts as u", "u.id", "s.user_id")
-      .join("tenants as t", "t.user_id", "u.id")
       .select(
         "u.id",
-        "t.id as tenant_id",
         "u.username",
         "u.role",
         "u.status",
@@ -660,7 +642,7 @@ export class FlyCloudHelperDatabase {
     limit: number;
     offset: number;
   }): Promise<{ items: Array<PublicUserRecord & { serviceCount: number; mediaCount: number }>; total: number }> {
-    const base = this.query("user_accounts as u").join("tenants as t", "t.user_id", "u.id");
+    const base = this.query("user_accounts as u");
     if (filters.keyword) {
       base.whereLike("u.username", `%${filters.keyword}%`);
     }
@@ -675,7 +657,6 @@ export class FlyCloudHelperDatabase {
       .clone()
       .select(
         "u.id",
-        "t.id as tenant_id",
         "u.username",
         "u.role",
         "u.status",
@@ -686,10 +667,10 @@ export class FlyCloudHelperDatabase {
       .limit(filters.limit)
       .offset(filters.offset)) as UserRow[];
     const items = await Promise.all(rows.map(async (row) => {
-      const serviceCountRow = await this.query("cloud_services").where({ tenant_id: row.tenant_id }).whereNull("deleted_at").count<{ count: string | number }[]>({ count: "id" }).first();
+      const serviceCountRow = await this.query("cloud_services").where({ user_id: row.id }).whereNull("deleted_at").count<{ count: string | number }[]>({ count: "id" }).first();
       const mediaCountRow = await this.query("media_items as m")
         .join("cloud_services as s", "s.id", "m.service_id")
-        .where("m.tenant_id", row.tenant_id)
+        .where("m.user_id", row.id)
         .whereNull("m.deleted_at")
         .whereNull("s.deleted_at")
         .count<{ count: string | number }[]>({ count: "m.id" })

@@ -11,7 +11,6 @@ export const sessionCookieName = "flycloud_helper_session";
 export function toUserDto(user: PublicUserRecord) {
   return {
     userId: user.id,
-    tenantId: user.tenantId,
     username: user.username,
     role: user.role,
     status: user.status,

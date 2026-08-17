@@ -10,7 +10,7 @@ import { ApiError } from "./errors.js";
 function mapExportRecord(row: Record<string, unknown>): ExportRecord {
   return {
     id: String(row.id),
-    tenantId: String(row.tenant_id),
+    userId: String(row.user_id),
     libraryId: String(row.library_id),
     exportType: row.export_type as ExportRecord["exportType"],
     status: row.status as ExportRecord["status"],
@@ -32,12 +32,12 @@ export class LibraryExportService {
   }
 
   /** 创建 APP 可识别的 FlyCloudHelper JSON 快照。 */
-  public async createSnapshot(tenantId: string, libraryId: string): Promise<ExportRecord> {
+  public async createSnapshot(userId: string, libraryId: string): Promise<ExportRecord> {
     const library = await this.database.query("media_libraries as l")
       .join("cloud_services as s", "s.id", "l.service_id")
       .select("l.*", "s.display_name", "s.provider_type", "s.data_type")
       .where("l.id", libraryId)
-      .where("l.tenant_id", tenantId)
+      .where("l.user_id", userId)
       .whereNull("s.deleted_at")
       .first();
     if (!library) {
@@ -46,7 +46,7 @@ export class LibraryExportService {
 
     const exportId = randomUUID();
     const now = new Date().toISOString();
-    const exportDirectory = path.join(this.config.exportDirectory, tenantId, libraryId);
+    const exportDirectory = path.join(this.config.exportDirectory, userId, libraryId);
     // 备份扩展名属于已经约定的客户端导入协议，项目改名后仍保留旧值。
     const finalPath = path.join(exportDirectory, `${exportId}.flymby-scanner-backup.json`);
     const temporaryPath = `${finalPath}.tmp`;
@@ -60,18 +60,18 @@ export class LibraryExportService {
             "subtitle", "year", "overview", "poster_url", "backdrop_url", "match_state",
             "external_ids_json", "metadata_json", "created_at", "updated_at",
           )
-          .where({ tenant_id: tenantId, library_id: libraryId })
+          .where({ user_id: userId, library_id: libraryId })
           .whereNull("deleted_at"),
         this.database.query("media_relations")
           .select("parent_item_id", "child_item_id", "relation_type", "sort_order")
-          .where({ tenant_id: tenantId, library_id: libraryId }),
+          .where({ user_id: userId, library_id: libraryId }),
         this.database.query("file_links as fl")
           .join("source_files as f", "f.id", "fl.source_file_id")
           .select(
             "fl.item_id", "f.id as file_id", "f.provider_resource_id", "f.path", "f.name",
             "f.extension", "f.size", "f.modified_at", "f.etag", "fl.locator_json",
           )
-          .where("fl.tenant_id", tenantId)
+          .where("fl.user_id", userId)
           .where("fl.library_id", libraryId)
           .where("f.status", "active"),
       ]);
@@ -131,7 +131,7 @@ export class LibraryExportService {
       const stat = await fs.stat(finalPath);
       await this.database.query("library_exports").insert({
         id: exportId,
-        tenant_id: tenantId,
+        user_id: userId,
         library_id: libraryId,
         export_type: "snapshot",
         status: "completed",
@@ -144,7 +144,7 @@ export class LibraryExportService {
       await fs.rm(temporaryPath, { force: true });
       await this.database.query("library_exports").insert({
         id: exportId,
-        tenant_id: tenantId,
+        user_id: userId,
         library_id: libraryId,
         export_type: "snapshot",
         status: "failed",
@@ -155,13 +155,13 @@ export class LibraryExportService {
       });
       throw error;
     }
-    return this.getExport(exportId, tenantId);
+    return this.getExport(exportId, userId);
   }
 
-  /** 查询当前租户的导出记录。 */
-  public async getExport(exportId: string, tenantId: string): Promise<ExportRecord> {
+  /** 查询当前用户的导出记录。 */
+  public async getExport(exportId: string, userId: string): Promise<ExportRecord> {
     const row = await this.database.query("library_exports")
-      .where({ id: exportId, tenant_id: tenantId })
+      .where({ id: exportId, user_id: userId })
       .first();
     if (!row) {
       throw new ApiError(404, "export_not_found", "导出文件不存在");
@@ -169,9 +169,9 @@ export class LibraryExportService {
     return mapExportRecord(row);
   }
 
-  /** 返回经过租户校验的导出文件绝对路径。 */
-  public async getDownloadPath(exportId: string, tenantId: string): Promise<string> {
-    const record = await this.getExport(exportId, tenantId);
+  /** 返回经过用户归属校验的导出文件绝对路径。 */
+  public async getDownloadPath(exportId: string, userId: string): Promise<string> {
+    const record = await this.getExport(exportId, userId);
     if (record.status !== "completed" || !record.filePath) {
       throw new ApiError(409, "export_not_ready", "导出文件尚不可下载");
     }

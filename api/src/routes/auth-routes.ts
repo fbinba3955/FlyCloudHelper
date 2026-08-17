@@ -78,7 +78,6 @@ export async function registerAuthRoutes(server: FastifyInstance, context: AuthR
     validatePasswordConfirmation(password, request.body.passwordConfirmation);
     const user = await context.database.initializeSuperAdmin({
       userId: randomUUID(),
-      tenantId: randomUUID(),
       username,
       usernameLookup: createUsernameLookup(username),
       passwordHash: await hashPassword(password),
@@ -141,7 +140,6 @@ export async function registerAuthRoutes(server: FastifyInstance, context: AuthR
     validatePasswordConfirmation(password, request.body.passwordConfirmation);
     const user = await context.database.createUser({
       userId: randomUUID(),
-      tenantId: randomUUID(),
       username,
       usernameLookup: createUsernameLookup(username),
       passwordHash: await hashPassword(password),

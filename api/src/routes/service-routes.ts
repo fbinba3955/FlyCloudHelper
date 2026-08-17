@@ -280,7 +280,7 @@ function readEventSequence(headers: Record<string, unknown>, query: Record<strin
 export async function registerServiceRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   server.get("/api/v1/overview", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    return runtime.repository.getOverview(user.tenantId);
+    return runtime.repository.getOverview(user.id);
   });
 
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/providers", async (request) => {
@@ -301,7 +301,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const pagination = readPagination(request.query);
     const status = typeof request.query.status === "string" ? request.query.status as ServiceStatus : undefined;
     return runtime.repository.listServices({
-      tenantId: user.tenantId,
+      userId: user.id,
       providerType: typeof request.query.providerType === "string" ? request.query.providerType : undefined,
       status,
       keyword: typeof request.query.search === "string" ? request.query.search : undefined,
@@ -335,8 +335,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const service = await runtime.repository.createService({
       serviceId: randomUUID(),
       libraryId: randomUUID(),
-      tenantId: user.tenantId,
-      ownerUserId: user.id,
+      userId: user.id,
       displayName,
       providerType,
       dataType,
@@ -371,13 +370,13 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.get<{ Params: { serviceId: string } }>("/api/v1/services/:serviceId", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    return { service: await runtime.repository.getServiceDetail(request.params.serviceId, user.tenantId) };
+    return { service: await runtime.repository.getServiceDetail(request.params.serviceId, user.id) };
   });
 
   server.get<{ Params: { serviceId: string }; Querystring: Record<string, unknown> }>("/api/v1/services/:serviceId/directories", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.tenantId);
-    const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, user.tenantId));
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+    const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, user.id));
     const listing = await runtime.providers.get(service.providerType).browseDirectories(
       connection,
       readProviderDirectoryParent(request.query),
@@ -397,7 +396,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const user = await requireRequestUser(request, runtime.database);
     const result = await runtime.repository.bindClientService({
       bindingId: randomUUID(),
-      tenantId: user.tenantId,
+      userId: user.id,
       serviceId: request.params.serviceId,
       clientDeviceId: requireString(request.body, "clientDeviceId", "客户端设备 ID", 200),
       clientServiceId: requireString(request.body, "clientServiceId", "客户端服务 ID", 200),
@@ -408,20 +407,20 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/connection/validate", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.tenantId);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
     const connection = requireObject(request.body, "connection", "连接配置");
     return runtime.providers.get(service.providerType).validateConnection(connection);
   });
 
   server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/connection", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.tenantId);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
     const connection = requireObject(request.body, "connection", "连接配置");
     const adapter = runtime.providers.get(service.providerType);
     await validateProviderAccess(adapter, connection, service.scanProfile);
     const updated = await runtime.repository.updateConnection({
       serviceId: service.id,
-      tenantId: user.tenantId,
+      userId: user.id,
       encryptedConnection: runtime.vault.encrypt(connection),
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
     });
@@ -439,10 +438,10 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.post<{ Params: { serviceId: string } }>("/api/v1/services/:serviceId/connection/reconnect", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.tenantId);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
     const adapter = runtime.providers.get(service.providerType);
     const connection = runtime.vault.decrypt(
-      await runtime.repository.getActiveEncryptedConnection(service.id, user.tenantId),
+      await runtime.repository.getActiveEncryptedConnection(service.id, user.id),
     );
     try {
       await validateProviderAccess(adapter, connection, service.scanProfile);
@@ -459,7 +458,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       });
       throw error;
     }
-    const updated = await runtime.repository.restoreServiceConnection(service.id, user.tenantId);
+    const updated = await runtime.repository.restoreServiceConnection(service.id, user.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-provider-reconnect",
       事件: "使用当前配置重连成功",
@@ -473,16 +472,16 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/scan-profile", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.tenantId);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
     const profile = validateScanProfile(
       requireObject(request.body, "scan", "扫描配置"),
       service.providerType,
       service.dataType,
       runtime.providers.get(service.providerType).descriptor.recommendedScanSettings,
     );
-    const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, user.tenantId));
+    const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, user.id));
     await validateConfiguredScanRoots(runtime.providers.get(service.providerType), connection, profile);
-    const updatedService = await runtime.repository.updateScanProfile(request.params.serviceId, user.tenantId, profile);
+    const updatedService = await runtime.repository.updateScanProfile(request.params.serviceId, user.id, profile);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-scan-path",
       事件: "更新服务扫描路径",
@@ -498,12 +497,12 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/metadata-profile", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.tenantId);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
     const profile = validateMetadataProfile(
       requireObject(request.body, "metadata", "元数据配置"),
       service.dataType,
     );
-    const updatedService = await runtime.repository.updateMetadataProfile(request.params.serviceId, user.tenantId, profile);
+    const updatedService = await runtime.repository.updateMetadataProfile(request.params.serviceId, user.id, profile);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-metadata-profile",
       事件: "更新影视元数据配置",
@@ -520,13 +519,13 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     if (status !== "active" && status !== "disabled") {
       throw validationError("status", "服务状态只支持 active 或 disabled");
     }
-    return { service: await runtime.repository.updateServiceStatus(request.params.serviceId, user.tenantId, status) };
+    return { service: await runtime.repository.updateServiceStatus(request.params.serviceId, user.id, status) };
   });
 
   server.delete<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, request.params.serviceId);
-    await runtime.repository.deleteService(request.params.serviceId, user.tenantId);
+    await runtime.repository.deleteService(request.params.serviceId, user.id);
     runtime.logBusinessEvent("info", { 事件: "删除云端服务", 用户ID: user.id, 服务ID: request.params.serviceId });
     return reply.status(204).send();
   });
@@ -534,7 +533,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.delete<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/catalog", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, request.params.serviceId);
-    const cleared = await runtime.repository.clearServiceCatalog(request.params.serviceId, user.tenantId);
+    const cleared = await runtime.repository.clearServiceCatalog(request.params.serviceId, user.id);
     await runtime.database.addAudit({
       id: randomUUID(),
       operatorUserId: user.id,
@@ -562,13 +561,13 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     if (scanMode !== "incremental" && scanMode !== "full") {
       throw validationError("scanMode", "扫描模式只支持 incremental 或 full");
     }
-    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.tenantId);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
     if (getScanRootsForMode(service.scanProfile, scanMode).length === 0) {
       throw new ApiError(409, "scan_paths_not_configured", `请先配置${scanMode === "full" ? "全量" : "增量"}扫描路径`);
     }
     const job = await runtime.repository.createScanJob({
       jobId: randomUUID(),
-      tenantId: user.tenantId,
+      userId: user.id,
       serviceId: request.params.serviceId,
       requestedByUserId: user.id,
       requestId: requireString(request.body, "requestId", "请求 ID", 200),
@@ -585,7 +584,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/scan-jobs", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     return runtime.repository.listJobs({
-      tenantId: user.tenantId,
+      userId: user.id,
       serviceId: typeof request.query.serviceId === "string" ? request.query.serviceId : undefined,
       status: typeof request.query.status === "string" ? request.query.status as JobStatus : undefined,
       ...readPagination(request.query),
@@ -594,15 +593,15 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.get<{ Params: { jobId: string } }>("/api/v1/scan-jobs/:jobId", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    return { job: await runtime.repository.getJob(request.params.jobId, user.tenantId) };
+    return { job: await runtime.repository.getJob(request.params.jobId, user.id) };
   });
 
   server.get<{ Params: { jobId: string }; Querystring: Record<string, unknown> }>("/api/v1/scan-jobs/:jobId/events", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
-    await runtime.repository.getJob(request.params.jobId, user.tenantId);
+    await runtime.repository.getJob(request.params.jobId, user.id);
     const start = readEventSequence(request.headers as Record<string, unknown>, request.query);
     streamJobEvents(reply, start, (afterSequence) => runtime.repository.listJobEvents({
-      tenantId: user.tenantId,
+      userId: user.id,
       jobId: request.params.jobId,
       afterSequence,
       limit: 200,
@@ -612,7 +611,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   for (const action of ["pause", "cancel"] as const) {
     server.post<{ Params: { jobId: string } }>(`/api/v1/scan-jobs/:jobId/${action}`, async (request) => {
       const user = await requireRequestUser(request, runtime.database);
-      const job = await runtime.repository.requestJobControl(request.params.jobId, user.tenantId, action);
+      const job = await runtime.repository.requestJobControl(request.params.jobId, user.id, action);
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-job-control",
         事件: action === "cancel" ? "用户终止扫描任务" : "用户暂停扫描任务",
@@ -627,7 +626,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.delete<{ Params: { jobId: string }; Body: Record<string, unknown> }>("/api/v1/scan-jobs/:jobId", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, request.params.jobId);
-    await runtime.repository.deleteScanJob(request.params.jobId, user.tenantId);
+    await runtime.repository.deleteScanJob(request.params.jobId, user.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-delete",
       事件: "用户删除扫描任务",
@@ -639,7 +638,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.post<{ Params: { jobId: string } }>("/api/v1/scan-jobs/:jobId/resume", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const job = await runtime.repository.resumeJob(request.params.jobId, user.tenantId);
+    const job = await runtime.repository.resumeJob(request.params.jobId, user.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-control",
       事件: "用户继续扫描任务",
@@ -652,13 +651,13 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.post<{ Params: { jobId: string }; Body: Record<string, unknown> }>("/api/v1/scan-jobs/:jobId/retry", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
-    const sourceJob = await runtime.repository.getJob(request.params.jobId, user.tenantId);
+    const sourceJob = await runtime.repository.getJob(request.params.jobId, user.id);
     if (sourceJob.status !== "failed" && sourceJob.status !== "cancelled") {
       throw new ApiError(409, "job_not_retryable", "只有失败或已取消任务可以重试");
     }
     const job = await runtime.repository.createScanJob({
       jobId: randomUUID(),
-      tenantId: user.tenantId,
+      userId: user.id,
       serviceId: sourceJob.serviceId,
       requestedByUserId: user.id,
       requestId: requireString(request.body, "requestId", "请求 ID", 200),
@@ -668,7 +667,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       tmdbKeyPoolRevision: runtime.tmdb.revision,
       retryOfJobId: sourceJob.id,
       pluginVersions: await runtime.plugins.buildTaskSnapshots(
-        (await runtime.repository.getServiceDetail(sourceJob.serviceId, user.tenantId)).metadataProfile,
+        (await runtime.repository.getServiceDetail(sourceJob.serviceId, user.id)).metadataProfile,
       ),
     });
     runtime.logBusinessEvent("info", {

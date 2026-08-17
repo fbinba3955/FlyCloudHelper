@@ -12,8 +12,8 @@ import {
 } from "../media/manual-video-match.js";
 import type { ApiRuntime } from "../runtime.js";
 
-/** 查询媒体库并强制当前租户归属。 */
-async function requireLibrary(runtime: ApiRuntime, libraryId: string, tenantId: string) {
+/** 查询媒体库并强制当前用户归属。 */
+async function requireLibrary(runtime: ApiRuntime, libraryId: string, userId: string) {
   const row = await runtime.database.query("media_libraries as l")
     .join("cloud_services as s", "s.id", "l.service_id")
     .select(
@@ -21,7 +21,7 @@ async function requireLibrary(runtime: ApiRuntime, libraryId: string, tenantId: 
       "l.created_at", "l.updated_at", "s.display_name", "s.data_type", "s.last_scan_at",
     )
     .where("l.id", libraryId)
-    .where("l.tenant_id", tenantId)
+    .where("l.user_id", userId)
     .whereNull("s.deleted_at")
     .first();
   if (!row) throw new ApiError(404, "library_not_found", "媒体库不存在");
@@ -36,8 +36,8 @@ function requireAppBearer(request: FastifyRequest): void {
 }
 
 /** 验证媒体条目属于 URL 指定媒体库。 */
-async function requireLibraryItem(runtime: ApiRuntime, tenantId: string, libraryId: string, itemId: string) {
-  const item = await runtime.repository.getCatalogItem(itemId, tenantId);
+async function requireLibraryItem(runtime: ApiRuntime, userId: string, libraryId: string, itemId: string) {
+  const item = await runtime.repository.getCatalogItem(itemId, userId);
   if (item.libraryId !== libraryId) {
     throw new ApiError(404, "media_item_not_found", "媒体条目不存在");
   }
@@ -68,9 +68,9 @@ async function auditCatalogAction(
 export async function registerCatalogRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   server.get<{ Params: { libraryId: string } }>("/api/v1/libraries/:libraryId", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.tenantId);
+    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
     const recentJobs = await runtime.repository.listJobs({
-      tenantId: user.tenantId,
+      userId: user.id,
       serviceId: String(library.service_id),
       limit: 10,
       offset: 0,
@@ -94,10 +94,10 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
 
   server.get<{ Params: { libraryId: string } }>("/api/v1/libraries/:libraryId/home", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.tenantId);
+    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
     const sections = await Promise.all((["video"] as MediaType[]).map(async (mediaType) => {
       const result = await runtime.repository.listCatalogItems({
-        tenantId: user.tenantId,
+        userId: user.id,
         libraryId: request.params.libraryId,
         mediaType,
         sort: "created_desc",
@@ -111,11 +111,11 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
 
   server.get<{ Params: { libraryId: string }; Querystring: Record<string, unknown> }>("/api/v1/libraries/:libraryId/facets", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.tenantId);
+    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
     const rows = await runtime.database.query("media_items")
       .select("media_type", "item_type", "match_state")
       .count<{ count: string | number }[]>({ count: "id" })
-      .where({ tenant_id: user.tenantId, library_id: request.params.libraryId })
+      .where({ user_id: user.id, library_id: request.params.libraryId })
       .whereNull("deleted_at")
       .groupBy("media_type", "item_type", "match_state");
     return {
@@ -136,7 +136,7 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     request: FastifyRequest<{ Params: { libraryId: string }; Querystring: Record<string, unknown> }>,
   ) => {
     const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.tenantId);
+    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
     const sortValue = request.query.sort;
     const sort = sortValue === "title_asc"
       || sortValue === "year_desc"
@@ -156,7 +156,7 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     });
     try {
       const result = await runtime.repository.listCatalogItems({
-        tenantId: user.tenantId,
+        userId: user.id,
         libraryId: request.params.libraryId,
         mediaType: typeof request.query.mediaType === "string" ? request.query.mediaType as MediaType : undefined,
         itemType: typeof request.query.itemType === "string" ? request.query.itemType : undefined,
@@ -193,22 +193,22 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
 
   server.get<{ Params: { libraryId: string; itemId: string } }>("/api/v1/libraries/:libraryId/items/:itemId", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    await requireLibrary(runtime, request.params.libraryId, user.tenantId);
-    return { item: await requireLibraryItem(runtime, user.tenantId, request.params.libraryId, request.params.itemId) };
+    await requireLibrary(runtime, request.params.libraryId, user.id);
+    return { item: await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId) };
   });
 
   server.get<{ Params: { libraryId: string; itemId: string } }>("/api/v1/libraries/:libraryId/items/:itemId/children", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    await requireLibrary(runtime, request.params.libraryId, user.tenantId);
-    await requireLibraryItem(runtime, user.tenantId, request.params.libraryId, request.params.itemId);
-    return { items: await runtime.repository.listCatalogChildren(request.params.itemId, user.tenantId) };
+    await requireLibrary(runtime, request.params.libraryId, user.id);
+    await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
+    return { items: await runtime.repository.listCatalogChildren(request.params.itemId, user.id) };
   });
 
   server.get<{ Params: { libraryId: string; itemId: string } }>("/api/v1/libraries/:libraryId/items/:itemId/paths", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    await requireLibrary(runtime, request.params.libraryId, user.tenantId);
-    await requireLibraryItem(runtime, user.tenantId, request.params.libraryId, request.params.itemId);
-    return { items: await runtime.repository.listCatalogItemPaths(request.params.itemId, user.tenantId) };
+    await requireLibrary(runtime, request.params.libraryId, user.id);
+    await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
+    return { items: await runtime.repository.listCatalogItemPaths(request.params.itemId, user.id) };
   });
 
   server.get<{
@@ -216,8 +216,8 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     Querystring: Record<string, unknown>;
   }>("/api/v1/libraries/:libraryId/items/:itemId/manual-match/search", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    await requireLibrary(runtime, request.params.libraryId, user.tenantId);
-    const item = await requireLibraryItem(runtime, user.tenantId, request.params.libraryId, request.params.itemId);
+    await requireLibrary(runtime, request.params.libraryId, user.id);
+    const item = await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
     return {
       items: await searchManualVideoMatches(runtime, item, {
         query: request.query.query,
@@ -232,8 +232,8 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     Body: Record<string, unknown>;
   }>("/api/v1/libraries/:libraryId/items/:itemId/manual-match", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    await requireLibrary(runtime, request.params.libraryId, user.tenantId);
-    const item = await requireLibraryItem(runtime, user.tenantId, request.params.libraryId, request.params.itemId);
+    await requireLibrary(runtime, request.params.libraryId, user.id);
+    const item = await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
     const updatedItem = await applyManualVideoMatch(runtime, item, {
       mediaType: request.body.mediaType,
       tmdbId: request.body.tmdbId,
@@ -249,8 +249,8 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     Params: { libraryId: string; itemId: string };
   }>("/api/v1/libraries/:libraryId/items/:itemId/manual-match/clear", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    await requireLibrary(runtime, request.params.libraryId, user.tenantId);
-    const item = await requireLibraryItem(runtime, user.tenantId, request.params.libraryId, request.params.itemId);
+    await requireLibrary(runtime, request.params.libraryId, user.id);
+    const item = await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
     const updatedItem = await clearManualVideoMatch(runtime, item);
     await auditCatalogAction(runtime, user, "clear_media_item_match", item.id);
     return { item: updatedItem };
@@ -259,44 +259,44 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
   server.get<{ Params: { libraryId: string; itemId: string } }>("/api/v1/libraries/:libraryId/items/:itemId/files", async (request) => {
     requireAppBearer(request);
     const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.tenantId);
-    await requireLibraryItem(runtime, user.tenantId, request.params.libraryId, request.params.itemId);
+    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
+    await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
     return {
       schemaVersion: 1,
       providerType: library.provider_type,
-      items: await runtime.repository.listItemFiles(request.params.itemId, user.tenantId),
+      items: await runtime.repository.listItemFiles(request.params.itemId, user.id),
     };
   });
 
   server.get<{ Params: { libraryId: string }; Querystring: Record<string, unknown> }>("/api/v1/libraries/:libraryId/changes", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const library = await requireLibrary(runtime, request.params.libraryId, user.tenantId);
+    const library = await requireLibrary(runtime, request.params.libraryId, user.id);
     const afterVersion = Math.max(0, Number.parseInt(String(request.query.afterVersion ?? "0"), 10) || 0);
     const limit = Math.min(1000, Math.max(1, Number.parseInt(String(request.query.limit ?? "500"), 10) || 500));
-    const result = await runtime.repository.listCatalogChanges(user.tenantId, request.params.libraryId, afterVersion, limit);
+    const result = await runtime.repository.listCatalogChanges(user.id, request.params.libraryId, afterVersion, limit);
     return { ...result, catalogVersion: Number(library.catalog_version) };
   });
 
   server.post<{ Params: { libraryId: string }; Body: Record<string, unknown> }>("/api/v1/libraries/:libraryId/exports", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
-    await requireLibrary(runtime, request.params.libraryId, user.tenantId);
+    await requireLibrary(runtime, request.params.libraryId, user.id);
     const exportType = request.body.exportType ?? "snapshot";
     if (exportType !== "snapshot") {
       throw new ApiError(422, "export_type_not_supported", "当前只支持完整目录 snapshot 导出");
     }
-    const record = await runtime.exports.createSnapshot(user.tenantId, request.params.libraryId);
+    const record = await runtime.exports.createSnapshot(user.id, request.params.libraryId);
     return reply.status(201).send({ export: { ...record, filePath: undefined } });
   });
 
   server.get<{ Params: { exportId: string } }>("/api/v1/exports/:exportId", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const record = await runtime.exports.getExport(request.params.exportId, user.tenantId);
+    const record = await runtime.exports.getExport(request.params.exportId, user.id);
     return { export: { ...record, filePath: undefined } };
   });
 
   server.get<{ Params: { exportId: string } }>("/api/v1/exports/:exportId/download", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
-    const filePath = await runtime.exports.getDownloadPath(request.params.exportId, user.tenantId);
+    const filePath = await runtime.exports.getDownloadPath(request.params.exportId, user.id);
     reply.header("Content-Type", "application/vnd.flymby.scanner-backup+json");
     reply.header("Content-Disposition", `attachment; filename="${path.basename(filePath)}"`);
     return reply.send(fs.createReadStream(filePath));

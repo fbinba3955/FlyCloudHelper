@@ -25,8 +25,7 @@ import type { TmdbVideoMetadata } from "./metadata/tmdb.js";
 
 interface ServiceRow {
   id: string;
-  tenant_id: string;
-  owner_user_id: string;
+  user_id: string;
   owner_username: string;
   library_id: string;
   display_name: string;
@@ -46,7 +45,7 @@ interface ServiceRow {
 
 interface JobRow {
   id: string;
-  tenant_id: string;
+  user_id: string;
   service_id: string;
   library_id: string;
   owner_username: string;
@@ -98,7 +97,7 @@ export interface ScanCheckpointProgress {
 /** 单个扫描任务的安全检查点；不包含任何 Provider 连接凭据。 */
 export interface ScanJobCheckpointRecord {
   jobId: string;
-  tenantId: string;
+  userId: string;
   serviceId: string;
   libraryId: string;
   checkpointVersion: number;
@@ -125,8 +124,7 @@ export interface ScanRootRunRecord {
 function mapService(row: ServiceRow): CloudServiceRecord {
   return {
     id: row.id,
-    tenantId: row.tenant_id,
-    ownerUserId: row.owner_user_id,
+    userId: row.user_id,
     ownerUsername: row.owner_username,
     libraryId: row.library_id,
     displayName: row.display_name,
@@ -149,7 +147,7 @@ function mapService(row: ServiceRow): CloudServiceRecord {
 function mapJob(row: JobRow): ScanJobRecord {
   return {
     id: row.id,
-    tenantId: row.tenant_id,
+    userId: row.user_id,
     serviceId: row.service_id,
     libraryId: row.library_id,
     ownerUsername: row.owner_username,
@@ -216,7 +214,7 @@ function mapScanJobCheckpoint(row: Record<string, unknown>): ScanJobCheckpointRe
   };
   return {
     jobId: String(row.job_id),
-    tenantId: String(row.tenant_id),
+    userId: String(row.user_id),
     serviceId: String(row.service_id),
     libraryId: String(row.library_id),
     checkpointVersion: Number(row.checkpoint_version),
@@ -336,7 +334,7 @@ function toVideoProviderEntry(row: Record<string, unknown>) {
   };
 }
 
-/** 提供带租户作用域的云端服务、任务和目录数据访问。 */
+/** 提供带用户作用域的云端服务、任务和目录数据访问。 */
 export class ServiceRepository {
   private readonly database: FlyCloudHelperDatabase;
 
@@ -344,10 +342,10 @@ export class ServiceRepository {
     this.database = database;
   }
 
-  /** 构造服务摘要公共查询，始终保留租户、所有者和媒体库链路。 */
+  /** 构造服务摘要公共查询，始终保留用户和媒体库链路。 */
   private serviceSummaryQuery(transaction: Knex | Knex.Transaction = this.database.query) {
     return transaction("cloud_services as s")
-      .join("user_accounts as u", "u.id", "s.owner_user_id")
+      .join("user_accounts as u", "u.id", "s.user_id")
       .join("media_libraries as l", "l.id", "s.library_id")
       .leftJoin("media_items as m", function joinActiveMedia() {
         this.on("m.library_id", "=", "l.id")
@@ -356,8 +354,7 @@ export class ServiceRepository {
       })
       .select(
         "s.id",
-        "s.tenant_id",
-        "s.owner_user_id",
+        "s.user_id",
         "u.username as owner_username",
         "s.library_id",
         "s.display_name",
@@ -377,8 +374,7 @@ export class ServiceRepository {
       .whereNull("s.deleted_at")
       .groupBy(
         "s.id",
-        "s.tenant_id",
-        "s.owner_user_id",
+        "s.user_id",
         "u.username",
         "s.library_id",
         "s.display_name",
@@ -400,8 +396,7 @@ export class ServiceRepository {
   public async createService(input: {
     serviceId: string;
     libraryId: string;
-    tenantId: string;
-    ownerUserId: string;
+    userId: string;
     displayName: string;
     providerType: string;
     dataType: MediaType;
@@ -415,8 +410,7 @@ export class ServiceRepository {
     await this.database.query.transaction(async (transaction) => {
       await transaction("cloud_services").insert({
         id: input.serviceId,
-        tenant_id: input.tenantId,
-        owner_user_id: input.ownerUserId,
+        user_id: input.userId,
         library_id: input.libraryId,
         display_name: input.displayName,
         provider_type: input.providerType,
@@ -433,7 +427,7 @@ export class ServiceRepository {
       });
       await transaction("media_libraries").insert({
         id: input.libraryId,
-        tenant_id: input.tenantId,
+        user_id: input.userId,
         service_id: input.serviceId,
         provider_type: input.providerType,
         catalog_version: 0,
@@ -443,7 +437,7 @@ export class ServiceRepository {
       });
       await transaction("service_credentials").insert({
         id: randomUUID(),
-        tenant_id: input.tenantId,
+        user_id: input.userId,
         service_id: input.serviceId,
         revision: 1,
         encrypted_payload: input.encryptedConnection,
@@ -454,7 +448,7 @@ export class ServiceRepository {
       });
       await transaction("service_scan_profiles").insert({
         id: randomUUID(),
-        tenant_id: input.tenantId,
+        user_id: input.userId,
         service_id: input.serviceId,
         revision: 1,
         configuration_json: JSON.stringify(input.scanProfile),
@@ -462,7 +456,7 @@ export class ServiceRepository {
       });
       await transaction("service_metadata_profiles").insert({
         id: randomUUID(),
-        tenant_id: input.tenantId,
+        user_id: input.userId,
         service_id: input.serviceId,
         revision: 1,
         configuration_json: JSON.stringify(input.metadataProfile),
@@ -471,7 +465,7 @@ export class ServiceRepository {
       if (input.binding) {
         await transaction("client_service_links").insert({
           id: input.binding.id,
-          tenant_id: input.tenantId,
+          user_id: input.userId,
           service_id: input.serviceId,
           client_device_id: input.binding.clientDeviceId,
           client_service_id: input.binding.clientServiceId,
@@ -481,13 +475,12 @@ export class ServiceRepository {
         });
       }
     });
-    return this.getServiceDetail(input.serviceId, input.tenantId);
+    return this.getServiceDetail(input.serviceId, input.userId);
   }
 
-  /** 列出当前租户或管理端指定范围内的服务。 */
+  /** 列出当前用户或管理端指定范围内的服务。 */
   public async listServices(filters: {
-    tenantId?: string;
-    ownerUserId?: string;
+    userId?: string;
     providerType?: string;
     status?: ServiceStatus;
     keyword?: string;
@@ -496,13 +489,9 @@ export class ServiceRepository {
   }): Promise<{ items: CloudServiceRecord[]; total: number }> {
     const query = this.serviceSummaryQuery();
     const countQuery = this.database.query("cloud_services as s").whereNull("s.deleted_at");
-    if (filters.tenantId) {
-      query.where("s.tenant_id", filters.tenantId);
-      countQuery.where("s.tenant_id", filters.tenantId);
-    }
-    if (filters.ownerUserId) {
-      query.where("s.owner_user_id", filters.ownerUserId);
-      countQuery.where("s.owner_user_id", filters.ownerUserId);
+    if (filters.userId) {
+      query.where("s.user_id", filters.userId);
+      countQuery.where("s.user_id", filters.userId);
     }
     if (filters.providerType) {
       query.where("s.provider_type", filters.providerType);
@@ -523,11 +512,11 @@ export class ServiceRepository {
     return { items: rows.map(mapService), total: Number(countRow?.count ?? 0) };
   }
 
-  /** 按完整租户作用域查询服务详情，不返回凭据明文。 */
-  public async getServiceDetail(serviceId: string, tenantId?: string): Promise<ServiceDetailRecord> {
+  /** 按完整用户作用域查询服务详情，不返回凭据明文。 */
+  public async getServiceDetail(serviceId: string, userId?: string): Promise<ServiceDetailRecord> {
     const query = this.serviceSummaryQuery().where("s.id", serviceId);
-    if (tenantId) {
-      query.where("s.tenant_id", tenantId);
+    if (userId) {
+      query.where("s.user_id", userId);
     }
     const row = (await query.first()) as ServiceRow | undefined;
     if (!row) {
@@ -538,7 +527,7 @@ export class ServiceRepository {
       this.database.query("service_metadata_profiles").where({ service_id: serviceId, revision: Number(row.metadata_profile_revision) }).first(),
       this.database.query("service_credentials").where({ service_id: serviceId, revision: Number(row.credential_revision), status: "active" }).first(),
       this.database.query("client_service_links").select("id", "client_device_id", "client_service_id", "provider_type", "updated_at").where({ service_id: serviceId }).orderBy("updated_at", "desc"),
-      this.listJobs({ tenantId: row.tenant_id, serviceId, limit: 10, offset: 0 }).then((result) => result.items),
+      this.listJobs({ userId: row.user_id, serviceId, limit: 10, offset: 0 }).then((result) => result.items),
     ]);
     return {
       ...mapService(row),
@@ -567,10 +556,10 @@ export class ServiceRepository {
     const scanProfileRevision = Number(job.snapshot.scanProfileRevision);
     const metadataProfileRevision = Number(job.snapshot.metadataProfileRevision);
     const [service, credential, scanProfile, metadataProfile] = await Promise.all([
-      this.database.query("cloud_services").where({ id: job.serviceId, tenant_id: job.tenantId }).whereNull("deleted_at").first(),
-      this.database.query("service_credentials").where({ service_id: job.serviceId, tenant_id: job.tenantId, revision: credentialRevision, status: "active" }).first(),
-      this.database.query("service_scan_profiles").where({ service_id: job.serviceId, tenant_id: job.tenantId, revision: scanProfileRevision }).first(),
-      this.database.query("service_metadata_profiles").where({ service_id: job.serviceId, tenant_id: job.tenantId, revision: metadataProfileRevision }).first(),
+      this.database.query("cloud_services").where({ id: job.serviceId, user_id: job.userId }).whereNull("deleted_at").first(),
+      this.database.query("service_credentials").where({ service_id: job.serviceId, user_id: job.userId, revision: credentialRevision, status: "active" }).first(),
+      this.database.query("service_scan_profiles").where({ service_id: job.serviceId, user_id: job.userId, revision: scanProfileRevision }).first(),
+      this.database.query("service_metadata_profiles").where({ service_id: job.serviceId, user_id: job.userId, revision: metadataProfileRevision }).first(),
     ]);
     if (!service || !credential || !scanProfile || !metadataProfile) {
       throw new ApiError(410, "job_configuration_unavailable", "任务冻结配置已经不可用");
@@ -584,15 +573,15 @@ export class ServiceRepository {
   }
 
   /** 读取服务当前活动凭据密文，供扫描根更新前执行真实访问校验。 */
-  public async getActiveEncryptedConnection(serviceId: string, tenantId: string): Promise<string> {
+  public async getActiveEncryptedConnection(serviceId: string, userId: string): Promise<string> {
     const service = await this.database.query("cloud_services")
-      .where({ id: serviceId, tenant_id: tenantId })
+      .where({ id: serviceId, user_id: userId })
       .whereNull("deleted_at")
       .first();
     if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
     const credential = await this.database.query("service_credentials").where({
       service_id: serviceId,
-      tenant_id: tenantId,
+      user_id: userId,
       revision: Number(service.credential_revision),
       status: "active",
     }).first();
@@ -603,12 +592,12 @@ export class ServiceRepository {
   /** 更新服务连接并生成不可变凭据修订。 */
   public async updateConnection(input: {
     serviceId: string;
-    tenantId: string;
+    userId: string;
     encryptedConnection: string;
     providerSchemaVersion: number;
   }): Promise<ServiceDetailRecord> {
     await this.database.query.transaction(async (transaction) => {
-      const service = await transaction("cloud_services").where({ id: input.serviceId, tenant_id: input.tenantId }).whereNull("deleted_at").first();
+      const service = await transaction("cloud_services").where({ id: input.serviceId, user_id: input.userId }).whereNull("deleted_at").first();
       if (!service) {
         throw new ApiError(404, "service_not_found", "云端服务不存在");
       }
@@ -616,7 +605,7 @@ export class ServiceRepository {
       const now = new Date().toISOString();
       await transaction("service_credentials").insert({
         id: randomUUID(),
-        tenant_id: input.tenantId,
+        user_id: input.userId,
         service_id: input.serviceId,
         revision,
         encrypted_payload: input.encryptedConnection,
@@ -632,18 +621,18 @@ export class ServiceRepository {
         updated_at: now,
       });
     });
-    return this.getServiceDetail(input.serviceId, input.tenantId);
+    return this.getServiceDetail(input.serviceId, input.userId);
   }
 
   /** 当前保存的凭据重新验证成功后恢复连接状态，不创建新的凭据修订。 */
   public async restoreServiceConnection(
     serviceId: string,
-    tenantId: string | undefined,
+    userId: string | undefined,
   ): Promise<ServiceDetailRecord> {
     const serviceQuery = this.database.query("cloud_services")
       .where({ id: serviceId })
       .whereNull("deleted_at");
-    if (tenantId) serviceQuery.where({ tenant_id: tenantId });
+    if (userId) serviceQuery.where({ user_id: userId });
     const service = await serviceQuery.first();
     if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
     const now = new Date().toISOString();
@@ -654,32 +643,32 @@ export class ServiceRepository {
       status: nextStatus,
       updated_at: now,
     });
-    return this.getServiceDetail(serviceId, tenantId);
+    return this.getServiceDetail(serviceId, userId);
   }
 
   /** 更新扫描配置并生成不可变修订。 */
-  public async updateScanProfile(serviceId: string, tenantId: string, profile: Record<string, unknown>): Promise<ServiceDetailRecord> {
-    await this.updateProfileRevision("scan", serviceId, tenantId, profile);
-    return this.getServiceDetail(serviceId, tenantId);
+  public async updateScanProfile(serviceId: string, userId: string, profile: Record<string, unknown>): Promise<ServiceDetailRecord> {
+    await this.updateProfileRevision("scan", serviceId, userId, profile);
+    return this.getServiceDetail(serviceId, userId);
   }
 
   /** 更新元数据配置并生成不可变修订。 */
-  public async updateMetadataProfile(serviceId: string, tenantId: string, profile: Record<string, unknown>): Promise<ServiceDetailRecord> {
-    await this.updateProfileRevision("metadata", serviceId, tenantId, profile);
-    return this.getServiceDetail(serviceId, tenantId);
+  public async updateMetadataProfile(serviceId: string, userId: string, profile: Record<string, unknown>): Promise<ServiceDetailRecord> {
+    await this.updateProfileRevision("metadata", serviceId, userId, profile);
+    return this.getServiceDetail(serviceId, userId);
   }
 
   /** 生成指定类型的配置修订并原子更新当前指针。 */
   private async updateProfileRevision(
     type: "scan" | "metadata",
     serviceId: string,
-    tenantId: string,
+    userId: string,
     profile: Record<string, unknown>,
   ): Promise<void> {
     const tableName = type === "scan" ? "service_scan_profiles" : "service_metadata_profiles";
     const revisionColumn = type === "scan" ? "scan_profile_revision" : "metadata_profile_revision";
     await this.database.query.transaction(async (transaction) => {
-      const service = await transaction("cloud_services").where({ id: serviceId, tenant_id: tenantId }).whereNull("deleted_at").first();
+      const service = await transaction("cloud_services").where({ id: serviceId, user_id: userId }).whereNull("deleted_at").first();
       if (!service) {
         throw new ApiError(404, "service_not_found", "云端服务不存在");
       }
@@ -687,7 +676,7 @@ export class ServiceRepository {
       const now = new Date().toISOString();
       await transaction(tableName).insert({
         id: randomUUID(),
-        tenant_id: tenantId,
+        user_id: userId,
         service_id: serviceId,
         revision,
         configuration_json: JSON.stringify(profile),
@@ -703,19 +692,19 @@ export class ServiceRepository {
   /** 建立客户端本地服务到既有云端服务的绑定，不改写服务配置。 */
   public async bindClientService(input: {
     bindingId: string;
-    tenantId: string;
+    userId: string;
     serviceId: string;
     clientDeviceId: string;
     clientServiceId: string;
     providerType: string;
   }): Promise<{ bindingId: string; serviceId: string; libraryId: string; catalogVersion: number }> {
-    const service = await this.getServiceDetail(input.serviceId, input.tenantId);
+    const service = await this.getServiceDetail(input.serviceId, input.userId);
     if (service.providerType !== input.providerType) {
       throw new ApiError(409, "provider_type_conflict", "本地服务与云端服务 Provider 类型不一致");
     }
     const now = new Date().toISOString();
     const existing = await this.database.query("client_service_links").where({
-      tenant_id: input.tenantId,
+      user_id: input.userId,
       client_device_id: input.clientDeviceId,
       client_service_id: input.clientServiceId,
     }).first();
@@ -728,7 +717,7 @@ export class ServiceRepository {
     }
     await this.database.query("client_service_links").insert({
       id: input.bindingId,
-      tenant_id: input.tenantId,
+      user_id: input.userId,
       service_id: input.serviceId,
       client_device_id: input.clientDeviceId,
       client_service_id: input.clientServiceId,
@@ -742,7 +731,7 @@ export class ServiceRepository {
   /** 创建具备请求幂等和同服务单写互斥的扫描任务。 */
   public async createScanJob(input: {
     jobId: string;
-    tenantId: string;
+    userId: string;
     serviceId: string;
     requestedByUserId: string;
     requestId: string;
@@ -758,13 +747,13 @@ export class ServiceRepository {
       configurationRevision: number;
     }>;
   }): Promise<ScanJobRecord> {
-    const existing = await this.findJobByRequest(input.tenantId, input.clientDeviceId, input.requestId);
+    const existing = await this.findJobByRequest(input.userId, input.clientDeviceId, input.requestId);
     if (existing) {
       return existing;
     }
     try {
       return await this.database.query.transaction(async (transaction) => {
-        const service = await transaction("cloud_services").where({ id: input.serviceId, tenant_id: input.tenantId }).whereNull("deleted_at").first();
+        const service = await transaction("cloud_services").where({ id: input.serviceId, user_id: input.userId }).whereNull("deleted_at").first();
         if (!service) {
           throw new ApiError(404, "service_not_found", "云端服务不存在");
         }
@@ -791,7 +780,7 @@ export class ServiceRepository {
         };
         await transaction("scan_jobs").insert({
           id: input.jobId,
-          tenant_id: input.tenantId,
+          user_id: input.userId,
           service_id: input.serviceId,
           library_id: service.library_id,
           requested_by_user_id: input.requestedByUserId,
@@ -819,16 +808,16 @@ export class ServiceRepository {
           finished_at: null,
           updated_at: now,
         });
-        await this.insertJobEvent(transaction, input.tenantId, input.jobId, "queued", {
+        await this.insertJobEvent(transaction, input.userId, input.jobId, "queued", {
           status: "queued",
           stage: "queued",
           retryOfJobId: input.retryOfJobId ?? null,
         });
-        return this.getJob(input.jobId, input.tenantId, transaction);
+        return this.getJob(input.jobId, input.userId, transaction);
       });
     } catch (error) {
       // 并发请求可能同时通过事务外查询；唯一索引冲突后返回已经创建的同一任务。
-      const racedJob = await this.findJobByRequest(input.tenantId, input.clientDeviceId, input.requestId);
+      const racedJob = await this.findJobByRequest(input.userId, input.clientDeviceId, input.requestId);
       if (racedJob) {
         return racedJob;
       }
@@ -837,9 +826,9 @@ export class ServiceRepository {
   }
 
   /** 按幂等键查询任务。 */
-  private async findJobByRequest(tenantId: string, clientDeviceId: string, requestId: string): Promise<ScanJobRecord | null> {
+  private async findJobByRequest(userId: string, clientDeviceId: string, requestId: string): Promise<ScanJobRecord | null> {
     const row = await this.jobSummaryQuery().where({
-      "j.tenant_id": tenantId,
+      "j.user_id": userId,
       "j.client_device_id": clientDeviceId,
       "j.request_id": requestId,
     }).first() as JobRow | undefined;
@@ -850,7 +839,7 @@ export class ServiceRepository {
   private jobSummaryQuery(transaction: Knex | Knex.Transaction = this.database.query) {
     return transaction("scan_jobs as j")
       .join("cloud_services as s", "s.id", "j.service_id")
-      .join("user_accounts as u", "u.id", "s.owner_user_id")
+      .join("user_accounts as u", "u.id", "s.user_id")
       .leftJoin("scan_job_checkpoints as cp", "cp.job_id", "j.id")
       .select(
         "j.*",
@@ -861,15 +850,15 @@ export class ServiceRepository {
       );
   }
 
-  /** 查询单个任务并按需校验租户。 */
+  /** 查询单个任务并按需校验用户归属。 */
   public async getJob(
     jobId: string,
-    tenantId?: string,
+    userId?: string,
     transaction: Knex | Knex.Transaction = this.database.query,
   ): Promise<ScanJobRecord> {
     const query = this.jobSummaryQuery(transaction).where("j.id", jobId);
-    if (tenantId) {
-      query.where("j.tenant_id", tenantId);
+    if (userId) {
+      query.where("j.user_id", userId);
     }
     const row = await query.first() as JobRow | undefined;
     if (!row) {
@@ -917,7 +906,7 @@ export class ServiceRepository {
     };
     await this.database.query("scan_job_checkpoints").insert({
       job_id: job.id,
-      tenant_id: job.tenantId,
+      user_id: job.userId,
       service_id: job.serviceId,
       library_id: job.libraryId,
       checkpoint_version: 1,
@@ -950,7 +939,7 @@ export class ServiceRepository {
     await this.database.query("scan_job_checkpoints")
       .insert({
         job_id: input.checkpoint.jobId,
-        tenant_id: input.checkpoint.tenantId,
+        user_id: input.checkpoint.userId,
         service_id: input.checkpoint.serviceId,
         library_id: input.checkpoint.libraryId,
         checkpoint_version: input.checkpoint.checkpointVersion,
@@ -996,7 +985,7 @@ export class ServiceRepository {
       .insert({
         id: createStableId("root-run", input.job.id, input.rootKey),
         job_id: input.job.id,
-        tenant_id: input.job.tenantId,
+        user_id: input.job.userId,
         service_id: input.job.serviceId,
         library_id: input.job.libraryId,
         root_key: input.rootKey,
@@ -1050,10 +1039,9 @@ export class ServiceRepository {
     }));
   }
 
-  /** 分页查询当前租户或管理端筛选范围内的任务。 */
+  /** 分页查询当前用户或管理端筛选范围内的任务。 */
   public async listJobs(filters: {
-    tenantId?: string;
-    ownerUserId?: string;
+    userId?: string;
     serviceId?: string;
     status?: JobStatus;
     limit: number;
@@ -1061,13 +1049,9 @@ export class ServiceRepository {
   }): Promise<{ items: ScanJobRecord[]; total: number }> {
     const query = this.jobSummaryQuery();
     const countQuery = this.database.query("scan_jobs as j").join("cloud_services as s", "s.id", "j.service_id");
-    if (filters.tenantId) {
-      query.where("j.tenant_id", filters.tenantId);
-      countQuery.where("j.tenant_id", filters.tenantId);
-    }
-    if (filters.ownerUserId) {
-      query.where("s.owner_user_id", filters.ownerUserId);
-      countQuery.where("s.owner_user_id", filters.ownerUserId);
+    if (filters.userId) {
+      query.where("j.user_id", filters.userId);
+      countQuery.where("j.user_id", filters.userId);
     }
     if (filters.serviceId) {
       query.where("j.service_id", filters.serviceId);
@@ -1106,18 +1090,18 @@ export class ServiceRepository {
         return null;
       }
       await transaction("cloud_services").where({ id: row.service_id }).update({ status: "scanning", updated_at: now });
-      await this.insertJobEvent(transaction, String(row.tenant_id), String(row.id), "progress", {
+      await this.insertJobEvent(transaction, String(row.user_id), String(row.id), "progress", {
         status: "running",
         stage: "enumerating",
       });
-      return this.getJob(String(row.id), String(row.tenant_id), transaction);
+      return this.getJob(String(row.id), String(row.user_id), transaction);
     });
   }
 
   /** 单实例进程启动时把异常中断的运行任务恢复到队列。 */
   public async recoverInterruptedJobs(): Promise<number> {
     const rows = await this.database.query("scan_jobs")
-      .select("id", "tenant_id", "service_id")
+      .select("id", "user_id", "service_id")
       .where({ status: "running" });
     if (rows.length === 0) return 0;
     const now = new Date().toISOString();
@@ -1133,7 +1117,7 @@ export class ServiceRepository {
           status: "active",
           updated_at: now,
         });
-        await this.insertJobEvent(transaction, String(row.tenant_id), String(row.id), "queued", {
+        await this.insertJobEvent(transaction, String(row.user_id), String(row.id), "queued", {
           status: "queued",
           recoveredAfterRestart: true,
         });
@@ -1184,7 +1168,7 @@ export class ServiceRepository {
         status: "active",
         updated_at: now,
       });
-      await this.insertJobEvent(transaction, current.tenantId, current.id, "retry_waiting", {
+      await this.insertJobEvent(transaction, current.userId, current.id, "retry_waiting", {
         status: "retry_waiting",
         stage: current.stage,
         nextRetryAt,
@@ -1203,7 +1187,7 @@ export class ServiceRepository {
     return this.database.query.transaction(async (transaction) => {
       // 关键变量：按到期时间和创建时间稳定领取，防止大量等待任务恢复时顺序抖动。
       const rows = await transaction("scan_jobs")
-        .select("id", "tenant_id", "service_id", "retry_count")
+        .select("id", "user_id", "service_id", "retry_count")
         .where({ status: "retry_waiting" })
         .whereNotNull("next_retry_at")
         .where("next_retry_at", "<=", now)
@@ -1226,7 +1210,7 @@ export class ServiceRepository {
           });
         if (changed !== 1) continue;
         changedCount += 1;
-        await this.insertJobEvent(transaction, String(row.tenant_id), String(row.id), "queued", {
+        await this.insertJobEvent(transaction, String(row.user_id), String(row.id), "queued", {
           status: "queued",
           delayedRetry: true,
           retryCount: Number(row.retry_count ?? 0),
@@ -1260,7 +1244,7 @@ export class ServiceRepository {
     if (input.currentPath !== undefined) patch.current_path = input.currentPath;
     await this.database.query("scan_jobs").where({ id: jobId }).update(patch);
     const job = await this.getJob(jobId);
-    await this.addJobEvent(job.tenantId, job.id, "progress", {
+    await this.addJobEvent(job.userId, job.id, "progress", {
       status: job.status,
       stage: job.stage,
       processedCount: job.processedCount,
@@ -1305,7 +1289,7 @@ export class ServiceRepository {
       if (input.status === "completed" || input.status === "cancelled") {
         await transaction("scan_job_checkpoints").where({ job_id: current.id }).delete();
       }
-      await this.insertJobEvent(transaction, current.tenantId, current.id, input.status, {
+      await this.insertJobEvent(transaction, current.userId, current.id, input.status, {
         status: input.status,
         stage: input.status === "completed" ? "completed" : current.stage,
         errorCode: input.errorCode ?? null,
@@ -1316,8 +1300,8 @@ export class ServiceRepository {
   }
 
   /** 写入任务控制请求，Worker 在安全检查点执行。 */
-  public async requestJobControl(jobId: string, tenantId: string | undefined, action: "pause" | "cancel"): Promise<ScanJobRecord> {
-    const job = await this.getJob(jobId, tenantId);
+  public async requestJobControl(jobId: string, userId: string | undefined, action: "pause" | "cancel"): Promise<ScanJobRecord> {
+    const job = await this.getJob(jobId, userId);
     if (!(["queued", "running", "retry_waiting", "paused"] as JobStatus[]).includes(job.status)) {
       throw new ApiError(409, "job_not_controllable", "当前任务状态不能执行该操作");
     }
@@ -1338,8 +1322,8 @@ export class ServiceRepository {
   }
 
   /** 删除已经进入终态的扫描任务及其事件；运行中任务必须先取消。 */
-  public async deleteScanJob(jobId: string, tenantId?: string): Promise<void> {
-    const job = await this.getJob(jobId, tenantId);
+  public async deleteScanJob(jobId: string, userId?: string): Promise<void> {
+    const job = await this.getJob(jobId, userId);
     if ((["queued", "running", "retry_waiting", "paused"] as JobStatus[]).includes(job.status)) {
       throw new ApiError(409, "scan_job_active", "请先终止扫描任务，再删除任务记录");
     }
@@ -1351,8 +1335,8 @@ export class ServiceRepository {
   }
 
   /** 恢复暂停任务，继续使用原冻结配置。 */
-  public async resumeJob(jobId: string, tenantId?: string): Promise<ScanJobRecord> {
-    const job = await this.getJob(jobId, tenantId);
+  public async resumeJob(jobId: string, userId?: string): Promise<ScanJobRecord> {
+    const job = await this.getJob(jobId, userId);
     if (job.status !== "paused") {
       throw new ApiError(409, "job_not_paused", "只有暂停任务可以继续");
     }
@@ -1379,7 +1363,7 @@ export class ServiceRepository {
       patch.current_path = progress.currentScanPath;
     }
     await this.database.query("scan_jobs").where({ id: job.id }).update(patch);
-    await this.addJobEvent(job.tenantId, job.id, "queued", {
+    await this.addJobEvent(job.userId, job.id, "queued", {
       status: "queued",
       resumed: true,
       checkpointRestored: Boolean(checkpoint),
@@ -1397,13 +1381,13 @@ export class ServiceRepository {
   /** 在现有事务内插入任务事件。 */
   private async insertJobEvent(
     transaction: Knex | Knex.Transaction,
-    tenantId: string,
+    userId: string,
     jobId: string,
     eventType: string,
     payload: Record<string, unknown>,
   ): Promise<void> {
     await transaction("scan_job_events").insert({
-      tenant_id: tenantId,
+      user_id: userId,
       job_id: jobId,
       event_type: eventType,
       payload_json: JSON.stringify(payload),
@@ -1412,19 +1396,19 @@ export class ServiceRepository {
   }
 
   /** 插入持久化任务事件。 */
-  public async addJobEvent(tenantId: string, jobId: string, eventType: string, payload: Record<string, unknown>): Promise<void> {
-    await this.insertJobEvent(this.database.query, tenantId, jobId, eventType, payload);
+  public async addJobEvent(userId: string, jobId: string, eventType: string, payload: Record<string, unknown>): Promise<void> {
+    await this.insertJobEvent(this.database.query, userId, jobId, eventType, payload);
   }
 
   /** 按事件游标读取任务事件。 */
-  public async listJobEvents(filters: { tenantId?: string; jobId?: string; afterSequence: number; limit: number }): Promise<JobEventRecord[]> {
+  public async listJobEvents(filters: { userId?: string; jobId?: string; afterSequence: number; limit: number }): Promise<JobEventRecord[]> {
     const query = this.database.query("scan_job_events").where("sequence", ">", filters.afterSequence);
-    if (filters.tenantId) query.where("tenant_id", filters.tenantId);
+    if (filters.userId) query.where("user_id", filters.userId);
     if (filters.jobId) query.where("job_id", filters.jobId);
     const rows = await query.orderBy("sequence", "asc").limit(filters.limit);
     return rows.map((row) => ({
       sequence: Number(row.sequence),
-      tenantId: String(row.tenant_id),
+      userId: String(row.user_id),
       jobId: String(row.job_id),
       eventType: String(row.event_type),
       payload: parseJsonObject(row.payload_json),
@@ -1433,7 +1417,7 @@ export class ServiceRepository {
   }
 
   /** 更新服务启停状态。 */
-  public async updateServiceStatus(serviceId: string, tenantId: string | undefined, status: "active" | "disabled"): Promise<ServiceDetailRecord> {
+  public async updateServiceStatus(serviceId: string, userId: string | undefined, status: "active" | "disabled"): Promise<ServiceDetailRecord> {
     if (status === "disabled") {
       const activeJob = await this.database.query("scan_jobs")
         .where({ service_id: serviceId })
@@ -1442,17 +1426,17 @@ export class ServiceRepository {
       if (activeJob) throw new ApiError(409, "service_has_active_job", "服务仍有未结束任务，不能停用");
     }
     const query = this.database.query("cloud_services").where({ id: serviceId }).whereNull("deleted_at");
-    if (tenantId) query.where({ tenant_id: tenantId });
+    if (userId) query.where({ user_id: userId });
     const changed = await query.update({ status, updated_at: new Date().toISOString() });
     if (changed !== 1) throw new ApiError(404, "service_not_found", "云端服务不存在");
-    return this.getServiceDetail(serviceId, tenantId);
+    return this.getServiceDetail(serviceId, userId);
   }
 
   /** 软删除服务，并同步从活动媒体统计和扫描来源中移除关联数据。 */
-  public async deleteService(serviceId: string, tenantId?: string): Promise<void> {
+  public async deleteService(serviceId: string, userId?: string): Promise<void> {
     await this.database.query.transaction(async (transaction) => {
       const serviceQuery = transaction("cloud_services").where({ id: serviceId }).whereNull("deleted_at");
-      if (tenantId) serviceQuery.where({ tenant_id: tenantId });
+      if (userId) serviceQuery.where({ user_id: userId });
       const service = await serviceQuery.first();
       if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
       const running = await transaction("scan_jobs").where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first();
@@ -1466,13 +1450,13 @@ export class ServiceRepository {
   }
 
   /** 清空单个服务的扫描文件、刮削条目和目录变更，保留服务连接、配置与任务历史。 */
-  public async clearServiceCatalog(serviceId: string, tenantId?: string): Promise<{
+  public async clearServiceCatalog(serviceId: string, userId?: string): Promise<{
     mediaItemCount: number;
     sourceFileCount: number;
   }> {
     return this.database.query.transaction(async (transaction) => {
       const serviceQuery = transaction("cloud_services").where({ id: serviceId }).whereNull("deleted_at");
-      if (tenantId) serviceQuery.where({ tenant_id: tenantId });
+      if (userId) serviceQuery.where({ user_id: userId });
       const service = await serviceQuery.first();
       if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
       const activeJob = await transaction("scan_jobs")
@@ -1515,7 +1499,7 @@ export class ServiceRepository {
   /** 若源文件属性和播放定位均未变化，只推进本轮扫描标记并返回现有记录。 */
   public async markSourceFileSeenIfUnchanged(input: SourceFileRecord): Promise<SourceFileRecord | null> {
     const row = await this.database.query("source_files").where({
-      tenant_id: input.tenantId,
+      user_id: input.userId,
       library_id: input.libraryId,
       provider_resource_id: input.providerResourceId,
     }).first();
@@ -1548,7 +1532,7 @@ export class ServiceRepository {
     await this.database.query("source_files")
       .insert({
         id: input.id,
-        tenant_id: input.tenantId,
+        user_id: input.userId,
         service_id: input.serviceId,
         library_id: input.libraryId,
         provider_resource_id: input.providerResourceId,
@@ -1566,7 +1550,7 @@ export class ServiceRepository {
         created_at: now,
         updated_at: now,
       })
-      .onConflict(["tenant_id", "library_id", "provider_resource_id"])
+      .onConflict(["user_id", "library_id", "provider_resource_id"])
       .merge({
         parent_resource_id: input.parentResourceId,
         path: input.path,
@@ -1582,7 +1566,7 @@ export class ServiceRepository {
         updated_at: now,
       });
     const row = await this.database.query("source_files").where({
-      tenant_id: input.tenantId,
+      user_id: input.userId,
       library_id: input.libraryId,
       provider_resource_id: input.providerResourceId,
     }).first();
@@ -1595,7 +1579,7 @@ export class ServiceRepository {
   /** upsert 媒体条目并返回条目内容是否发生真实变化。 */
   public async upsertMediaItem(input: {
     id: string;
-    tenantId: string;
+    userId: string;
     serviceId: string;
     libraryId: string;
     identityKey: string;
@@ -1614,7 +1598,7 @@ export class ServiceRepository {
     generationId: string;
   }): Promise<{ itemId: string; changed: boolean }> {
     const existing = await this.database.query("media_items").where({
-      tenant_id: input.tenantId,
+      user_id: input.userId,
       library_id: input.libraryId,
       identity_key: input.identityKey,
     }).first();
@@ -1659,7 +1643,7 @@ export class ServiceRepository {
     await this.database.query("media_items")
       .insert({
         id: itemId,
-        tenant_id: input.tenantId,
+        user_id: input.userId,
         service_id: input.serviceId,
         library_id: input.libraryId,
         identity_key: input.identityKey,
@@ -1681,7 +1665,7 @@ export class ServiceRepository {
         updated_at: now,
         deleted_at: null,
       })
-      .onConflict(["tenant_id", "library_id", "identity_key"])
+      .onConflict(["user_id", "library_id", "identity_key"])
       .merge({
         media_type: effectiveInput.mediaType,
         item_type: effectiveInput.itemType,
@@ -1703,7 +1687,7 @@ export class ServiceRepository {
     if (hasManualMatch && effectiveInput.itemType === "video.series") {
       const childIds = await this.database.query("media_relations")
         .select("child_item_id")
-        .where({ tenant_id: input.tenantId, parent_item_id: itemId });
+        .where({ user_id: input.userId, parent_item_id: itemId });
       if (childIds.length > 0) {
         await this.database.query("media_items")
           .whereIn("id", childIds.map((row) => String(row.child_item_id)))
@@ -1714,11 +1698,11 @@ export class ServiceRepository {
   }
 
   /** 关联媒体条目与源文件定位。 */
-  public async linkItemFile(input: { tenantId: string; libraryId: string; itemId: string; sourceFileId: string; locator: Record<string, unknown> }): Promise<void> {
+  public async linkItemFile(input: { userId: string; libraryId: string; itemId: string; sourceFileId: string; locator: Record<string, unknown> }): Promise<void> {
     let targetItemId = input.itemId;
     const parentRow = await this.database.query("media_items").select("item_type", "metadata_json").where({
       id: input.itemId,
-      tenant_id: input.tenantId,
+      user_id: input.userId,
       library_id: input.libraryId,
     }).first();
     const parentHasManualMatch = Object.keys(asObject(parseJsonObject(parentRow?.metadata_json).manualMatch)).length > 0;
@@ -1727,7 +1711,7 @@ export class ServiceRepository {
       const episodeLink = await this.database.query("media_relations as mr")
         .join("file_links as fl", "fl.item_id", "mr.child_item_id")
         .select("mr.child_item_id")
-        .where("mr.tenant_id", input.tenantId)
+        .where("mr.user_id", input.userId)
         .where("mr.parent_item_id", input.itemId)
         .where("fl.source_file_id", input.sourceFileId)
         .first();
@@ -1736,46 +1720,46 @@ export class ServiceRepository {
     await this.database.query("file_links")
       .insert({
         id: randomUUID(),
-        tenant_id: input.tenantId,
+        user_id: input.userId,
         library_id: input.libraryId,
         item_id: targetItemId,
         source_file_id: input.sourceFileId,
         locator_json: JSON.stringify(input.locator),
       })
-      .onConflict(["tenant_id", "item_id", "source_file_id"])
+      .onConflict(["user_id", "item_id", "source_file_id"])
       .merge({ locator_json: JSON.stringify(input.locator) });
   }
 
   /** 创建父子或领域关系，重复关系保持幂等。 */
-  public async linkMediaRelation(input: { tenantId: string; libraryId: string; parentItemId: string; childItemId: string; relationType: string; sortOrder: number }): Promise<void> {
+  public async linkMediaRelation(input: { userId: string; libraryId: string; parentItemId: string; childItemId: string; relationType: string; sortOrder: number }): Promise<void> {
     const parentRow = await this.database.query("media_items").select("item_type", "metadata_json").where({
       id: input.parentItemId,
-      tenant_id: input.tenantId,
+      user_id: input.userId,
       library_id: input.libraryId,
     }).first();
     const parentHasManualMatch = Object.keys(asObject(parseJsonObject(parentRow?.metadata_json).manualMatch)).length > 0;
     if (parentRow?.item_type === "video.movie" && parentHasManualMatch) {
       // 人工把节目纠正成电影后，扫描到的单集文件继续汇总到电影条目，不重新生成节目关系。
       const childLinks = await this.database.query("file_links").select("source_file_id", "locator_json").where({
-        tenant_id: input.tenantId,
+        user_id: input.userId,
         library_id: input.libraryId,
         item_id: input.childItemId,
       });
       for (const childLink of childLinks) {
         await this.database.query("file_links").insert({
           id: randomUUID(),
-          tenant_id: input.tenantId,
+          user_id: input.userId,
           library_id: input.libraryId,
           item_id: input.parentItemId,
           source_file_id: childLink.source_file_id,
           locator_json: childLink.locator_json,
-        }).onConflict(["tenant_id", "item_id", "source_file_id"]).merge({ locator_json: childLink.locator_json });
+        }).onConflict(["user_id", "item_id", "source_file_id"]).merge({ locator_json: childLink.locator_json });
       }
       return;
     }
     // 单集、曲目和章节只能属于一个同类型父项；解析规则修正后先移除旧父关系，避免海报墙残留错误节目。
     await this.database.query("media_relations").where({
-      tenant_id: input.tenantId,
+      user_id: input.userId,
       library_id: input.libraryId,
       child_item_id: input.childItemId,
       relation_type: input.relationType,
@@ -1783,20 +1767,20 @@ export class ServiceRepository {
     await this.database.query("media_relations")
       .insert({
         id: randomUUID(),
-        tenant_id: input.tenantId,
+        user_id: input.userId,
         library_id: input.libraryId,
         parent_item_id: input.parentItemId,
         child_item_id: input.childItemId,
         relation_type: input.relationType,
         sort_order: input.sortOrder,
       })
-      .onConflict(["tenant_id", "parent_item_id", "child_item_id", "relation_type"])
+      .onConflict(["user_id", "parent_item_id", "child_item_id", "relation_type"])
       .merge({ sort_order: input.sortOrder });
   }
 
   /** 在成功 generation 后执行删除保护对账并推进目录版本。 */
   public async finalizeGeneration(input: {
-    tenantId: string;
+    userId: string;
     serviceId: string;
     libraryId: string;
     generationId: string;
@@ -1812,7 +1796,7 @@ export class ServiceRepository {
       const missingGenerationItemIds = input.deleteMissing
         ? await this.cleanupCompletedRootMissingFiles(
           transaction,
-          input.tenantId,
+          input.userId,
           input.libraryId,
           input.completedRootGenerations,
           now,
@@ -1820,12 +1804,12 @@ export class ServiceRepository {
         : [];
       // Flymby APP 在任一目录枚举失败后跳过本轮过期清理，避免把未访问目录中的旧数据误删。
       const excludedItemIds = input.allowDestructiveCleanup
-        ? await this.cleanupExcludedCatalogPaths(transaction, input.tenantId, input.libraryId, now)
+        ? await this.cleanupExcludedCatalogPaths(transaction, input.userId, input.libraryId, now)
         : [];
       const orphanParentIds = input.allowDestructiveCleanup || input.deleteMissing
-        ? await this.cleanupOrphanCatalogParents(transaction, input.tenantId, input.libraryId, now)
+        ? await this.cleanupOrphanCatalogParents(transaction, input.userId, input.libraryId, now)
         : [];
-      const library = await transaction("media_libraries").where({ id: input.libraryId, tenant_id: input.tenantId }).first();
+      const library = await transaction("media_libraries").where({ id: input.libraryId, user_id: input.userId }).first();
       if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
       const previousCatalogVersion = Number(library.catalog_version);
       const deletedItemIds = new Set([
@@ -1844,7 +1828,7 @@ export class ServiceRepository {
         for (let offset = 0; offset < changes.length; offset += CATALOG_CHANGE_INSERT_BATCH_SIZE) {
           const changeBatch = changes.slice(offset, offset + CATALOG_CHANGE_INSERT_BATCH_SIZE);
           await transaction("catalog_changes").insert(changeBatch.map((change, batchIndex) => ({
-            tenant_id: input.tenantId,
+            user_id: input.userId,
             library_id: input.libraryId,
             // 每条变化使用独立版本，afterVersion 分页不会跳过同一扫描批次的剩余条目。
             catalog_version: previousCatalogVersion + offset + batchIndex + 1,
@@ -1863,7 +1847,7 @@ export class ServiceRepository {
   /** 只把完整扫描根中未出现在本 generation 的源文件标记缺失，并软删除无活动文件条目。 */
   private async cleanupCompletedRootMissingFiles(
     transaction: Knex.Transaction,
-    tenantId: string,
+    userId: string,
     libraryId: string,
     completedRoots: Array<{ rootKey: string; generationId: string }>,
     now: string,
@@ -1873,7 +1857,7 @@ export class ServiceRepository {
       const rows = await transaction("source_files")
         .select("id")
         .where({
-          tenant_id: tenantId,
+          user_id: userId,
           library_id: libraryId,
           scan_root_key: root.rootKey,
           status: "active",
@@ -1916,13 +1900,13 @@ export class ServiceRepository {
   /** 把 APP 默认排除目录中的旧扫描文件标记缺失，并软删除已经没有活动文件的媒体条目。 */
   private async cleanupExcludedCatalogPaths(
     transaction: Knex.Transaction,
-    tenantId: string,
+    userId: string,
     libraryId: string,
     now: string,
   ): Promise<string[]> {
     const sourceRows = await transaction("source_files")
       .select("id", "path")
-      .where({ tenant_id: tenantId, library_id: libraryId, status: "active" });
+      .where({ user_id: userId, library_id: libraryId, status: "active" });
     const excludedSourceIds = sourceRows
       .filter((row) => isFlymbyExcludedPath(String(row.path)))
       .map((row) => String(row.id));
@@ -1953,13 +1937,13 @@ export class ServiceRepository {
   /** 删除已经没有活动子项且自身没有活动文件的旧节目、专辑或有声书父项。 */
   private async cleanupOrphanCatalogParents(
     transaction: Knex.Transaction,
-    tenantId: string,
+    userId: string,
     libraryId: string,
     now: string,
   ): Promise<string[]> {
     const parentRows = await transaction("media_items")
       .select("id")
-      .where({ tenant_id: tenantId, library_id: libraryId })
+      .where({ user_id: userId, library_id: libraryId })
       .whereIn("item_type", ["video.series", "music.album", "audiobook.book"])
       .whereNull("deleted_at");
     const parentIds = parentRows.map((row) => String(row.id));
@@ -1991,10 +1975,9 @@ export class ServiceRepository {
     return orphanIds;
   }
 
-  /** 查询当前租户媒体目录，管理端可省略租户并增加用户/服务筛选。 */
+  /** 查询当前用户媒体目录，管理端可省略用户并增加服务筛选。 */
   public async listCatalogItems(filters: {
-    tenantId?: string;
-    ownerUserId?: string;
+    userId?: string;
     serviceId?: string;
     libraryId?: string;
     mediaType?: MediaType;
@@ -2007,11 +1990,10 @@ export class ServiceRepository {
   }): Promise<{ items: MediaItemRecord[]; total: number }> {
     const base = this.database.query("media_items as m")
       .join("cloud_services as s", "s.id", "m.service_id")
-      .join("user_accounts as u", "u.id", "s.owner_user_id")
+      .join("user_accounts as u", "u.id", "s.user_id")
       .whereNull("m.deleted_at")
       .whereNull("s.deleted_at");
-    if (filters.tenantId) base.where("m.tenant_id", filters.tenantId);
-    if (filters.ownerUserId) base.where("s.owner_user_id", filters.ownerUserId);
+    if (filters.userId) base.where("m.user_id", filters.userId);
     if (filters.serviceId) base.where("m.service_id", filters.serviceId);
     if (filters.libraryId) base.where("m.library_id", filters.libraryId);
     if (filters.mediaType) base.where("m.media_type", filters.mediaType);
@@ -2053,16 +2035,16 @@ export class ServiceRepository {
     };
   }
 
-  /** 查询媒体条目详情并强制租户作用域。 */
-  public async getCatalogItem(itemId: string, tenantId?: string): Promise<MediaItemRecord> {
+  /** 查询媒体条目详情并强制用户作用域。 */
+  public async getCatalogItem(itemId: string, userId?: string): Promise<MediaItemRecord> {
     const query = this.database.query("media_items as m")
       .join("cloud_services as s", "s.id", "m.service_id")
-      .join("user_accounts as u", "u.id", "s.owner_user_id")
+      .join("user_accounts as u", "u.id", "s.user_id")
       .select("m.*", "u.username as owner_username", "s.display_name as service_name")
       .where("m.id", itemId)
       .whereNull("m.deleted_at")
       .whereNull("s.deleted_at");
-    if (tenantId) query.where("m.tenant_id", tenantId);
+    if (userId) query.where("m.user_id", userId);
     const row = await query.first();
     if (!row) throw new ApiError(404, "media_item_not_found", "媒体条目不存在");
     const fileCounts = await this.loadCatalogFileCounts([row]);
@@ -2072,31 +2054,31 @@ export class ServiceRepository {
   /** 批量统计条目自身及其子项关联的源文件数，避免相关子查询反复扫描完整关联表。 */
   private async loadCatalogFileCounts(rows: Record<string, unknown>[]): Promise<Map<string, number>> {
     const fileIdsByItem = new Map<string, Set<string>>();
-    // 关键变量：按租户分组后查询，确保能够使用 tenant_id 开头的现有复合索引。
-    const itemIdsByTenant = new Map<string, string[]>();
+    // 关键变量：按用户分组后查询，确保能够使用 user_id 开头的现有复合索引。
+    const itemIdsByUser = new Map<string, string[]>();
     rows.forEach((row) => {
-      const tenantId = String(row.tenant_id);
+      const userId = String(row.user_id);
       const itemId = String(row.id);
-      const itemIds = itemIdsByTenant.get(tenantId) ?? [];
+      const itemIds = itemIdsByUser.get(userId) ?? [];
       itemIds.push(itemId);
-      itemIdsByTenant.set(tenantId, itemIds);
+      itemIdsByUser.set(userId, itemIds);
       fileIdsByItem.set(itemId, new Set<string>());
     });
 
-    for (const [tenantId, itemIds] of itemIdsByTenant) {
+    for (const [userId, itemIds] of itemIdsByUser) {
       for (const itemIdChunk of chunkStrings(itemIds)) {
         const [directRows, childRows] = await Promise.all([
           this.database.query("file_links")
             .select("item_id", "source_file_id")
-            .where("tenant_id", tenantId)
+            .where("user_id", userId)
             .whereIn("item_id", itemIdChunk),
           this.database.query("media_relations as mr")
             .join("file_links as fl", function joinChildFileLinks() {
-              this.on("fl.tenant_id", "=", "mr.tenant_id")
+              this.on("fl.user_id", "=", "mr.user_id")
                 .andOn("fl.item_id", "=", "mr.child_item_id");
             })
             .select("mr.parent_item_id as item_id", "fl.source_file_id")
-            .where("mr.tenant_id", tenantId)
+            .where("mr.user_id", userId)
             .whereIn("mr.parent_item_id", itemIdChunk),
         ]);
         [...directRows, ...childRows].forEach((fileRow) => {
@@ -2112,7 +2094,7 @@ export class ServiceRepository {
   private mapMediaItem(row: Record<string, unknown>): MediaItemRecord {
     return {
       id: String(row.id),
-      tenantId: String(row.tenant_id),
+      userId: String(row.user_id),
       serviceId: String(row.service_id),
       libraryId: String(row.library_id),
       mediaType: row.media_type as MediaType,
@@ -2137,16 +2119,16 @@ export class ServiceRepository {
   }
 
   /** 查询媒体条目子项关系。 */
-  public async listCatalogChildren(itemId: string, tenantId?: string): Promise<MediaItemRecord[]> {
-    await this.getCatalogItem(itemId, tenantId);
+  public async listCatalogChildren(itemId: string, userId?: string): Promise<MediaItemRecord[]> {
+    await this.getCatalogItem(itemId, userId);
     const relationRows = await this.database.query("media_relations").select("child_item_id").where({ parent_item_id: itemId }).orderBy("sort_order", "asc");
-    return Promise.all(relationRows.map((row) => this.getCatalogItem(String(row.child_item_id), tenantId)));
+    return Promise.all(relationRows.map((row) => this.getCatalogItem(String(row.child_item_id), userId)));
   }
 
   /** 读取当前条目及其直接子项关联的源文件，返回值不包含播放定位和凭据。 */
-  public async listCatalogItemPaths(itemId: string, tenantId?: string): Promise<CatalogPathRow[]> {
-    const item = await this.getCatalogItem(itemId, tenantId);
-    const rows = await this.readLinkedSourceRows(this.database.query, itemId, item.tenantId);
+  public async listCatalogItemPaths(itemId: string, userId?: string): Promise<CatalogPathRow[]> {
+    const item = await this.getCatalogItem(itemId, userId);
+    const rows = await this.readLinkedSourceRows(this.database.query, itemId, item.userId);
     const uniqueRows = new Map<string, CatalogPathRow>();
     for (const row of rows) {
       if (uniqueRows.has(row.source_file_id)) continue;
@@ -2167,18 +2149,18 @@ export class ServiceRepository {
   /** 将用户选择的 TMDB 电影或节目元数据覆盖到当前顶层影视条目。 */
   public async applyManualVideoMatch(input: {
     itemId: string;
-    tenantId: string;
+    userId: string;
     metadata: TmdbVideoMetadata;
   }): Promise<MediaItemRecord> {
-    const item = await this.getCatalogItem(input.itemId, input.tenantId);
+    const item = await this.getCatalogItem(input.itemId, input.userId);
     this.requireManualMatchableVideo(item);
     await this.database.query.transaction(async (transaction) => {
       const row = await transaction("media_items")
-        .where({ id: input.itemId, tenant_id: input.tenantId })
+        .where({ id: input.itemId, user_id: input.userId })
         .whereNull("deleted_at")
         .first();
       if (!row) throw new ApiError(404, "media_item_not_found", "媒体条目不存在");
-      const sourceRows = await this.readLinkedSourceRows(transaction, input.itemId, input.tenantId);
+      const sourceRows = await this.readLinkedSourceRows(transaction, input.itemId, input.userId);
       // 关键变量：首次手动匹配前的本地识别快照，用于清除匹配时恢复未匹配状态。
       const original = await this.buildManualMatchSnapshot(transaction, row, sourceRows);
       const nextItemType = input.metadata.mediaType === "tv" ? "video.series" : "video.movie";
@@ -2210,7 +2192,7 @@ export class ServiceRepository {
           original,
         },
       };
-      await transaction("media_items").where({ id: input.itemId, tenant_id: input.tenantId }).update({
+      await transaction("media_items").where({ id: input.itemId, user_id: input.userId }).update({
         item_type: nextItemType,
         title: input.metadata.title,
         sort_title: input.metadata.title,
@@ -2225,22 +2207,22 @@ export class ServiceRepository {
         metadata_json: JSON.stringify(nextMetadata),
         updated_at: now,
       });
-      await this.recordCatalogItemUpserts(transaction, input.tenantId, String(row.library_id), [input.itemId, ...changedItemIds], now);
+      await this.recordCatalogItemUpserts(transaction, input.userId, String(row.library_id), [input.itemId, ...changedItemIds], now);
     });
-    return this.getCatalogItem(input.itemId, input.tenantId);
+    return this.getCatalogItem(input.itemId, input.userId);
   }
 
   /** 清除自动或手动刮削结果，并恢复文件名和目录推导出的本地影视信息。 */
-  public async clearVideoMatch(itemId: string, tenantId: string): Promise<MediaItemRecord> {
-    const item = await this.getCatalogItem(itemId, tenantId);
+  public async clearVideoMatch(itemId: string, userId: string): Promise<MediaItemRecord> {
+    const item = await this.getCatalogItem(itemId, userId);
     this.requireManualMatchableVideo(item);
     await this.database.query.transaction(async (transaction) => {
       const row = await transaction("media_items")
-        .where({ id: itemId, tenant_id: tenantId })
+        .where({ id: itemId, user_id: userId })
         .whereNull("deleted_at")
         .first();
       if (!row) throw new ApiError(404, "media_item_not_found", "媒体条目不存在");
-      const sourceRows = await this.readLinkedSourceRows(transaction, itemId, tenantId);
+      const sourceRows = await this.readLinkedSourceRows(transaction, itemId, userId);
       // 关键变量：清除后恢复的本地条目信息，不能继续携带海报、简介和 TMDB 编号。
       const original = await this.buildManualMatchSnapshot(transaction, row, sourceRows);
       const now = new Date().toISOString();
@@ -2253,7 +2235,7 @@ export class ServiceRepository {
         original.title,
         now,
       );
-      await transaction("media_items").where({ id: itemId, tenant_id: tenantId }).update({
+      await transaction("media_items").where({ id: itemId, user_id: userId }).update({
         item_type: original.itemType,
         title: original.title,
         sort_title: original.sortTitle,
@@ -2268,9 +2250,9 @@ export class ServiceRepository {
         metadata_json: JSON.stringify(original.metadata),
         updated_at: now,
       });
-      await this.recordCatalogItemUpserts(transaction, tenantId, String(row.library_id), [itemId, ...changedItemIds], now);
+      await this.recordCatalogItemUpserts(transaction, userId, String(row.library_id), [itemId, ...changedItemIds], now);
     });
-    return this.getCatalogItem(itemId, tenantId);
+    return this.getCatalogItem(itemId, userId);
   }
 
   /** 要求手动匹配对象是海报墙顶层电影或节目。 */
@@ -2284,11 +2266,11 @@ export class ServiceRepository {
   private async readLinkedSourceRows(
     transaction: Knex | Knex.Transaction,
     itemId: string,
-    tenantId: string,
+    userId: string,
   ): Promise<LinkedSourceRow[]> {
     const childRows = await transaction("media_relations")
       .select("child_item_id")
-      .where({ tenant_id: tenantId, parent_item_id: itemId });
+      .where({ user_id: userId, parent_item_id: itemId });
     const itemIds = [itemId, ...childRows.map((row) => String(row.child_item_id))];
     const rows = await transaction("file_links as fl")
       .join("source_files as f", "f.id", "fl.source_file_id")
@@ -2305,7 +2287,7 @@ export class ServiceRepository {
         "f.modified_at",
         "linked.title as linked_item_title",
       )
-      .where("fl.tenant_id", tenantId)
+      .where("fl.user_id", userId)
       .whereIn("fl.item_id", itemIds)
       .where("f.status", "active")
       .orderBy("f.path", "asc");
@@ -2374,7 +2356,7 @@ export class ServiceRepository {
   ): Promise<string[]> {
     const previousItemType = String(row.item_type);
     if (previousItemType === nextItemType) return [];
-    const tenantId = String(row.tenant_id);
+    const userId = String(row.user_id);
     const libraryId = String(row.library_id);
     const parentItemId = String(row.id);
     const uniqueSourceRows = [...new Map(sourceRows.map((sourceRow) => [sourceRow.source_file_id, sourceRow])).values()];
@@ -2384,14 +2366,14 @@ export class ServiceRepository {
       for (const sourceRow of uniqueSourceRows) {
         await transaction("file_links").insert({
           id: randomUUID(),
-          tenant_id: tenantId,
+          user_id: userId,
           library_id: libraryId,
           item_id: parentItemId,
           source_file_id: sourceRow.source_file_id,
           locator_json: sourceRow.locator_json,
-        }).onConflict(["tenant_id", "item_id", "source_file_id"]).merge({ locator_json: sourceRow.locator_json });
+        }).onConflict(["user_id", "item_id", "source_file_id"]).merge({ locator_json: sourceRow.locator_json });
       }
-      await transaction("media_relations").where({ tenant_id: tenantId, parent_item_id: parentItemId }).delete();
+      await transaction("media_relations").where({ user_id: userId, parent_item_id: parentItemId }).delete();
       return changedItemIds;
     }
 
@@ -2400,7 +2382,7 @@ export class ServiceRepository {
       const existingEpisode = await transaction("file_links as fl")
         .join("media_items as m", "m.id", "fl.item_id")
         .select("m.id", "m.metadata_json")
-        .where("fl.tenant_id", tenantId)
+        .where("fl.user_id", userId)
         .where("fl.source_file_id", sourceRow.source_file_id)
         .where("m.item_type", "video.episode")
         .whereNull("m.deleted_at")
@@ -2414,7 +2396,7 @@ export class ServiceRepository {
       let episodeItemId = existingEpisode ? String(existingEpisode.id) : "";
       if (!episodeItemId) {
         const identityKey = `manual:video:episode:${sourceRow.source_file_id}`;
-        episodeItemId = createStableId("itm", tenantId, libraryId, identityKey);
+        episodeItemId = createStableId("itm", userId, libraryId, identityKey);
         const episodeMetadata = {
           sourcePath: sourceRow.path,
           query: displayTitle,
@@ -2425,7 +2407,7 @@ export class ServiceRepository {
         };
         await transaction("media_items").insert({
           id: episodeItemId,
-          tenant_id: tenantId,
+          user_id: userId,
           service_id: row.service_id,
           library_id: libraryId,
           identity_key: identityKey,
@@ -2445,7 +2427,7 @@ export class ServiceRepository {
           created_at: now,
           updated_at: now,
           deleted_at: null,
-        }).onConflict(["tenant_id", "library_id", "identity_key"]).merge({
+        }).onConflict(["user_id", "library_id", "identity_key"]).merge({
           subtitle: displayTitle,
           year: metadata?.year ?? row.year,
           poster_url: metadata?.posterUrl ?? row.poster_url,
@@ -2457,7 +2439,7 @@ export class ServiceRepository {
         changedItemIds.push(episodeItemId);
       } else {
         const existingEpisodeMetadata = parseJsonObject(existingEpisode.metadata_json);
-        await transaction("media_items").where({ id: episodeItemId, tenant_id: tenantId }).update({
+        await transaction("media_items").where({ id: episodeItemId, user_id: userId }).update({
           subtitle: displayTitle,
           year: metadata?.year ?? row.year,
           poster_url: metadata?.posterUrl ?? row.poster_url,
@@ -2477,26 +2459,26 @@ export class ServiceRepository {
       }
       await transaction("file_links").insert({
         id: randomUUID(),
-        tenant_id: tenantId,
+        user_id: userId,
         library_id: libraryId,
         item_id: episodeItemId,
         source_file_id: sourceRow.source_file_id,
         locator_json: sourceRow.locator_json,
-      }).onConflict(["tenant_id", "item_id", "source_file_id"]).merge({ locator_json: sourceRow.locator_json });
+      }).onConflict(["user_id", "item_id", "source_file_id"]).merge({ locator_json: sourceRow.locator_json });
       await transaction("file_links").where({
-        tenant_id: tenantId,
+        user_id: userId,
         item_id: parentItemId,
         source_file_id: sourceRow.source_file_id,
       }).delete();
       await transaction("media_relations").insert({
         id: randomUUID(),
-        tenant_id: tenantId,
+        user_id: userId,
         library_id: libraryId,
         parent_item_id: parentItemId,
         child_item_id: episodeItemId,
         relation_type: "series_episode",
         sort_order: seasonNumber * 100_000 + episodeNumber,
-      }).onConflict(["tenant_id", "parent_item_id", "child_item_id", "relation_type"]).merge({
+      }).onConflict(["user_id", "parent_item_id", "child_item_id", "relation_type"]).merge({
         sort_order: seasonNumber * 100_000 + episodeNumber,
       });
     }
@@ -2506,24 +2488,24 @@ export class ServiceRepository {
   /** 为人工修改的媒体条目递增目录版本并追加变更记录。 */
   private async recordCatalogItemUpserts(
     transaction: Knex.Transaction,
-    tenantId: string,
+    userId: string,
     libraryId: string,
     itemIds: string[],
     now: string,
   ): Promise<void> {
     const uniqueItemIds = [...new Set(itemIds)];
     if (uniqueItemIds.length === 0) return;
-    const library = await transaction("media_libraries").where({ id: libraryId, tenant_id: tenantId }).first();
+    const library = await transaction("media_libraries").where({ id: libraryId, user_id: userId }).first();
     if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
     const previousVersion = Number(library.catalog_version);
-    await transaction("media_libraries").where({ id: libraryId, tenant_id: tenantId }).update({
+    await transaction("media_libraries").where({ id: libraryId, user_id: userId }).update({
       catalog_version: previousVersion + uniqueItemIds.length,
       updated_at: now,
     });
     for (let offset = 0; offset < uniqueItemIds.length; offset += CATALOG_CHANGE_INSERT_BATCH_SIZE) {
       const itemIdBatch = uniqueItemIds.slice(offset, offset + CATALOG_CHANGE_INSERT_BATCH_SIZE);
       await transaction("catalog_changes").insert(itemIdBatch.map((entityId, batchIndex) => ({
-        tenant_id: tenantId,
+        user_id: userId,
         library_id: libraryId,
         catalog_version: previousVersion + offset + batchIndex + 1,
         entity_type: "media_item",
@@ -2535,13 +2517,13 @@ export class ServiceRepository {
   }
 
   /** 查询 APP 播放端使用的 Provider 文件定位，不下发服务端凭据。 */
-  public async listItemFiles(itemId: string, tenantId: string): Promise<Array<Record<string, unknown>>> {
-    await this.getCatalogItem(itemId, tenantId);
+  public async listItemFiles(itemId: string, userId: string): Promise<Array<Record<string, unknown>>> {
+    await this.getCatalogItem(itemId, userId);
     const rows = await this.database.query("file_links as fl")
       .join("source_files as f", "f.id", "fl.source_file_id")
       .select("f.id", "f.provider_resource_id", "f.path", "f.name", "f.size", "f.modified_at", "fl.locator_json")
       .where("fl.item_id", itemId)
-      .where("fl.tenant_id", tenantId)
+      .where("fl.user_id", userId)
       .where("f.status", "active");
     return rows.map((row) => ({
       fileId: row.id,
@@ -2555,11 +2537,11 @@ export class ServiceRepository {
   }
 
   /** 查询指定版本后的目录变更。 */
-  public async listCatalogChanges(tenantId: string, libraryId: string, afterVersion: number, limit: number) {
-    const library = await this.database.query("media_libraries").where({ id: libraryId, tenant_id: tenantId }).first();
+  public async listCatalogChanges(userId: string, libraryId: string, afterVersion: number, limit: number) {
+    const library = await this.database.query("media_libraries").where({ id: libraryId, user_id: userId }).first();
     if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
     const rows = await this.database.query("catalog_changes")
-      .where({ tenant_id: tenantId, library_id: libraryId })
+      .where({ user_id: userId, library_id: libraryId })
       .where("catalog_version", ">", afterVersion)
       .orderBy("catalog_version", "asc")
       .limit(limit + 1);
@@ -2582,7 +2564,7 @@ export class ServiceRepository {
   }
 
   /** 查询用户或全局概览统计。 */
-  public async getOverview(tenantId?: string) {
+  public async getOverview(userId?: string) {
     const services = this.database.query("cloud_services").whereNull("deleted_at");
     const media = this.database.query("media_items as m")
       .join("cloud_services as s", "s.id", "m.service_id")
@@ -2591,10 +2573,10 @@ export class ServiceRepository {
       // 概览与海报墙使用相同口径：节目单集只计入父节目，不重复计入媒体总数。
       .whereNot("m.item_type", "video.episode");
     const jobs = this.database.query("scan_jobs");
-    if (tenantId) {
-      services.where("tenant_id", tenantId);
-      media.where("m.tenant_id", tenantId);
-      jobs.where("tenant_id", tenantId);
+    if (userId) {
+      services.where("user_id", userId);
+      media.where("m.user_id", userId);
+      jobs.where("user_id", userId);
     }
     const [serviceCount, mediaCount, runningCount, failedCount, reviewCount] = await Promise.all([
       services.clone().count<{ count: string | number }[]>({ count: "id" }).first(),
