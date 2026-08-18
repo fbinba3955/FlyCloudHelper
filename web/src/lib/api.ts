@@ -38,6 +38,38 @@ export class ApiClientError extends Error {
   }
 }
 
+/**
+ * 生成扫描请求的幂等标识。
+ * 普通 HTTP 页面不一定开放 crypto.randomUUID，因此回退到 Web Crypto 随机字节生成标准 UUID v4。
+ */
+function createRequestId(): string {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === "function") {
+    return cryptoApi.randomUUID();
+  }
+
+  if (typeof cryptoApi?.getRandomValues === "function") {
+    // UUID 使用的 16 字节随机数据。
+    const randomBytes = new Uint8Array(16);
+    cryptoApi.getRandomValues(randomBytes);
+    randomBytes[6] = (randomBytes[6]! & 0x0f) | 0x40;
+    randomBytes[8] = (randomBytes[8]! & 0x3f) | 0x80;
+
+    // 每个字节固定输出两个十六进制字符。
+    const hexadecimalBytes = Array.from(randomBytes, (byte) => byte.toString(16).padStart(2, "0"));
+    console.info("codex-flycloudhelper-request-id 生成方式=WebCrypto随机字节 原因=randomUUID不可用");
+    return `${hexadecimalBytes.slice(0, 4).join("")}-${hexadecimalBytes.slice(4, 6).join("")}`
+      + `-${hexadecimalBytes.slice(6, 8).join("")}-${hexadecimalBytes.slice(8, 10).join("")}`
+      + `-${hexadecimalBytes.slice(10, 16).join("")}`;
+  }
+
+  // 请求 ID 仅用于避免任务重复创建，不作为认证或加密凭据。
+  const timePart = Date.now().toString(36);
+  const randomPart = Math.random().toString(36).slice(2);
+  console.warn("codex-flycloudhelper-request-id 生成方式=兼容随机值 原因=WebCrypto不可用");
+  return `flycloud-helper-web-${timePart}-${randomPart}`;
+}
+
 /** 发起同源 API 请求并统一处理错误响应。 */
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
@@ -385,7 +417,7 @@ export async function createScanJob(serviceId: string, scanMode: "incremental" |
       method: "POST",
       body: JSON.stringify({
         scanMode,
-        requestId: crypto.randomUUID(),
+        requestId: createRequestId(),
         clientDeviceId: "flycloud-helper-web",
       }),
     },
@@ -400,7 +432,7 @@ export async function retryScanJob(jobId: string, admin = false): Promise<ScanJo
     {
       method: "POST",
       body: JSON.stringify({
-        requestId: crypto.randomUUID(),
+        requestId: createRequestId(),
         clientDeviceId: "flycloud-helper-web",
       }),
     },
