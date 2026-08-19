@@ -6,6 +6,7 @@ import {
   createRouter,
   useNavigate,
 } from "@tanstack/react-router";
+import { ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
 import { SessionBoundary } from "@/components/SessionBoundary";
 import { ApiClientError, getCurrentUser, getSetupStatus } from "@/lib/api";
@@ -118,6 +119,39 @@ function RootIndexRouteComponent() {
   );
 }
 
+/** 接收光鸭官方人机验证回调，把一次性结果发送给打开本窗口的服务配置页。 */
+function GuangyaCaptchaCallbackPage() {
+  const [message, setMessage] = useState("正在确认光鸭人机验证结果…");
+
+  useEffect(() => {
+    const parameters = new URLSearchParams(window.location.search);
+    const captchaToken = parameters.get("captcha_token") ?? "";
+    const state = parameters.get("state") ?? "";
+    if (!captchaToken || !state || !window.opener) {
+      setMessage("未收到有效的人机验证结果，请关闭窗口后重新获取验证码");
+      return;
+    }
+    window.opener.postMessage({
+      type: "flycloud-helper-guangya-captcha",
+      captchaToken,
+      state,
+    }, window.location.origin);
+    setMessage("人机验证已完成，正在关闭窗口…");
+    const closeTimer = window.setTimeout(() => window.close(), 300);
+    return () => window.clearTimeout(closeTimer);
+  }, []);
+
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4">
+      <div className="surface max-w-md p-8 text-center">
+        <ShieldCheck className="mx-auto size-10 text-success" />
+        <h1 className="mt-4 text-xl font-semibold">光鸭人机验证</h1>
+        <p className="mt-2 text-sm text-muted-foreground">{message}</p>
+      </div>
+    </div>
+  );
+}
+
 /** 处理普通用户服务详情路由参数。 */
 function UserServiceDetailRouteComponent() {
   const { serviceId } = userServiceDetailRoute.useParams();
@@ -188,6 +222,12 @@ const registerRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "register",
   component: RegisterPage,
+});
+
+const guangyaCaptchaCallbackRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "guangya-captcha-callback",
+  component: GuangyaCaptchaCallbackPage,
 });
 
 const appRoute = createRoute({
@@ -349,6 +389,7 @@ const routeTree = rootRoute.addChildren([
   setupRoute,
   loginRoute,
   registerRoute,
+  guangyaCaptchaCallbackRoute,
   appRouteTree,
   adminRouteTree,
 ]);

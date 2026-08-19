@@ -1,6 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import { Download, Pause, Play, Radio, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
@@ -15,6 +15,7 @@ import {
   type JobStatus,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
+import { formatJobDuration, getJobDurationLabel } from "@/lib/job-duration";
 
 // 关键变量：扫描任务页固定每 5 秒读取一次进度，避免轮询和 SSE 同时触发重复请求。
 const JOB_PROGRESS_REFRESH_INTERVAL_MS = 5_000;
@@ -56,6 +57,16 @@ interface JobPluginSnapshot {
   configurationRevision: string;
   sha256: string;
 }
+
+type JobOperation = "pause" | "resume" | "cancel" | "retry" | "delete";
+
+const jobOperationLabels: Record<JobOperation, string> = {
+  pause: "暂停",
+  resume: "继续",
+  cancel: "终止",
+  retry: "重试",
+  delete: "删除",
+};
 
 /** 将任务阶段转换成中文展示名称。 */
 function getJobStageLabel(stage: string): string {
@@ -140,8 +151,14 @@ function JobsView({ admin }: { admin: boolean }) {
   const resource = useApiResource(() => listJobs(admin), [admin]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [pendingJobOperations, setPendingJobOperations] = useState<Record<string, JobOperation>>({});
+  // 关键变量：引用中的任务操作会在事件处理入口同步写入，阻止 React 状态刷新前发生的连续点击。
+  const pendingJobOperationsRef = useRef<Map<string, JobOperation>>(new Map());
   const jobs = resource.data?.items ?? [];
   const activeJob = jobs.find((job) => job.id === selectedJobId) ?? jobs[0];
+  const pendingActiveJobOperation = activeJob ? pendingJobOperations[activeJob.id] : undefined;
+  const serverControlPending = Boolean(activeJob && (activeJob.controlAction ?? "none") !== "none");
+  const activeJobOperationBlocked = Boolean(pendingActiveJobOperation || serverControlPending);
   // 只有终态失败任务允许生成重试任务，避免把正常扫描误认为重试。
   const canRetryActiveJob = activeJob?.status === "failed" || activeJob?.status === "cancelled";
   const canPauseActiveJob = activeJob?.status === "queued" || activeJob?.status === "running" || activeJob?.status === "retry_waiting";
@@ -167,17 +184,44 @@ function JobsView({ admin }: { admin: boolean }) {
     console.warn("codex-job-progress-refresh", { "刷新错误": resource.error, "管理模式": admin });
   }, [admin, resource.error]);
 
+  /** 同步占用当前任务的操作槽，避免同一任务同时提交暂停、终止等互斥请求。 */
+  function beginJobOperation(jobId: string, operation: JobOperation): boolean {
+    const existingOperation = pendingJobOperationsRef.current.get(jobId);
+    if (existingOperation) {
+      console.warn("codex-flycloud-helper-job-operation", {
+        事件: "拦截重复任务操作",
+        任务ID: jobId,
+        正在处理: jobOperationLabels[existingOperation],
+        本次操作: jobOperationLabels[operation],
+      });
+      return false;
+    }
+    pendingJobOperationsRef.current.set(jobId, operation);
+    setPendingJobOperations(Object.fromEntries(pendingJobOperationsRef.current));
+    return true;
+  }
+
+  /** 释放指定任务操作槽；请求成功、失败都允许用户在状态刷新后重新操作。 */
+  function finishJobOperation(jobId: string): void {
+    pendingJobOperationsRef.current.delete(jobId);
+    setPendingJobOperations(Object.fromEntries(pendingJobOperationsRef.current));
+  }
+
   /** 通过任务重试接口保留原任务关联并创建新任务。 */
   async function retrySelectedJob(): Promise<void> {
     if (!activeJob || !canRetryActiveJob) return;
+    const targetJobId = activeJob.id;
+    if (!beginJobOperation(targetJobId, "retry")) return;
     setMessage("正在创建重试任务…");
     try {
-      const job = await retryScanJob(activeJob.id, admin);
+      const job = await retryScanJob(targetJobId, admin);
       setSelectedJobId(job.id);
       setMessage(`任务 ${job.id} 已进入队列`);
       await resource.refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "重试失败");
+    } finally {
+      finishJobOperation(targetJobId);
     }
   }
 
@@ -185,39 +229,51 @@ function JobsView({ admin }: { admin: boolean }) {
   async function cancelSelectedJob(): Promise<void> {
     if (!activeJob || !canCancelActiveJob) return;
     if (!window.confirm(`确定终止扫描任务 ${activeJob.id} 吗？已写入的媒体结果不会自动回滚。`)) return;
+    const targetJobId = activeJob.id;
+    if (!beginJobOperation(targetJobId, "cancel")) return;
     setMessage("正在提交终止请求…");
     try {
-      await cancelScanJob(activeJob.id, admin);
-      setMessage(`任务 ${activeJob.id} 的终止请求已提交`);
+      await cancelScanJob(targetJobId, admin);
+      setMessage(`任务 ${targetJobId} 的终止请求已提交`);
       await resource.refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "终止任务失败");
+    } finally {
+      finishJobOperation(targetJobId);
     }
   }
 
   /** 请求 Worker 在安全边界暂停当前任务。 */
   async function pauseSelectedJob(): Promise<void> {
     if (!activeJob || !canPauseActiveJob) return;
+    const targetJobId = activeJob.id;
+    if (!beginJobOperation(targetJobId, "pause")) return;
     setMessage("正在提交暂停请求…");
     try {
-      await pauseScanJob(activeJob.id, admin);
-      setMessage(`任务 ${activeJob.id} 将在安全检查点暂停`);
+      await pauseScanJob(targetJobId, admin);
+      setMessage(`任务 ${targetJobId} 将在安全检查点暂停`);
       await resource.refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "暂停任务失败");
+    } finally {
+      finishJobOperation(targetJobId);
     }
   }
 
   /** 继续已暂停任务，服务端会从持久化目录游标恢复。 */
   async function resumeSelectedJob(): Promise<void> {
     if (!activeJob || !canResumeActiveJob) return;
+    const targetJobId = activeJob.id;
+    if (!beginJobOperation(targetJobId, "resume")) return;
     setMessage("正在恢复扫描任务…");
     try {
-      await resumeScanJob(activeJob.id, admin);
-      setMessage(`任务 ${activeJob.id} 已恢复到队列`);
+      await resumeScanJob(targetJobId, admin);
+      setMessage(`任务 ${targetJobId} 已恢复到队列`);
       await resource.refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "继续任务失败");
+    } finally {
+      finishJobOperation(targetJobId);
     }
   }
 
@@ -225,14 +281,18 @@ function JobsView({ admin }: { admin: boolean }) {
   async function deleteSelectedJob(): Promise<void> {
     if (!activeJob || !canDeleteActiveJob) return;
     if (!window.confirm(`确定删除扫描任务 ${activeJob.id} 吗？该任务的进度和错误记录将无法恢复。`)) return;
+    const targetJobId = activeJob.id;
+    if (!beginJobOperation(targetJobId, "delete")) return;
     setMessage("正在删除任务…");
     try {
-      await deleteScanJob(activeJob.id, admin);
+      await deleteScanJob(targetJobId, admin);
       setSelectedJobId(null);
-      setMessage(`任务 ${activeJob.id} 已删除`);
+      setMessage(`任务 ${targetJobId} 已删除`);
       await resource.refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "删除任务失败");
+    } finally {
+      finishJobOperation(targetJobId);
     }
   }
 
@@ -257,14 +317,21 @@ function JobsView({ admin }: { admin: boolean }) {
     <>
       <PageHeader
         title={admin ? "全部扫描任务" : "扫描任务"}
-        actions={<><SecondaryButton onClick={() => void resource.refresh()}><Radio className="size-4" /> 每 5 秒刷新</SecondaryButton><SecondaryButton onClick={() => void pauseSelectedJob()} disabled={!canPauseActiveJob}><Pause className="size-4" /> 暂停</SecondaryButton><SecondaryButton onClick={() => void resumeSelectedJob()} disabled={!canResumeActiveJob}><Play className="size-4" /> 继续</SecondaryButton><SecondaryButton onClick={() => void cancelSelectedJob()} disabled={!canCancelActiveJob}><Square className="size-4" /> 终止任务</SecondaryButton><PrimaryButton onClick={() => void retrySelectedJob()} disabled={!canRetryActiveJob}><RotateCcw className="size-4" /> 重试失败任务</PrimaryButton><button type="button" onClick={() => void deleteSelectedJob()} disabled={!canDeleteActiveJob} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> 删除任务</button></>}
+        actions={<>
+          <SecondaryButton onClick={() => void resource.refresh()}><Radio className="size-4" /> 每 5 秒刷新</SecondaryButton>
+          <SecondaryButton onClick={() => void pauseSelectedJob()} disabled={!canPauseActiveJob || activeJobOperationBlocked}><Pause className="size-4" /> {pendingActiveJobOperation === "pause" || activeJob?.controlAction === "pause" ? "暂停处理中…" : "暂停"}</SecondaryButton>
+          <SecondaryButton onClick={() => void resumeSelectedJob()} disabled={!canResumeActiveJob || activeJobOperationBlocked}><Play className="size-4" /> {pendingActiveJobOperation === "resume" ? "正在继续…" : "继续"}</SecondaryButton>
+          <SecondaryButton onClick={() => void cancelSelectedJob()} disabled={!canCancelActiveJob || activeJobOperationBlocked}><Square className="size-4" /> {pendingActiveJobOperation === "cancel" || activeJob?.controlAction === "cancel" ? "终止处理中…" : "终止任务"}</SecondaryButton>
+          <PrimaryButton onClick={() => void retrySelectedJob()} disabled={!canRetryActiveJob || activeJobOperationBlocked}><RotateCcw className="size-4" /> {pendingActiveJobOperation === "retry" ? "正在重试…" : "重试失败任务"}</PrimaryButton>
+          <button type="button" onClick={() => void deleteSelectedJob()} disabled={!canDeleteActiveJob || activeJobOperationBlocked} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {pendingActiveJobOperation === "delete" ? "正在删除…" : "删除任务"}</button>
+        </>}
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
       {!activeJob ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "还没有扫描任务"}</div></Panel> : (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
           <Panel title={`任务详情 ${activeJob.id}`} description={`${activeJob.serviceName} · ${activeJob.scanMode === "full" ? "全量" : "增量"}扫描${admin ? ` · ${activeJob.ownerUsername}` : ""}`}>
             <div className="rounded-xl border border-primary/25 bg-primary/8 p-5">
-              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div><p className="text-xs text-muted-foreground">当前阶段</p><p className="font-display mt-1 text-2xl font-semibold">{getJobStageLabel(activeJob.stage)}</p></div><StatusPill tone={getJobTone(activeJob.status)}>{jobStatusLabels[activeJob.status]}</StatusPill></div>
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div><p className="text-xs text-muted-foreground">当前阶段</p><p className="font-display mt-1 text-2xl font-semibold">{getJobStageLabel(activeJob.stage)}</p><p className="mt-1 text-xs text-muted-foreground">{getJobDurationLabel(activeJob.status)}：{formatJobDuration(activeJob.elapsedMs)}</p></div><StatusPill tone={getJobTone(activeJob.status)}>{jobStatusLabels[activeJob.status]}</StatusPill></div>
               <div className="mt-4"><ProgressMeter value={activeJob.status === "completed" ? 1 : activeJob.processedCount} total={activeJob.status === "completed" ? 1 : activeJob.totalCount} /></div>
               <div className="mt-3 min-w-0 rounded-lg border border-border/70 bg-background/30 px-3 py-2">
                 <p className="text-[11px] text-muted-foreground">当前扫描路径</p>
@@ -299,7 +366,7 @@ function JobsView({ admin }: { admin: boolean }) {
           </Panel>
           <Panel title="任务列表" description={`共 ${resource.data?.total ?? 0} 个任务`}>
             <ul className="space-y-2">
-              {jobs.map((job) => <li key={job.id}><button type="button" onClick={() => setSelectedJobId(job.id)} className="w-full rounded-xl border border-border bg-secondary/40 p-3.5 text-left"><div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div className="min-w-0"><p className="truncate font-mono text-xs">{job.id}</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.serviceName} · {job.scanMode === "full" ? "全量" : "增量"} · {getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p></div><StatusPill tone={getJobTone(job.status)}>{jobStatusLabels[job.status]}</StatusPill></div><div className="mt-2.5"><ProgressMeter value={job.status === "completed" ? 1 : job.processedCount} total={job.status === "completed" ? 1 : job.totalCount} /></div></button></li>)}
+              {jobs.map((job) => <li key={job.id}><button type="button" onClick={() => setSelectedJobId(job.id)} className="w-full rounded-xl border border-border bg-secondary/40 p-3.5 text-left"><div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div className="min-w-0"><p className="truncate font-mono text-xs">{job.id}</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.serviceName} · {job.scanMode === "full" ? "全量" : "增量"} · {getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p><p className="mt-1 text-[11px] text-muted-foreground">{getJobDurationLabel(job.status)}：{formatJobDuration(job.elapsedMs)}</p></div><StatusPill tone={getJobTone(job.status)}>{jobStatusLabels[job.status]}</StatusPill></div><div className="mt-2.5"><ProgressMeter value={job.status === "completed" ? 1 : job.processedCount} total={job.status === "completed" ? 1 : job.totalCount} /></div></button></li>)}
             </ul>
           </Panel>
         </div>

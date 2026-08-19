@@ -33,6 +33,7 @@ interface ServiceRow {
   data_type: MediaType;
   status: ServiceStatus;
   connection_status: string;
+  relay_playback_enabled: number | string | boolean;
   credential_revision: number | string;
   scan_profile_revision: number | string;
   metadata_profile_revision: number | string;
@@ -74,7 +75,15 @@ interface JobRow {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  active_duration_ms: number | string;
+  active_started_at: string | null;
   updated_at: string;
+}
+
+interface ActiveDurationRow {
+  status: JobStatus;
+  active_duration_ms: number | string | null;
+  active_started_at: string | null;
 }
 
 /** Worker 持久化的业务统计集合；使用稳定任务键避免续扫后重复计数。 */
@@ -138,6 +147,7 @@ function mapService(row: ServiceRow): CloudServiceRecord {
     dataType: row.data_type,
     status: row.status,
     connectionStatus: row.connection_status,
+    relayPlaybackEnabled: Number(row.relay_playback_enabled) === 1 || row.relay_playback_enabled === true,
     credentialRevision: Number(row.credential_revision),
     scanProfileRevision: Number(row.scan_profile_revision),
     metadataProfileRevision: Number(row.metadata_profile_revision),
@@ -147,6 +157,22 @@ function mapService(row: ServiceRow): CloudServiceRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+/** 把数据库时长值限制为安全的非负整数。 */
+function readActiveDurationMs(value: number | string | null | undefined): number {
+  const parsed = Number(value ?? 0);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(parsed));
+}
+
+/** 计算任务截至指定时刻真正处于 running 状态的累计时长。 */
+function calculateActiveDurationMs(row: ActiveDurationRow, nowMs = Date.now()): number {
+  const accumulatedMs = readActiveDurationMs(row.active_duration_ms);
+  if (row.status !== "running" || !row.active_started_at) return accumulatedMs;
+  const activeStartedAtMs = Date.parse(row.active_started_at);
+  if (!Number.isFinite(activeStartedAtMs) || nowMs <= activeStartedAtMs) return accumulatedMs;
+  return Math.min(Number.MAX_SAFE_INTEGER, accumulatedMs + Math.floor(nowMs - activeStartedAtMs));
 }
 
 /** 把任务查询行转换为公开任务 DTO。 */
@@ -184,6 +210,7 @@ function mapJob(row: JobRow): ScanJobRecord {
     createdAt: row.created_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
+    elapsedMs: calculateActiveDurationMs(row),
     updatedAt: row.updated_at,
   };
 }
@@ -343,6 +370,8 @@ function toVideoProviderEntry(row: Record<string, unknown>) {
 /** 提供带用户作用域的云端服务、任务和目录数据访问。 */
 export class ServiceRepository {
   private readonly database: FlyCloudHelperDatabase;
+  // 关键变量：阻止同一 API 实例同时执行同一服务的多次清空，跨实例仍由数据库服务行锁兜底。
+  private readonly clearingCatalogServiceIds = new Set<string>();
 
   public constructor(database: FlyCloudHelperDatabase) {
     this.database = database;
@@ -368,6 +397,7 @@ export class ServiceRepository {
         "s.data_type",
         "s.status",
         "s.connection_status",
+        "s.relay_playback_enabled",
         "s.credential_revision",
         "s.scan_profile_revision",
         "s.metadata_profile_revision",
@@ -388,6 +418,7 @@ export class ServiceRepository {
         "s.data_type",
         "s.status",
         "s.connection_status",
+        "s.relay_playback_enabled",
         "s.credential_revision",
         "s.scan_profile_revision",
         "s.metadata_profile_revision",
@@ -423,6 +454,7 @@ export class ServiceRepository {
         data_type: input.dataType,
         status: "active",
         connection_status: "valid",
+        relay_playback_enabled: 0,
         credential_revision: 1,
         scan_profile_revision: 1,
         metadata_profile_revision: 1,
@@ -782,7 +814,12 @@ export class ServiceRepository {
     }
     try {
       return await this.database.query.transaction(async (transaction) => {
-        const service = await transaction("cloud_services").where({ id: input.serviceId, user_id: input.userId }).whereNull("deleted_at").first();
+        let serviceQuery = transaction("cloud_services")
+          .where({ id: input.serviceId, user_id: input.userId })
+          .whereNull("deleted_at");
+        // 关键变量：同一服务创建或重试任务时锁住服务行，避免不同请求 ID 绕过活动任务检查并生成两条任务。
+        if (this.database.databaseType !== "sqlite") serviceQuery = serviceQuery.forUpdate();
+        const service = await serviceQuery.first();
         if (!service) {
           throw new ApiError(404, "service_not_found", "云端服务不存在");
         }
@@ -835,6 +872,8 @@ export class ServiceRepository {
           created_at: now,
           started_at: null,
           finished_at: null,
+          active_duration_ms: 0,
+          active_started_at: null,
           updated_at: now,
         });
         await this.insertJobEvent(transaction, input.userId, input.jobId, "queued", {
@@ -1113,6 +1152,7 @@ export class ServiceRepository {
         error_code: null,
         error_message: null,
         started_at: row.started_at ?? now,
+        active_started_at: now,
         updated_at: now,
       });
       if (changed !== 1) {
@@ -1130,16 +1170,24 @@ export class ServiceRepository {
   /** 单实例进程启动时把异常中断的运行任务恢复到队列。 */
   public async recoverInterruptedJobs(): Promise<number> {
     const rows = await this.database.query("scan_jobs")
-      .select("id", "user_id", "service_id")
+      .select("id", "user_id", "service_id", "status", "active_duration_ms", "active_started_at", "updated_at")
       .where({ status: "running" });
     if (rows.length === 0) return 0;
     const now = new Date().toISOString();
     await this.database.query.transaction(async (transaction) => {
       for (const row of rows) {
+        // 进程终止到本次启动之间无法确认任务是否执行，因此只累计到最后一次数据库活动时间。
+        const lastKnownActiveAtMs = Date.parse(String(row.updated_at));
+        const activeDurationMs = calculateActiveDurationMs(
+          row as ActiveDurationRow,
+          Number.isFinite(lastKnownActiveAtMs) ? lastKnownActiveAtMs : Date.now(),
+        );
         await transaction("scan_jobs").where({ id: row.id, status: "running" }).update({
           status: "queued",
           stage: "queued",
           control_action: "none",
+          active_duration_ms: activeDurationMs,
+          active_started_at: null,
           updated_at: now,
         });
         await transaction("cloud_services").where({ id: row.service_id, status: "scanning" }).update({
@@ -1192,6 +1240,15 @@ export class ServiceRepository {
       waitingPatch.current_path = checkpoint.progress.currentScanPath;
     }
     await this.database.query.transaction(async (transaction) => {
+      const timingRow = await transaction("scan_jobs")
+        .select("status", "active_duration_ms", "active_started_at")
+        .where({ id: current.id, status: "running" })
+        .first() as ActiveDurationRow | undefined;
+      if (!timingRow) {
+        throw new ApiError(409, "scan_job_not_running", "只有运行中的扫描任务可以进入延迟恢复");
+      }
+      waitingPatch.active_duration_ms = calculateActiveDurationMs(timingRow, Date.parse(now));
+      waitingPatch.active_started_at = null;
       await transaction("scan_jobs").where({ id: current.id, status: "running" }).update(waitingPatch);
       await transaction("cloud_services").where({ id: current.serviceId, status: "scanning" }).update({
         status: "active",
@@ -1235,6 +1292,7 @@ export class ServiceRepository {
             error_code: null,
             error_message: null,
             control_action: "none",
+            active_started_at: null,
             updated_at: now,
           });
         if (changed !== 1) continue;
@@ -1284,6 +1342,7 @@ export class ServiceRepository {
       unmatchedCount: job.unmatchedCount,
       errorCount: job.errorCount,
       currentPath: job.currentPath,
+      elapsedMs: job.elapsedMs,
     });
     return job;
   }
@@ -1293,12 +1352,25 @@ export class ServiceRepository {
     status: "completed" | "failed" | "paused" | "cancelled";
     errorCode?: string | null;
     errorMessage?: string | null;
+    expectedStatus?: JobStatus;
   }): Promise<ScanJobRecord> {
     const current = await this.getJob(jobId);
     const now = new Date().toISOString();
     const finishedAt = input.status === "paused" ? null : now;
     await this.database.query.transaction(async (transaction) => {
-      await transaction("scan_jobs").where({ id: jobId }).update({
+      const timingRow = await transaction("scan_jobs")
+        .select("status", "active_duration_ms", "active_started_at")
+        .where({ id: jobId })
+        .first() as ActiveDurationRow | undefined;
+      if (!timingRow) {
+        throw new ApiError(404, "scan_job_not_found", "扫描任务不存在");
+      }
+      const activeDurationMs = calculateActiveDurationMs(timingRow, Date.parse(now));
+      const finishQuery = transaction("scan_jobs").where({ id: jobId });
+      if (input.expectedStatus) {
+        finishQuery.where({ status: input.expectedStatus, control_action: "none" });
+      }
+      const changed = await finishQuery.update({
         status: input.status,
         stage: input.status === "completed" ? "completed" : current.stage,
         error_code: input.errorCode ?? null,
@@ -1306,8 +1378,13 @@ export class ServiceRepository {
         next_retry_at: null,
         control_action: "none",
         finished_at: finishedAt,
+        active_duration_ms: activeDurationMs,
+        active_started_at: null,
         updated_at: now,
       });
+      if (changed !== 1) {
+        throw new ApiError(409, "job_operation_in_progress", "任务正在处理其他操作，请等待状态刷新后再试");
+      }
       const servicePatch: Record<string, unknown> = {
         status: input.errorCode === "provider_authentication_failed" ? "reauthorization_required" : "active",
         connection_status: input.errorCode === "provider_authentication_failed" ? "reauthorization_required" : "valid",
@@ -1334,19 +1411,29 @@ export class ServiceRepository {
     if (!(["queued", "running", "retry_waiting", "paused"] as JobStatus[]).includes(job.status)) {
       throw new ApiError(409, "job_not_controllable", "当前任务状态不能执行该操作");
     }
+    if (job.controlAction !== "none") {
+      throw new ApiError(409, "job_operation_in_progress", "任务正在处理暂停或终止操作，请等待状态刷新后再试");
+    }
     if ((job.status === "queued" || job.status === "retry_waiting" || job.status === "paused") && action === "cancel") {
-      return this.finishJob(job.id, { status: "cancelled" });
+      return this.finishJob(job.id, { status: "cancelled", expectedStatus: job.status });
     }
     if ((job.status === "queued" || job.status === "retry_waiting") && action === "pause") {
-      return this.finishJob(job.id, { status: "paused" });
+      return this.finishJob(job.id, { status: "paused", expectedStatus: job.status });
     }
     if (job.status === "paused") {
       throw new ApiError(409, "job_already_paused", "任务已经暂停");
     }
-    await this.database.query("scan_jobs").where({ id: job.id }).update({
+    const changed = await this.database.query("scan_jobs").where({
+      id: job.id,
+      status: job.status,
+      control_action: "none",
+    }).update({
       control_action: action,
       updated_at: new Date().toISOString(),
     });
+    if (changed !== 1) {
+      throw new ApiError(409, "job_operation_in_progress", "任务正在处理其他操作，请等待状态刷新后再试");
+    }
     return this.getJob(job.id);
   }
 
@@ -1378,25 +1465,34 @@ export class ServiceRepository {
       next_retry_at: null,
       error_code: null,
       error_message: null,
+      active_started_at: null,
       updated_at: new Date().toISOString(),
     };
     if (progress) {
-      // 关键变量：页面先回到安全检查点口径，避免显示尚未提交游标的窗口进度。
+      // 关键变量：Worker 从安全检查点重放，但页面扫描视频数保留暂停前高水位，避免继续后数字倒退。
       patch.processed_count = progress.processedKeys.length + progress.failedKeys.length;
       patch.total_count = progress.taskKeys.length;
-      patch.discovered_count = progress.scannedMediaCount;
+      patch.discovered_count = Math.max(job.discoveredCount, progress.scannedMediaCount);
       patch.skipped_count = progress.skippedCount;
       patch.matched_count = progress.matchedKeys.length;
       patch.unmatched_count = progress.unmatchedKeys.length;
       patch.error_count = progress.failedKeys.length;
       patch.current_path = progress.currentScanPath;
     }
-    await this.database.query("scan_jobs").where({ id: job.id }).update(patch);
+    const changed = await this.database.query("scan_jobs").where({
+      id: job.id,
+      status: "paused",
+      control_action: "none",
+    }).update(patch);
+    if (changed !== 1) {
+      throw new ApiError(409, "job_operation_in_progress", "任务正在处理其他操作，请等待状态刷新后再试");
+    }
     await this.addJobEvent(job.userId, job.id, "queued", {
       status: "queued",
       resumed: true,
       checkpointRestored: Boolean(checkpoint),
       checkpointUpdatedAt: checkpoint?.updatedAt ?? null,
+      resumedDiscoveredCount: progress ? Math.max(job.discoveredCount, progress.scannedMediaCount) : job.discoveredCount,
     });
     return this.getJob(job.id);
   }
@@ -1461,6 +1557,22 @@ export class ServiceRepository {
     return this.getServiceDetail(serviceId, userId);
   }
 
+  /** 更新单个服务是否允许媒体流经过 FlyCloudHelper 中转。 */
+  public async updateRelayPlaybackEnabled(
+    serviceId: string,
+    userId: string | undefined,
+    enabled: boolean,
+  ): Promise<ServiceDetailRecord> {
+    const query = this.database.query("cloud_services").where({ id: serviceId }).whereNull("deleted_at");
+    if (userId) query.where({ user_id: userId });
+    const changed = await query.update({
+      relay_playback_enabled: enabled ? 1 : 0,
+      updated_at: new Date().toISOString(),
+    });
+    if (changed !== 1) throw new ApiError(404, "service_not_found", "云端服务不存在");
+    return this.getServiceDetail(serviceId, userId);
+  }
+
   /** 软删除服务，并同步从活动媒体统计和扫描来源中移除关联数据。 */
   public async deleteService(serviceId: string, userId?: string): Promise<void> {
     await this.database.query.transaction(async (transaction) => {
@@ -1483,46 +1595,56 @@ export class ServiceRepository {
     mediaItemCount: number;
     sourceFileCount: number;
   }> {
-    return this.database.query.transaction(async (transaction) => {
-      const serviceQuery = transaction("cloud_services").where({ id: serviceId }).whereNull("deleted_at");
-      if (userId) serviceQuery.where({ user_id: userId });
-      const service = await serviceQuery.first();
-      if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
-      const activeJob = await transaction("scan_jobs")
-        .where({ service_id: serviceId })
-        .whereIn("status", ["queued", "running", "retry_waiting", "paused"])
-        .first();
-      if (activeJob) throw new ApiError(409, "service_has_active_job", "请先终止该服务的扫描任务，再清空媒体库");
+    if (this.clearingCatalogServiceIds.has(serviceId)) {
+      throw new ApiError(409, "service_catalog_clear_in_progress", "当前服务正在清空媒体库，请勿重复操作");
+    }
+    this.clearingCatalogServiceIds.add(serviceId);
+    try {
+      return await this.database.query.transaction(async (transaction) => {
+        let serviceQuery = transaction("cloud_services").where({ id: serviceId }).whereNull("deleted_at");
+        if (userId) serviceQuery.where({ user_id: userId });
+        // 关键变量：PostgreSQL/MySQL 对同一服务的重复清空请求必须先争用服务行锁，避免并发删除互相等待关联表事务锁。
+        if (this.database.databaseType !== "sqlite") serviceQuery = serviceQuery.forUpdate();
+        const service = await serviceQuery.first();
+        if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
+        const activeJob = await transaction("scan_jobs")
+          .where({ service_id: serviceId })
+          .whereIn("status", ["queued", "running", "retry_waiting", "paused"])
+          .first();
+        if (activeJob) throw new ApiError(409, "service_has_active_job", "请先终止该服务的扫描任务，再清空媒体库");
 
-      const libraryId = String(service.library_id);
-      const mediaItemCountRow = await transaction("media_items")
-        .where({ library_id: libraryId })
-        .count<{ count: string | number }[]>({ count: "id" })
-        .first();
-      const sourceFileCountRow = await transaction("source_files")
-        .where({ library_id: libraryId })
-        .count<{ count: string | number }[]>({ count: "id" })
-        .first();
-      // 关键变量：显式按媒体库删除关联表，确保不同服务的数据不会被一起清空。
-      await transaction("file_links").where({ library_id: libraryId }).delete();
-      await transaction("media_relations").where({ library_id: libraryId }).delete();
-      await transaction("media_items").where({ library_id: libraryId }).delete();
-      await transaction("source_files").where({ library_id: libraryId }).delete();
-      await transaction("catalog_changes").where({ library_id: libraryId }).delete();
-      await transaction("media_libraries").where({ id: libraryId }).update({
-        catalog_version: 0,
-        status: "active",
-        updated_at: new Date().toISOString(),
+        const libraryId = String(service.library_id);
+        const mediaItemCountRow = await transaction("media_items")
+          .where({ library_id: libraryId })
+          .count<{ count: string | number }[]>({ count: "id" })
+          .first();
+        const sourceFileCountRow = await transaction("source_files")
+          .where({ library_id: libraryId })
+          .count<{ count: string | number }[]>({ count: "id" })
+          .first();
+        // 关键变量：显式按媒体库删除关联表，确保不同服务的数据不会被一起清空。
+        await transaction("file_links").where({ library_id: libraryId }).delete();
+        await transaction("media_relations").where({ library_id: libraryId }).delete();
+        await transaction("media_items").where({ library_id: libraryId }).delete();
+        await transaction("source_files").where({ library_id: libraryId }).delete();
+        await transaction("catalog_changes").where({ library_id: libraryId }).delete();
+        await transaction("media_libraries").where({ id: libraryId }).update({
+          catalog_version: 0,
+          status: "active",
+          updated_at: new Date().toISOString(),
+        });
+        await transaction("cloud_services").where({ id: serviceId }).update({
+          last_scan_at: null,
+          updated_at: new Date().toISOString(),
+        });
+        return {
+          mediaItemCount: Number(mediaItemCountRow?.count ?? 0),
+          sourceFileCount: Number(sourceFileCountRow?.count ?? 0),
+        };
       });
-      await transaction("cloud_services").where({ id: serviceId }).update({
-        last_scan_at: null,
-        updated_at: new Date().toISOString(),
-      });
-      return {
-        mediaItemCount: Number(mediaItemCountRow?.count ?? 0),
-        sourceFileCount: Number(sourceFileCountRow?.count ?? 0),
-      };
-    });
+    } finally {
+      this.clearingCatalogServiceIds.delete(serviceId);
+    }
   }
 
   /** 若源文件属性和播放定位均未变化，只推进本轮扫描标记并返回现有记录。 */

@@ -21,7 +21,8 @@ FlyCloudHelper 是面向 Flymby 客户端的自部署云端媒体扫描、刮削
 - 用户注册、登录和多用户数据隔离。
 - 一个用户可创建多个独立网盘服务和媒体库。
 - 服务、任务和媒体目录全部直接使用用户 ID 归属。
-- 支持 WebDAV、光鸭、阿里云盘、百度网盘 Provider 接口；光鸭使用官网同源的二维码登录。
+- 支持 WebDAV、光鸭、阿里云盘、百度网盘 Provider 接口；光鸭支持官方 API、网页二维码和网页验证码三种登录连接。
+- WebDAV 与光鸭支持服务级中转播放开关；开关默认关闭，不提供转码或 Web 前端播放。
 - 配置全量扫描目录、增量扫描目录、本地 NFO、元数据规则和服务级任务并发。
 - 扫描任务进度、当前路径、WebDAV 检查点暂停/继续、终止、删除和失败重试。
 - TMDB 多 Key 自动切换；全部 Key 因限流或临时故障不可用时，任务保留检查点并到期自动恢复。
@@ -205,9 +206,42 @@ PostgreSQL 与 MySQL 使用拆分字段时，服务会自动处理密码中的�
 
 网盘服务默认使用 Flymby APP 的任务参数：扫描任务数为 8、刮削任务数为 4。扫描任务数可在 1–16 之间调整，刮削任务数可在 1–4 之间调整；全量扫描的实际目录并发固定不超过 1，增量扫描使用服务设置。实际刮削并发还会受当前可用 TMDB Key 容量限制。
 
-## 光鸭扫码、扫描与文件访问
+## 光鸭登录、扫描与文件访问
 
-创建或替换光鸭服务连接时，Web 控制台会显示光鸭官方扫码登录二维码。用户使用光鸭 APP 扫码并确认后，FlyCloudHelper 只在服务端保存加密 Token；二维码对应的设备码、Access Token 和 Refresh Token 不会返回前端或写入诊断日志。
+光鸭连接固定分为三类：
+
+- `光鸭官方 API 登录`：只能先在 Flymby APP 中完成登录，再通过已认证的 Fly云助手接口同步连接。Fly云助手前台不提供该登录入口。
+- `光鸭网页二维码登录`：只能在 Fly云助手前台发起，使用光鸭 APP 扫码确认。
+- `光鸭网页验证码登录`：只能在 Fly云助手前台发起，使用中国大陆手机号和短信验证码登录；未注册手机号按光鸭官网规则创建账号。
+
+网页二维码和网页验证码都通过一次性授权会话创建服务，Token、设备码、手机号原文和短信验证码不会由状态接口回显或写入诊断日志。连接成功后，Access Token、Refresh Token 等字段使用凭据主密钥加密保存。
+
+Flymby APP 同步官方 API 连接时，可复用服务创建和连接更新接口。更新已有光鸭服务的示例：
+
+```http
+PUT /api/v1/services/{serviceId}/connection
+Authorization: Bearer {Fly云助手登录令牌}
+Content-Type: application/json
+```
+
+```json
+{
+  "connection": {
+    "authMode": "official_api",
+    "clientId": "由 APP 当前光鸭配置提供",
+    "projectId": "由 APP 当前光鸭配置提供",
+    "signSecret": "由 APP 当前光鸭配置提供",
+    "deviceId": "由 APP 当前授权提供",
+    "accessToken": "由 APP 当前授权提供",
+    "refreshToken": "由 APP 当前授权提供",
+    "tokenType": "Bearer",
+    "expiresAt": 0,
+    "userId": "可选的光鸭账号 ID"
+  }
+}
+```
+
+服务端只接受固定字段，并在验证根目录访问成功后替换连接。生产环境建议通过 HTTPS 传输；启用项目的非安全 HTTP 配置时，局域网或调试环境也可以使用 HTTP。创建新服务时使用 `POST /api/v1/services`，把同一 `connection` 放到 `provider.connection`，并设置 `provider.type` 为 `guangya`；创建成功不会自动触发扫描。
 
 授权完成后可在服务详情中逐级选择光鸭目录，再创建全量或增量扫描任务。光鸭文件枚举结果进入与 WebDAV 相同的影视处理管线，继续执行视频过滤、电影/节目识别、TMDB 刮削、媒体目录落库和增量变更记录。
 
@@ -215,8 +249,21 @@ APP 可使用以下接口访问结果：
 
 - `GET /api/v1/libraries/:libraryId/items/:itemId/files`：读取影片绑定的源文件及稳定定位。
 - `POST /api/v1/libraries/:libraryId/items/:itemId/files/:fileId/access`：用 APP Bearer Token 换取短期文件下载地址；响应不会包含光鸭账号 Token。
+- `GET/HEAD /api/v1/libraries/:libraryId/items/:itemId/files/:fileId/stream`：当对应服务已开启中转播放时，通过 FlyCloudHelper 流式读取源文件，支持 HTTP Range。
 
-文件访问接口返回 `accessType=temporary_url`、`url`、`headers` 和 `expiresAt`。APP 应在地址过期前直接访问网盘/CDN，不由 FlyCloudHelper 代理文件内容，因此不会占用扫描服务的播放或下载带宽。光鸭网页接口发生变更时，Provider 适配器也需要同步升级。
+文件访问接口返回 `accessType=temporary_url`、`url`、`headers` 和 `expiresAt`，APP 可在地址过期前直接访问网盘/CDN。若用户在服务详情的“播放设置”中开启“中转播放”，APP 也可以携带 FlyCloudHelper Bearer Token 请求中转接口；服务端只按字节流转发源文件，不转码、不缓存媒体正文，也不会向 APP 返回 WebDAV 密码、Token 或上游认证头。关闭开关时中转接口返回 `409 relay_playback_disabled`。
+
+中转播放开关通过以下接口立即保存，且只影响指定服务：
+
+```http
+PATCH /api/v1/services/{serviceId}/playback-settings
+Authorization: Bearer {Fly云助手登录令牌}
+Content-Type: application/json
+
+{"relayPlaybackEnabled": true}
+```
+
+超级管理员管理其他用户服务时使用 `/api/v1/admin/services/{serviceId}/playback-settings`。中转播放会同时占用 FlyCloudHelper 的下载和上传带宽；关闭开关不会影响扫描、刮削和 APP 获取直连临时地址。光鸭网页接口或开放平台接口发生变更时，Provider 适配器也需要同步升级。
 
 ## 数据与密钥
 
@@ -224,7 +271,7 @@ APP 可使用以下接口访问结果：
 
 切换 SQLite、PostgreSQL 或 MySQL 不会自动迁移数据，需要自行执行导出、导入或数据库迁移。
 
-当前项目尚未发布，schema 14 已改为用户直接归属的数据结构。使用旧开发数据库时需要删除并重新初始化，首次启动后重新设置超级管理员。
+当前项目尚未发布，schema 17 已加入用户直接归属的数据结构及服务级中转播放开关。使用不兼容的旧开发数据库时可以删除并重新初始化，首次启动后重新设置超级管理员。
 
 ## 项目结构
 

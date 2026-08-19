@@ -10,6 +10,7 @@ import {
   type ProviderEnumerationOptions,
   type ProviderEnumerationCheckpoint,
   type ProviderEnumerationWarning,
+  type ProviderFileStreamAccess,
   type ProviderValidationResult,
   type ScanRoot,
   createFlymbyRecommendedScanSettings,
@@ -99,7 +100,7 @@ export class WebDavProvider implements ProviderAdapter {
     displayName: "WebDAV",
     adapterVersion: "1.0.0",
     credentialSchemaVersion: 1,
-    capabilities: ["list", "readText", "rangeRead", "pathIdentity", "playbackLocator"],
+    capabilities: ["list", "readText", "rangeRead", "pathIdentity", "playbackLocator", "relayPlayback"],
     recommendedScanSettings: createFlymbyRecommendedScanSettings(),
     connectionFields: [
       { name: "baseUrl", label: "WebDAV 地址", type: "url", required: true, secret: false },
@@ -317,6 +318,34 @@ export class WebDavProvider implements ProviderAdapter {
       }
       await options?.onRootComplete?.({ rootIndex, root, warningCount: rootWarningCount });
     }
+  }
+
+  /**
+   * 生成仅供 FlyCloudHelper 中转使用的 WebDAV 上游请求。
+   * Authorization 只保留在服务端内存中，不能复用 APP 临时地址响应。
+   */
+  public async resolveFileStreamAccess(
+    connection: Record<string, unknown>,
+    locator: Record<string, unknown>,
+  ): Promise<ProviderFileStreamAccess> {
+    const baseUrl = await validateProviderUrl(
+      requireConnectionString(connection, "baseUrl", "WebDAV 地址"),
+      this.networkOptions,
+    );
+    // 关键变量：扫描时保存的原始 WebDAV 路径用于准确恢复带空格、井号和中文的文件地址。
+    const resourcePath = typeof locator.path === "string" && locator.path.trim()
+      ? locator.path
+      : typeof locator.resourceId === "string" && locator.resourceId.trim()
+        ? locator.resourceId
+        : "";
+    if (!resourcePath) {
+      throw new ApiError(422, "provider_file_locator_invalid", "WebDAV 文件定位无效");
+    }
+    return {
+      url: this.resolveEnumeratedPath(baseUrl, resourcePath).href,
+      headers: this.createAuthorizationHeaders(connection),
+      expiresAt: null,
+    };
   }
 
   /** 读取扫描发现的 NFO 等小型文本文件，内容上限避免异常文件占用过多内存。 */

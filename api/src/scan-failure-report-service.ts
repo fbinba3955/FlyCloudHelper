@@ -51,6 +51,8 @@ export class ScanFailureReportService {
   private readonly logger: FailureReportLogger;
   /** 关键变量：同一任务的并发刮削失败必须串行写入，避免 JSON 行互相穿插。 */
   private readonly appendChains = new Map<string, Promise<void>>();
+  /** 关键变量：缓存任务已经写入的记录 ID，避免检查点重放产生重复失败行。 */
+  private readonly recordIdsByJob = new Map<string, Set<string>>();
 
   public constructor(config: ApiConfig, logger: FailureReportLogger) {
     this.config = config;
@@ -95,8 +97,14 @@ export class ScanFailureReportService {
     }
   }
 
+  /** 任务结束或转入等待后释放去重缓存，下次续跑会从报告文件重新恢复。 */
+  public release(jobId: string): void {
+    this.recordIdsByJob.delete(jobId);
+  }
+
   /** 删除任务时同步清理对应报告，避免任务不存在后遗留不可访问文件。 */
   public async remove(job: ScanJobRecord): Promise<void> {
+    this.recordIdsByJob.delete(job.id);
     try {
       await fs.rm(this.getReportPath(job.userId, job.id), { force: true });
     } catch (error) {
@@ -146,6 +154,18 @@ export class ScanFailureReportService {
       resourceId: input.resourceId ?? "",
       businessTaskKey: input.businessTaskKey ?? "",
     })).digest("hex");
+    const recordedIds = await this.loadRecordIds(job.id, reportPath);
+    if (recordedIds.has(recordId)) {
+      this.logger.info({
+        日志关键字: "codex-video-recognition-optimize",
+        事件: "扫描失败重复记录已跳过",
+        任务ID: job.id,
+        服务ID: job.serviceId,
+        记录ID: recordId,
+        错误码: input.errorCode,
+      });
+      return;
+    }
     const record = {
       记录类型: "失败记录",
       记录ID: recordId,
@@ -162,7 +182,13 @@ export class ScanFailureReportService {
       影片任务标识: input.businessTaskKey ?? null,
       诊断上下文: input.context ?? {},
     };
-    await fs.appendFile(reportPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+    recordedIds.add(recordId);
+    try {
+      await fs.appendFile(reportPath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+    } catch (error) {
+      recordedIds.delete(recordId);
+      throw error;
+    }
     this.logger.info({
       日志关键字: "codex-scan-failure-report",
       事件: "扫描失败记录已写入报告",
@@ -172,6 +198,32 @@ export class ScanFailureReportService {
       错误码: input.errorCode,
       是否已降级继续: input.recovered,
     });
+  }
+
+  /** 首次写入任务时读取已有报告，恢复进程重启前已经落盘的记录 ID。 */
+  private async loadRecordIds(jobId: string, reportPath: string): Promise<Set<string>> {
+    const cachedIds = this.recordIdsByJob.get(jobId);
+    if (cachedIds) return cachedIds;
+    const recordedIds = new Set<string>();
+    try {
+      const content = await fs.readFile(reportPath, "utf8");
+      for (const line of content.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const item = JSON.parse(line) as { 记录ID?: unknown };
+          if (typeof item.记录ID === "string" && item.记录ID) recordedIds.add(item.记录ID);
+        } catch {
+          // 单行损坏不阻止后续报告继续追加，下载后仍可根据其余有效行分析。
+        }
+      }
+    } catch (error) {
+      const errorCode = error && typeof error === "object" && "code" in error
+        ? String((error as { code?: string }).code)
+        : "";
+      if (errorCode !== "ENOENT") throw error;
+    }
+    this.recordIdsByJob.set(jobId, recordedIds);
+    return recordedIds;
   }
 
   /** 生成任务专属报告绝对路径。 */

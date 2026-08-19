@@ -1,6 +1,7 @@
 import { ApiError } from "../errors.js";
 import { isFlymbyExcludedFolderName } from "../media/flymby-scan-exclusions.js";
 import { GuangyaWebApiClient } from "./guangya-web-api.js";
+import { GuangyaOpenApiClient } from "./guangya-open-api.js";
 import {
   type ProviderAdapter,
   type ProviderConnectionContext,
@@ -35,6 +36,29 @@ interface GuangyaListResult {
 
 interface GuangyaCheckpoint extends ProviderEnumerationCheckpoint {
   providerType: "guangya";
+}
+
+/** 光鸭两套文件 API 对 Provider 暴露的统一最小能力。 */
+interface GuangyaFileApiClient {
+  validateConnection(
+    connection: Record<string, unknown>,
+    persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<string | null>;
+  listChildren(
+    connection: Record<string, unknown>,
+    parentId: string,
+    page: number,
+    pageSize: number,
+    persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<JsonRecord>;
+  getFileDownloadAccess(
+    connection: Record<string, unknown>,
+    fileId: string,
+    persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<{ url: string; expiresAt: string | null }>;
 }
 
 /** 将未知 JSON 值安全读取为对象。 */
@@ -148,28 +172,41 @@ function readGuangyaCheckpoint(value: Record<string, unknown> | null | undefined
   };
 }
 
-/** 光鸭 Provider 使用官网同源的扫码登录和文件 API 接入后台扫描、刮削。 */
+/** 光鸭 Provider 按登录类型分流官方开放平台与网页文件 API。 */
 export class GuangyaProvider implements ProviderAdapter {
   public readonly descriptor: ProviderDescriptor = {
     type: "guangya",
     displayName: "光鸭云盘",
-    adapterVersion: "3.0.0-web-qr",
-    credentialSchemaVersion: 3,
-    capabilities: ["list", "stableResourceId", "playbackLocator", "webQrLogin", "directDownload"],
+    adapterVersion: "4.0.0-three-auth-modes",
+    credentialSchemaVersion: 4,
+    capabilities: [
+      "list",
+      "stableResourceId",
+      "playbackLocator",
+      "officialApiSync",
+      "webQrLogin",
+      "webSmsLogin",
+      "directDownload",
+      "relayPlayback",
+    ],
     recommendedScanSettings: createFlymbyRecommendedScanSettings(),
     authenticationMode: "web_qr",
     connectionFields: [],
   };
 
-  public constructor(private readonly client: GuangyaWebApiClient) {}
+  public constructor(
+    private readonly webClient: GuangyaWebApiClient,
+    private readonly openApiClient: GuangyaOpenApiClient,
+  ) {}
 
-  /** 使用根目录列表验证网页扫码连接。 */
+  /** 使用对应登录类型的根目录列表验证连接。 */
   public async validateConnection(
     connection: Record<string, unknown>,
     signal?: AbortSignal,
     context?: ProviderConnectionContext,
   ): Promise<ProviderValidationResult> {
-    const accountLabel = await this.client.validateConnection(connection, context?.persistConnection, signal);
+    const accountLabel = await this.resolveClient(connection)
+      .validateConnection(connection, context?.persistConnection, signal);
     return { valid: true, accountLabel, rootAccessible: true };
   }
 
@@ -195,7 +232,7 @@ export class GuangyaProvider implements ProviderAdapter {
   ): Promise<{ url: string; expiresAt: string | null; headers: Record<string, string> }> {
     const fileId = typeof locator.fileId === "string" ? locator.fileId.trim() : "";
     if (!fileId) throw new ApiError(422, "provider_file_locator_invalid", "光鸭文件定位无效");
-    const access = await this.client.getFileDownloadAccess(
+    const access = await this.resolveClient(connection).getFileDownloadAccess(
       connection,
       fileId,
       context?.persistConnection,
@@ -359,7 +396,7 @@ export class GuangyaProvider implements ProviderAdapter {
     persistConnection?: (connection: Record<string, unknown>) => Promise<void>,
     signal?: AbortSignal,
   ): Promise<GuangyaListResult> {
-    const body = await this.client.listChildren(
+    const body = await this.resolveClient(connection).listChildren(
       connection,
       toWebApiParentId(parentId),
       page,
@@ -377,5 +414,15 @@ export class GuangyaProvider implements ProviderAdapter {
       ? explicitHasMore
       : total > 0 ? (page + 1) * pageSize < total : items.length >= pageSize;
     return { items, hasMore };
+  }
+
+  /** 根据加密连接中的类型选择文件 API；旧数据默认视为网页二维码登录。 */
+  private resolveClient(connection: Record<string, unknown>): GuangyaFileApiClient {
+    const authMode = typeof connection.authMode === "string" && connection.authMode.trim()
+      ? connection.authMode.trim()
+      : "web_qr";
+    if (authMode === "official_api") return this.openApiClient;
+    if (authMode === "web_qr" || authMode === "web_sms") return this.webClient;
+    throw new ApiError(422, "guangya_auth_mode_invalid", "不支持的光鸭登录类型");
   }
 }

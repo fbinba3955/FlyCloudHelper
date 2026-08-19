@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
 
 const GUANGYA_AUTH_BASE_URL = "https://account.guangyapan.com/v1/auth";
+const GUANGYA_CAPTCHA_INIT_URL = "https://account.guangyapan.com/v1/shield/captcha/init";
 const GUANGYA_WEB_API_BASE_URL = "https://api.guangyapan.com";
 const GUANGYA_WEB_CLIENT_ID = "aMe-8VSlkrbQXpUR";
 const GUANGYA_PROJECT_ID = "356jld6jjlbjvygi5v9";
@@ -12,15 +13,19 @@ const GUANGYA_LIST_REQUEST_INTERVAL_MS = 210;
 const GUANGYA_DEFAULT_AUTH_EXPIRES_SECONDS = 120;
 const GUANGYA_DEFAULT_POLL_INTERVAL_SECONDS = 2;
 const GUANGYA_AUTHORIZATION_RETENTION_MS = 10 * 60 * 1_000;
+const GUANGYA_SMS_DEFAULT_EXPIRES_SECONDS = 5 * 60;
+const GUANGYA_SMS_RESEND_INTERVAL_MS = 60 * 1_000;
+const GUANGYA_CAPTCHA_DEFAULT_EXPIRES_SECONDS = 5 * 60;
 
 type JsonRecord = Record<string, unknown>;
 
 /** Provider 在光鸭 Token 自动刷新后持久化最新加密连接。 */
 export type PersistGuangyaConnection = (connection: Record<string, unknown>) => Promise<void>;
 
-/** 光鸭网页扫码授权公开状态；不包含 device_code、二维码密钥或 Token。 */
+/** 光鸭网页授权公开状态；不包含手机号原文、验证码、设备码或 Token。 */
 export interface GuangyaAuthorizationStatus {
   authorizationSessionId: string;
+  authMethod: "qr" | "sms";
   status: "pending" | "authorized" | "expired" | "failed";
   verificationUri: string;
   verificationUriComplete: string;
@@ -28,7 +33,18 @@ export interface GuangyaAuthorizationStatus {
   expiresAt: string;
   intervalSeconds: number;
   accountLabel: string | null;
+  maskedPhone: string | null;
   errorMessage: string | null;
+}
+
+/** 光鸭网页短信登录启动结果；需要交互时只返回官方验证地址，不返回验证码 Token。 */
+export interface GuangyaSmsAuthorizationStartResult {
+  authorization: GuangyaAuthorizationStatus | null;
+  captcha: {
+    captchaSessionId: string;
+    verificationUri: string;
+    expiresAt: string;
+  } | null;
 }
 
 interface GuangyaDeviceAuthorization {
@@ -45,9 +61,35 @@ interface GuangyaAuthorizationSession extends GuangyaAuthorizationStatus {
   targetUserId: string;
   deviceId: string;
   deviceCode: string;
+  phoneNumber: string | null;
+  verificationId: string | null;
+  isExistingUser: boolean | null;
   expiresAtMs: number;
   nextPollAtMs: number;
   connection: Record<string, unknown> | null;
+}
+
+/** 服务端暂存的人机验证上下文，用于绑定操作者、手机号和光鸭设备标识。 */
+interface GuangyaCaptchaSession {
+  captchaSessionId: string;
+  actorUserId: string;
+  targetUserId: string;
+  deviceId: string;
+  phoneNumber: string;
+  captchaToken: string | null;
+  expiresAtMs: number;
+}
+
+interface GuangyaCaptchaInitialization {
+  captchaToken: string | null;
+  verificationUri: string | null;
+  expiresInSeconds: number;
+}
+
+interface GuangyaPhoneVerification {
+  verificationId: string;
+  isExistingUser: boolean;
+  expiresInSeconds: number;
 }
 
 interface GuangyaTokenPollResult {
@@ -80,6 +122,23 @@ function readFirstNumber(record: JsonRecord, keys: string[]): number {
     if (Number.isFinite(value) && value > 0) return value;
   }
   return 0;
+}
+
+/** 从候选字段读取布尔值，兼容网页接口的布尔、数字和字符串表示。 */
+function readFirstBoolean(record: JsonRecord, keys: string[]): boolean {
+  for (const key of keys) {
+    const value = record[key];
+    if (value === true || value === 1 || value === "1" || value === "true") return true;
+    if (value === false || value === 0 || value === "0" || value === "false") return false;
+  }
+  return false;
+}
+
+/** 仅保留手机号首三位和末四位，供页面确认授权账号。 */
+function maskPhoneNumber(phoneNumber: string): string {
+  const digits = phoneNumber.replace(/\D/gu, "");
+  const localNumber = digits.startsWith("86") ? digits.slice(2) : digits;
+  return /^1\d{10}$/u.test(localNumber) ? `${localNumber.slice(0, 3)}****${localNumber.slice(-4)}` : "手机号账号";
 }
 
 /** 读取光鸭可能位于 data 内或顶层的业务数据。 */
@@ -211,6 +270,142 @@ export class GuangyaWebApiClient {
     };
   }
 
+  /** 按光鸭官网短信登录协议发送手机验证码。 */
+  public async createPhoneVerification(
+    phoneNumber: string,
+    deviceId: string,
+    captchaToken: string,
+    signal?: AbortSignal,
+  ): Promise<GuangyaPhoneVerification> {
+    const response = await this.requestJson(`${GUANGYA_AUTH_BASE_URL}/verification`, {
+      method: "POST",
+      headers: {
+        ...this.createAuthHeaders(deviceId),
+        "x-captcha-token": captchaToken,
+      },
+      body: JSON.stringify({
+        phone_number: phoneNumber,
+        target: "ANY",
+        client_id: GUANGYA_WEB_CLIENT_ID,
+      }),
+      signal,
+    });
+    const data = resolveDataRecord(response.body);
+    const verificationId = readFirstText(data, ["verification_id", "verificationId"]);
+    if (!response.ok || !verificationId) {
+      this.throwPhoneAuthorizationError(response, "guangya_sms_send_failed", "发送光鸭验证码失败，请稍后重试");
+    }
+    return {
+      verificationId,
+      isExistingUser: readFirstBoolean(data, ["is_user", "isUser"]),
+      expiresInSeconds: readFirstNumber(data, ["expires_in", "expiresIn"]) || GUANGYA_SMS_DEFAULT_EXPIRES_SECONDS,
+    };
+  }
+
+  /** 按光鸭官网 SDK 的 Shield 流程初始化短信接口所需的人机验证。 */
+  public async createPhoneCaptcha(
+    phoneNumber: string,
+    deviceId: string,
+    redirectUri: string,
+    state: string,
+    signal?: AbortSignal,
+  ): Promise<GuangyaCaptchaInitialization> {
+    const response = await this.requestJson(GUANGYA_CAPTCHA_INIT_URL, {
+      method: "POST",
+      headers: {
+        ...this.createAuthHeaders(deviceId),
+        "Accept-Language": "zh-CN",
+      },
+      body: JSON.stringify({
+        client_id: GUANGYA_WEB_CLIENT_ID,
+        action: "POST:/v1/auth/verification",
+        device_id: deviceId,
+        meta: { phone_number: phoneNumber },
+      }),
+      signal,
+    });
+    const data = resolveDataRecord(response.body);
+    const captchaToken = readFirstText(data, ["captcha_token", "captchaToken"]);
+    const rawVerificationUri = readFirstText(data, ["url", "verification_uri", "verificationUri"]);
+    const expiresInSeconds = readFirstNumber(data, ["expires_in", "expiresIn"])
+      || GUANGYA_CAPTCHA_DEFAULT_EXPIRES_SECONDS;
+    this.logDiagnostic?.({
+      日志关键字: "codex-flycloud-helper-guangya-sms-auth",
+      事件: "光鸭人机验证初始化完成",
+      响应状态码: response.status,
+      验证方式: captchaToken ? "服务端直接签发" : rawVerificationUri ? "需要用户交互" : "未返回验证结果",
+      有效秒数: expiresInSeconds,
+    });
+    if (!response.ok || (!captchaToken && !rawVerificationUri)) {
+      this.throwPhoneAuthorizationError(response, "guangya_captcha_unavailable", "暂时无法启动光鸭人机验证");
+    }
+    if (!rawVerificationUri) {
+      return { captchaToken, verificationUri: null, expiresInSeconds };
+    }
+    let verificationUrl: URL;
+    try {
+      verificationUrl = new URL(rawVerificationUri);
+    } catch {
+      throw new ApiError(503, "guangya_captcha_url_invalid", "光鸭返回的人机验证地址无效");
+    }
+    if (verificationUrl.protocol !== "https:") {
+      throw new ApiError(503, "guangya_captcha_url_invalid", "光鸭返回的人机验证地址不是 HTTPS");
+    }
+    verificationUrl.searchParams.set("redirect_uri", redirectUri);
+    verificationUrl.searchParams.set("state", state);
+    return {
+      captchaToken: null,
+      verificationUri: verificationUrl.toString(),
+      expiresInSeconds,
+    };
+  }
+
+  /** 校验短信验证码，并按官网规则登录已有账号或自动注册新账号。 */
+  public async completePhoneAuthorization(
+    phoneNumber: string,
+    verificationId: string,
+    verificationCode: string,
+    isExistingUser: boolean,
+    deviceId: string,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    const verifyResponse = await this.requestJson(`${GUANGYA_AUTH_BASE_URL}/verification/verify`, {
+      method: "POST",
+      headers: this.createAuthHeaders(deviceId),
+      body: JSON.stringify({
+        verification_id: verificationId,
+        verification_code: verificationCode,
+        client_id: GUANGYA_WEB_CLIENT_ID,
+      }),
+      signal,
+    });
+    const verifyData = resolveDataRecord(verifyResponse.body);
+    const verificationToken = readFirstText(verifyData, ["verification_token", "verificationToken"]);
+    if (!verifyResponse.ok || !verificationToken) {
+      this.throwPhoneAuthorizationError(verifyResponse, "guangya_sms_code_invalid", "验证码错误或已过期，请重新获取");
+    }
+
+    const signPath = isExistingUser ? "/signin" : "/signup";
+    const signBody: JsonRecord = {
+      verification_code: verificationCode,
+      verification_token: verificationToken,
+      client_id: GUANGYA_WEB_CLIENT_ID,
+    };
+    if (isExistingUser) signBody.username = phoneNumber;
+    else signBody.phone_number = phoneNumber;
+    const signResponse = await this.requestJson(`${GUANGYA_AUTH_BASE_URL}${signPath}`, {
+      method: "POST",
+      headers: this.createAuthHeaders(deviceId),
+      body: JSON.stringify(signBody),
+      signal,
+    });
+    const connection = this.createConnectionFromTokenResponse(signResponse.body, deviceId, "", "web_sms");
+    if (!signResponse.ok || !connection) {
+      this.throwPhoneAuthorizationError(signResponse, "guangya_sms_login_failed", "光鸭手机号登录失败，请重新获取验证码");
+    }
+    return connection;
+  }
+
   /** 列出光鸭目录；请求起始时间全局限制在每秒五次以内。 */
   public async listChildren(
     connection: Record<string, unknown>,
@@ -321,7 +516,7 @@ export class GuangyaWebApiClient {
     const refreshToken = typeof connection.refreshToken === "string" ? connection.refreshToken.trim() : "";
     const deviceId = typeof connection.deviceId === "string" ? connection.deviceId.trim() : "";
     if (!refreshToken) {
-      throw new ApiError(410, "provider_authentication_failed", "光鸭登录已失效，请重新扫码登录");
+      throw new ApiError(410, "provider_authentication_failed", "光鸭登录已失效，请重新登录");
     }
     const response = await this.requestJson(`${GUANGYA_AUTH_BASE_URL}/token`, {
       method: "POST",
@@ -333,9 +528,10 @@ export class GuangyaWebApiClient {
       }),
       signal,
     });
-    const nextConnection = this.createConnectionFromTokenResponse(response.body, deviceId, refreshToken);
+    const authMode = typeof connection.authMode === "string" && connection.authMode.trim() ? connection.authMode.trim() : "web_qr";
+    const nextConnection = this.createConnectionFromTokenResponse(response.body, deviceId, refreshToken, authMode);
     if (!response.ok || !nextConnection) {
-      throw new ApiError(410, "provider_authentication_failed", "光鸭刷新令牌已失效，请重新扫码登录");
+      throw new ApiError(410, "provider_authentication_failed", "光鸭刷新令牌已失效，请重新登录");
     }
     Object.assign(connection, nextConnection);
     if (persistConnection) await persistConnection(connection);
@@ -346,6 +542,7 @@ export class GuangyaWebApiClient {
     body: JsonRecord,
     deviceId: string,
     fallbackRefreshToken = "",
+    authMode = "web_qr",
   ): Record<string, unknown> | null {
     const data = resolveDataRecord(body);
     const accessToken = readFirstText(data, ["access_token", "accessToken"]);
@@ -357,7 +554,7 @@ export class GuangyaWebApiClient {
       ? rawExpiresAt < 1_000_000_000_000 ? rawExpiresAt * 1_000 : rawExpiresAt
       : expiresIn > 0 ? Date.now() + expiresIn * 1_000 : 0;
     return {
-      authMode: "web_qr",
+      authMode,
       deviceId,
       accessToken,
       refreshToken,
@@ -379,7 +576,7 @@ export class GuangyaWebApiClient {
       ? connection.tokenType.trim()
       : "Bearer";
     const deviceId = typeof connection.deviceId === "string" ? connection.deviceId.trim() : "";
-    if (!accessToken) throw new ApiError(410, "provider_authentication_failed", "光鸭登录已失效，请重新扫码登录");
+    if (!accessToken) throw new ApiError(410, "provider_authentication_failed", "光鸭登录已失效，请重新登录");
     return this.requestJson(`${GUANGYA_WEB_API_BASE_URL}${path}`, {
       method: "POST",
       headers: {
@@ -414,7 +611,7 @@ export class GuangyaWebApiClient {
     if (response.status === 403) throw new ApiError(403, "provider_permission_denied", "当前光鸭账号没有文件访问权限");
     if (response.status === 429) throw new ApiError(503, "provider_rate_limited", "光鸭接口访问频率过高，请稍后重试");
     if (response.status === 401 || code === GUANGYA_TOKEN_EXPIRED_CODE) {
-      throw new ApiError(410, "provider_authentication_failed", "光鸭登录已失效，请重新扫码登录");
+      throw new ApiError(410, "provider_authentication_failed", "光鸭登录已失效，请重新登录");
     }
     if (!response.ok || code !== 0) {
       const message = readFirstText(response.body, ["msg", "message"]);
@@ -430,6 +627,30 @@ export class GuangyaWebApiClient {
       "x-project-id": GUANGYA_PROJECT_ID,
       ...(deviceId ? { "x-device-id": deviceId } : {}),
     };
+  }
+
+  /** 把光鸭短信认证错误转换为稳定且不泄露外部响应细节的 API 错误。 */
+  private throwPhoneAuthorizationError(
+    response: { ok: boolean; status: number; body: JsonRecord },
+    errorCode: string,
+    fallbackMessage: string,
+  ): never {
+    const providerCode = readFirstText(response.body, ["error", "code", "error_code"]);
+    const providerMessage = readFirstText(response.body, ["error_description", "msg", "message"]);
+    this.logDiagnostic?.({
+      日志关键字: "codex-flycloud-helper-guangya-sms-auth",
+      事件: "光鸭短信认证请求失败",
+      响应状态码: response.status,
+      业务错误码: providerCode || null,
+    });
+    if (response.status === 429) {
+      throw new ApiError(429, "guangya_sms_too_frequent", "验证码发送过于频繁，请稍后重试");
+    }
+    throw new ApiError(
+      errorCode === "guangya_sms_code_invalid" ? 422 : 503,
+      errorCode,
+      sanitizeProviderMessage(providerMessage, fallbackMessage),
+    );
   }
 
   /** 保证文件列表请求发起时间不超过每秒五次。 */
@@ -478,13 +699,16 @@ export class GuangyaWebApiClient {
   }
 }
 
-/** 管理多用户网页扫码授权会话，敏感 device_code 与 Token 不下发到浏览器。 */
+/** 管理多用户网页二维码与验证码授权会话，敏感凭据始终不下发到浏览器。 */
 export class GuangyaAuthorizationManager {
   private readonly sessions = new Map<string, GuangyaAuthorizationSession>();
+  private readonly captchaSessions = new Map<string, GuangyaCaptchaSession>();
+  // 关键变量：记录每个操作者与目标用户最近一次发送时间，避免误触造成短信轰炸。
+  private readonly smsSendAllowedAtByOwner = new Map<string, number>();
 
   public constructor(private readonly client: GuangyaWebApiClient) {}
 
-  /** 为当前操作者和目标用户创建一次官方网页扫码登录会话。 */
+  /** 为当前操作者和目标用户创建一次光鸭网页二维码登录会话。 */
   public async start(actorUserId: string, targetUserId: string): Promise<GuangyaAuthorizationStatus> {
     this.purgeExpiredSessions();
     // 关键变量：同一操作者为同一用户重新扫码时废弃旧等待会话，避免旧二维码覆盖新连接。
@@ -504,6 +728,10 @@ export class GuangyaAuthorizationManager {
       targetUserId,
       deviceId,
       deviceCode: authorization.deviceCode,
+      phoneNumber: null,
+      verificationId: null,
+      isExistingUser: null,
+      authMethod: "qr",
       status: "pending",
       verificationUri: authorization.verificationUri,
       verificationUriComplete: authorization.verificationUriComplete,
@@ -513,6 +741,7 @@ export class GuangyaAuthorizationManager {
       intervalSeconds: authorization.intervalSeconds,
       nextPollAtMs: createdAtMs + authorization.intervalSeconds * 1_000,
       accountLabel: null,
+      maskedPhone: null,
       errorMessage: null,
       connection: null,
     };
@@ -520,9 +749,170 @@ export class GuangyaAuthorizationManager {
     return this.toPublicStatus(session);
   }
 
+  /** 发送光鸭网页验证码，并创建一次只能由原操作者提交的短期授权会话。 */
+  public async startSms(
+    actorUserId: string,
+    targetUserId: string,
+    rawPhoneNumber: string,
+    captchaRedirectUri: string,
+  ): Promise<GuangyaSmsAuthorizationStartResult> {
+    this.purgeExpiredSessions();
+    const localPhoneNumber = rawPhoneNumber.replace(/[\s-]/gu, "");
+    if (!/^1\d{10}$/u.test(localPhoneNumber)) {
+      throw new ApiError(422, "guangya_phone_invalid", "请输入正确的中国大陆手机号");
+    }
+    const ownerKey = `${actorUserId}:${targetUserId}`;
+    const nextAllowedAtMs = this.smsSendAllowedAtByOwner.get(ownerKey) ?? 0;
+    if (Date.now() < nextAllowedAtMs) {
+      throw new ApiError(429, "guangya_sms_too_frequent", "验证码发送过于频繁，请一分钟后重试");
+    }
+    const captchaSessionId = randomUUID();
+    const deviceId = randomUUID();
+    const phoneNumber = `+86 ${localPhoneNumber}`;
+    const captcha = await this.client.createPhoneCaptcha(
+      phoneNumber,
+      deviceId,
+      captchaRedirectUri,
+      captchaSessionId,
+    );
+    const captchaExpiresAtMs = Date.now() + captcha.expiresInSeconds * 1_000;
+    const captchaSession: GuangyaCaptchaSession = {
+      captchaSessionId,
+      actorUserId,
+      targetUserId,
+      deviceId,
+      phoneNumber,
+      captchaToken: captcha.captchaToken,
+      expiresAtMs: captchaExpiresAtMs,
+    };
+    this.captchaSessions.set(captchaSessionId, captchaSession);
+    if (!captcha.captchaToken && captcha.verificationUri) {
+      return {
+        authorization: null,
+        captcha: {
+          captchaSessionId,
+          verificationUri: captcha.verificationUri,
+          expiresAt: new Date(captchaExpiresAtMs).toISOString(),
+        },
+      };
+    }
+    return {
+      authorization: await this.completeSmsCaptcha(actorUserId, captchaSessionId, null),
+      captcha: null,
+    };
+  }
+
+  /** 使用官网回调返回的 Token 完成人机验证并发送短信验证码。 */
+  public async completeSmsCaptcha(
+    actorUserId: string,
+    captchaSessionId: string,
+    callbackCaptchaToken: string | null,
+  ): Promise<GuangyaAuthorizationStatus> {
+    this.purgeExpiredSessions();
+    const captchaSession = this.captchaSessions.get(captchaSessionId);
+    if (!captchaSession) {
+      throw new ApiError(404, "guangya_captcha_session_not_found", "光鸭人机验证会话不存在或已经失效");
+    }
+    if (captchaSession.actorUserId !== actorUserId) {
+      throw new ApiError(403, "guangya_authorization_owner_mismatch", "无权访问该光鸭人机验证会话");
+    }
+    if (Date.now() >= captchaSession.expiresAtMs) {
+      this.captchaSessions.delete(captchaSessionId);
+      throw new ApiError(410, "guangya_captcha_expired", "光鸭人机验证已过期，请重新获取验证码");
+    }
+    // 关键变量：优先使用官网初始化时直接签发的 Token，否则使用浏览器交互回调 Token。
+    const captchaToken = captchaSession.captchaToken || callbackCaptchaToken?.trim() || "";
+    if (!captchaToken || captchaToken.length > 4_096) {
+      throw new ApiError(422, "guangya_captcha_token_invalid", "光鸭人机验证结果无效，请重新验证");
+    }
+    this.captchaSessions.delete(captchaSessionId);
+    const verification = await this.client.createPhoneVerification(
+      captchaSession.phoneNumber,
+      captchaSession.deviceId,
+      captchaToken,
+    );
+    const createdAtMs = Date.now();
+    const expiresAtMs = createdAtMs + verification.expiresInSeconds * 1_000;
+    // 只有光鸭已确认短信发送成功后才进入冷却，网络失败不会锁住用户。
+    const ownerKey = `${captchaSession.actorUserId}:${captchaSession.targetUserId}`;
+    this.smsSendAllowedAtByOwner.set(ownerKey, createdAtMs + GUANGYA_SMS_RESEND_INTERVAL_MS);
+    for (const [sessionId, session] of this.sessions) {
+      if (session.actorUserId === captchaSession.actorUserId
+        && session.targetUserId === captchaSession.targetUserId
+        && session.status === "pending") {
+        this.sessions.delete(sessionId);
+      }
+    }
+    const maskedPhone = maskPhoneNumber(captchaSession.phoneNumber);
+    const session: GuangyaAuthorizationSession = {
+      authorizationSessionId: randomUUID(),
+      actorUserId: captchaSession.actorUserId,
+      targetUserId: captchaSession.targetUserId,
+      deviceId: captchaSession.deviceId,
+      deviceCode: "",
+      phoneNumber: captchaSession.phoneNumber,
+      verificationId: verification.verificationId,
+      isExistingUser: verification.isExistingUser,
+      authMethod: "sms",
+      status: "pending",
+      verificationUri: "",
+      verificationUriComplete: "",
+      userCode: "",
+      expiresAt: new Date(expiresAtMs).toISOString(),
+      expiresAtMs,
+      intervalSeconds: 0,
+      nextPollAtMs: 0,
+      accountLabel: maskedPhone,
+      maskedPhone,
+      errorMessage: null,
+      connection: null,
+    };
+    this.sessions.set(session.authorizationSessionId, session);
+    return this.toPublicStatus(session);
+  }
+
+  /** 校验网页短信验证码，成功后仅在服务端会话内保存 Token。 */
+  public async verifySms(
+    actorUserId: string,
+    authorizationSessionId: string,
+    rawVerificationCode: string,
+  ): Promise<GuangyaAuthorizationStatus> {
+    const session = this.requireOwnedSession(actorUserId, authorizationSessionId);
+    if (session.authMethod !== "sms") {
+      throw new ApiError(409, "guangya_authorization_method_mismatch", "当前会话不是光鸭网页验证码登录");
+    }
+    if (session.status !== "pending") return this.toPublicStatus(session);
+    if (Date.now() >= session.expiresAtMs) {
+      session.status = "expired";
+      session.errorMessage = "光鸭验证码已过期，请重新获取";
+      return this.toPublicStatus(session);
+    }
+    const verificationCode = rawVerificationCode.trim();
+    if (!/^\d{4,8}$/u.test(verificationCode)) {
+      throw new ApiError(422, "guangya_sms_code_invalid", "请输入正确的短信验证码");
+    }
+    if (!session.phoneNumber || !session.verificationId || session.isExistingUser === null) {
+      throw new ApiError(409, "guangya_authorization_incomplete", "光鸭验证码会话数据不完整，请重新获取");
+    }
+    const connection = await this.client.completePhoneAuthorization(
+      session.phoneNumber,
+      session.verificationId,
+      verificationCode,
+      session.isExistingUser,
+      session.deviceId,
+    );
+    session.connection = connection;
+    session.status = "authorized";
+    session.errorMessage = null;
+    return this.toPublicStatus(session);
+  }
+
   /** 轮询官方 Token 接口，并把授权结果保留在仅服务端可读的会话中。 */
   public async poll(actorUserId: string, authorizationSessionId: string): Promise<GuangyaAuthorizationStatus> {
     const session = this.requireOwnedSession(actorUserId, authorizationSessionId);
+    if (session.authMethod !== "qr") {
+      throw new ApiError(409, "guangya_authorization_method_mismatch", "光鸭网页验证码登录不需要轮询");
+    }
     if (session.status !== "pending") return this.toPublicStatus(session);
     if (Date.now() >= session.expiresAtMs) {
       session.status = "expired";
@@ -560,7 +950,7 @@ export class GuangyaAuthorizationManager {
       throw new ApiError(403, "guangya_authorization_owner_mismatch", "光鸭授权不属于目标用户");
     }
     if (session.status !== "authorized" || !session.connection) {
-      throw new ApiError(409, "guangya_authorization_incomplete", "请先完成光鸭扫码登录");
+      throw new ApiError(409, "guangya_authorization_incomplete", "请先完成光鸭网页登录");
     }
     return { ...session.connection };
   }
@@ -575,10 +965,10 @@ export class GuangyaAuthorizationManager {
   private requireOwnedSession(actorUserId: string, authorizationSessionId: string): GuangyaAuthorizationSession {
     const session = this.sessions.get(authorizationSessionId);
     if (!session) {
-      throw new ApiError(404, "guangya_authorization_not_found", "光鸭扫码登录会话不存在或已经失效");
+      throw new ApiError(404, "guangya_authorization_not_found", "光鸭网页登录会话不存在或已经失效");
     }
     if (session.actorUserId !== actorUserId) {
-      throw new ApiError(403, "guangya_authorization_owner_mismatch", "无权访问该光鸭扫码登录会话");
+      throw new ApiError(403, "guangya_authorization_owner_mismatch", "无权访问该光鸭网页登录会话");
     }
     return session;
   }
@@ -591,12 +981,18 @@ export class GuangyaAuthorizationManager {
         this.sessions.delete(sessionId);
       }
     }
+    for (const [captchaSessionId, captchaSession] of this.captchaSessions) {
+      if (now > captchaSession.expiresAtMs + GUANGYA_AUTHORIZATION_RETENTION_MS) {
+        this.captchaSessions.delete(captchaSessionId);
+      }
+    }
   }
 
-  /** 剥离授权会话中的 device_code、设备标识和 Token。 */
+  /** 剥离授权会话中的手机号、验证码标识、device_code、设备标识和 Token。 */
   private toPublicStatus(session: GuangyaAuthorizationSession): GuangyaAuthorizationStatus {
     return {
       authorizationSessionId: session.authorizationSessionId,
+      authMethod: session.authMethod,
       status: session.status,
       verificationUri: session.verificationUri,
       verificationUriComplete: session.verificationUriComplete,
@@ -604,6 +1000,7 @@ export class GuangyaAuthorizationManager {
       expiresAt: session.expiresAt,
       intervalSeconds: session.intervalSeconds,
       accountLabel: session.accountLabel,
+      maskedPhone: session.maskedPhone,
       errorMessage: session.errorMessage,
     };
   }

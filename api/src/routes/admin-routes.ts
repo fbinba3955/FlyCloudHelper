@@ -21,6 +21,7 @@ import { tmdbKeySettingName, validateTmdbKeyList } from "../system-settings.js";
 import { streamJobEvents } from "./event-stream.js";
 import {
   consumeProviderAuthorization,
+  attachConnectionAuthMode,
   getScanRootsForMode,
   hasHttpProviderAddress,
   readProviderDirectoryParent,
@@ -311,6 +312,15 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       数据类型: dataType,
       自动创建扫描任务: false,
     });
+    if (providerType === "guangya" && connection.authMode === "official_api") {
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-helper-guangya-official-api",
+        事件: "管理员同步光鸭官方API连接并创建服务",
+        管理员ID: operator.id,
+        目标用户ID: owner.id,
+        服务ID: service.id,
+      });
+    }
     if (hasHttpProviderAddress(connection)) {
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-provider-http",
@@ -330,7 +340,8 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
 
   server.get<{ Params: { serviceId: string } }>("/api/v1/admin/services/:serviceId", async (request) => {
     await requireSuperAdmin(request, runtime.database);
-    return { service: await runtime.repository.getServiceDetail(request.params.serviceId) };
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+    return { service: await attachConnectionAuthMode(runtime, service) };
   });
 
   server.get<{ Params: { serviceId: string }; Querystring: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/directories", async (request) => {
@@ -403,6 +414,15 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
     });
     consumeProviderAuthorization(runtime, operator.id, resolvedConnection.authorizationSessionId);
+    if (service.providerType === "guangya" && connection.authMode === "official_api") {
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-helper-guangya-official-api",
+        事件: "管理员同步光鸭官方API连接并更新服务",
+        管理员ID: operator.id,
+        目标用户ID: service.userId,
+        服务ID: service.id,
+      });
+    }
     if (hasHttpProviderAddress(connection)) {
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-provider-http",
@@ -534,6 +554,34 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     return { service: updated };
   });
 
+  server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/playback-settings", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    if (typeof request.body.relayPlaybackEnabled !== "boolean") {
+      throw validationError("relayPlaybackEnabled", "中转播放开关必须是布尔值");
+    }
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+    if (request.body.relayPlaybackEnabled
+      && !runtime.providers.get(service.providerType).descriptor.capabilities.includes("relayPlayback")) {
+      throw new ApiError(422, "provider_relay_playback_unsupported", "当前网盘类型暂不支持中转播放");
+    }
+    const updated = await runtime.repository.updateRelayPlaybackEnabled(
+      service.id,
+      service.userId,
+      request.body.relayPlaybackEnabled,
+    );
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-relay-playback-setting",
+      事件: "管理员更新服务中转播放开关",
+      管理员ID: operator.id,
+      服务ID: service.id,
+      是否启用中转播放: updated.relayPlaybackEnabled,
+    });
+    await audit(runtime, operator, "update_service_relay_playback", "service", service.id, {
+      是否启用中转播放: updated.relayPlaybackEnabled,
+    });
+    return { service: updated };
+  });
+
   server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/scan-jobs", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
@@ -578,10 +626,18 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.delete<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/catalog", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, request.params.serviceId);
+    const clearStartedAtMs = Date.now();
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-catalog-clear",
+      事件: "管理员开始清空服务媒体库",
+      管理员ID: operator.id,
+      服务ID: request.params.serviceId,
+    });
     const cleared = await runtime.repository.clearServiceCatalog(request.params.serviceId);
     await audit(runtime, operator, "clear_service_catalog", "service", request.params.serviceId, {
       清空媒体条目数: cleared.mediaItemCount,
       清空源文件数: cleared.sourceFileCount,
+      清空耗时毫秒: Date.now() - clearStartedAtMs,
     });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-catalog-clear",
@@ -612,6 +668,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.post<{ Params: { jobId: string } }>("/api/v1/admin/jobs/:jobId/cancel", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const job = await runtime.repository.requestJobControl(request.params.jobId, undefined, "cancel");
+    const interrupted = runtime.worker.interruptJobControl(job.id, "cancel");
     await audit(runtime, operator, "cancel_scan_job", "scan_job", job.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-control",
@@ -619,6 +676,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       管理员ID: operator.id,
       任务ID: job.id,
       控制动作: "cancel",
+      是否中断运行请求: interrupted,
     });
     return { job };
   });
@@ -626,6 +684,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.post<{ Params: { jobId: string } }>("/api/v1/admin/jobs/:jobId/pause", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const job = await runtime.repository.requestJobControl(request.params.jobId, undefined, "pause");
+    const interrupted = runtime.worker.interruptJobControl(job.id, "pause");
     await audit(runtime, operator, "pause_scan_job", "scan_job", job.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-control",
@@ -633,6 +692,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       管理员ID: operator.id,
       任务ID: job.id,
       控制动作: "pause",
+      是否中断运行请求: interrupted,
     });
     return { job };
   });

@@ -38,6 +38,8 @@ export interface CloudServiceRecord {
   dataType: MediaType;
   status: ServiceStatus;
   connectionStatus: string;
+  /** 当前服务是否允许 APP 通过 FlyCloudHelper 中转媒体文件。 */
+  relayPlaybackEnabled: boolean;
   credentialRevision: number;
   scanProfileRevision: number;
   metadataProfileRevision: number;
@@ -92,6 +94,8 @@ export interface ScanJobRecord {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  /** 任务真正处于扫描刮削运行状态的累计时长，不包含排队、暂停和延迟恢复等待。 */
+  elapsedMs: number;
   updatedAt: string;
 }
 

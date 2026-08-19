@@ -124,6 +124,8 @@ export interface TmdbEpisodeMetadata {
 export interface TmdbVideoQuery {
   mediaType: "movie" | "tv";
   title: string;
+  /** 目录标题无候选时使用的文件名查询词。 */
+  fallbackTitle?: string;
   year: number | null;
   language: string;
   region: string;
@@ -216,7 +218,7 @@ export class TmdbKeyPool {
   }
 
   /**
-   * 按 APP 的顺序查询电影或节目：原查询带年份、简化查询带年份、原查询去年份、简化查询去年份。
+   * 按 APP 的顺序查询电影或节目：目录标题带年份，失败后最多再使用一次文件名或简化标题。
    * 命中候选后继续读取详情和演职人员，避免只把搜索摘要当作完整刮削结果。
    */
   public async scrapeVideo(query: TmdbVideoQuery): Promise<TmdbVideoMetadata | null> {
@@ -234,6 +236,27 @@ export class TmdbKeyPool {
         query.signal,
       );
       if (explicitResult) return explicitResult;
+      const correctedMediaType = query.mediaType === "movie" ? "tv" : "movie";
+      const correctedResult = await this.readDetails(
+        correctedMediaType,
+        explicitId,
+        query.title,
+        1,
+        query.language,
+        query.region,
+        query.signal,
+      );
+      if (correctedResult) {
+        this.diagnosticLogger({
+          日志关键字: "codex-video-recognition-optimize",
+          事件: "显式TMDB编号跨类型纠正成功",
+          原媒体类型: query.mediaType === "tv" ? "节目" : "电影",
+          纠正后媒体类型: correctedMediaType === "tv" ? "节目" : "电影",
+          TMDB编号: explicitId,
+          查询标题: query.title,
+        });
+        return correctedResult;
+      }
       this.diagnosticLogger({
         日志关键字: "codex-flycloud-helper-scrape-flow",
         事件: "显式TMDB编号无效后回退标题搜索",
@@ -250,15 +273,20 @@ export class TmdbKeyPool {
     }
 
     const primaryTitle = query.title.trim();
-    const alternateTitle = FlymbyVideoTitleCleaner.buildAlternateTmdbSearchQuery(primaryTitle);
+    // 关键变量：文件名回退优先于普通简化标题，并与主查询去重。
+    const fileFallbackTitle = String(query.fallbackTitle ?? "").trim();
+    const simplifiedTitle = FlymbyVideoTitleCleaner.buildAlternateTmdbSearchQuery(primaryTitle);
+    const firstSeriesFallback = query.mediaType === "tv" && !fileFallbackTitle && !simplifiedTitle
+      ? this.buildFirstSeriesTitleFallback(primaryTitle)
+      : "";
+    const alternateTitle = fileFallbackTitle || simplifiedTitle || firstSeriesFallback;
     const attempts: Array<{ title: string; year: number | null }> = [];
     this.appendSearchAttempt(attempts, primaryTitle, query.year);
-    this.appendSearchAttempt(attempts, alternateTitle, query.year);
-    if (query.year) {
-      this.appendSearchAttempt(attempts, primaryTitle, null);
-      this.appendSearchAttempt(attempts, alternateTitle, null);
-    }
-    for (const attempt of attempts) {
+    // 关键变量：第二次查询同时放宽标题和年份，保持每个任务最多两次 TMDB 搜索。
+    const relaxedTitle = alternateTitle || (query.year !== null ? primaryTitle : "");
+    this.appendSearchAttempt(attempts, relaxedTitle, query.year !== null ? null : query.year);
+    for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
+      const attempt = attempts[attemptIndex]!;
       const candidates = await this.searchCandidates(
         query.mediaType,
         attempt.title,
@@ -384,6 +412,12 @@ export class TmdbKeyPool {
     if (!attempts.some((item) => `${FlymbyVideoTitleCleaner.normalizeSearchText(item.title)}|${item.year ?? ""}` === key)) {
       attempts.push({ title: cleanedTitle, year });
     }
+  }
+
+  /** 节目主查询无候选时，将紧贴中文标题末尾的“1”作为第一部编号移除。 */
+  private buildFirstSeriesTitleFallback(title: string): string {
+    const match = /^(.{2,80}[\u4e00-\u9fa5])1$/u.exec(String(title ?? "").trim());
+    return match?.[1]?.trim() ?? "";
   }
 
   /** 请求 TMDB 搜索接口并转换为统一候选。 */

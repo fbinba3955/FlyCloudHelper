@@ -4,6 +4,7 @@ import { AliyunDriveProvider } from "./aliyundrive.js";
 import { BaiduPanProvider } from "./baidupan.js";
 import { GuangyaProvider } from "./guangya.js";
 import { GuangyaAuthorizationManager, GuangyaWebApiClient } from "./guangya-web-api.js";
+import { GuangyaOpenApiClient } from "./guangya-open-api.js";
 import type { ProviderAdapter, ProviderDescriptor } from "./types.js";
 import { WebDavProvider } from "./webdav.js";
 
@@ -27,7 +28,7 @@ export class ProviderRegistry {
       new WebDavProvider(networkOptions),
       new AliyunDriveProvider(networkOptions),
       new BaiduPanProvider(networkOptions),
-      new GuangyaProvider(guangyaClient),
+      new GuangyaProvider(guangyaClient, new GuangyaOpenApiClient(logConnectionFailure)),
     ].forEach((adapter) => this.adapters.set(adapter.descriptor.type, adapter));
   }
 

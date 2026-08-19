@@ -72,6 +72,13 @@ export interface ProviderFileAccess {
   headers: Record<string, string>;
 }
 
+/** Provider 仅供服务端中转使用的上游访问结果，headers 可能包含凭据，严禁写入接口响应或日志。 */
+export interface ProviderFileStreamAccess {
+  url: string;
+  expiresAt: string | null;
+  headers: Record<string, string>;
+}
+
 /** Provider 建议的扫描和刮削并发范围，默认值与 Flymby APP 保持一致。 */
 export interface ProviderRecommendedScanSettings {
   scanDirectoryConcurrency: {
@@ -154,6 +161,13 @@ export interface ProviderAdapter {
     signal?: AbortSignal,
     context?: ProviderConnectionContext,
   ): Promise<ProviderFileAccess>;
+  /** 把扫描 locator 转换为仅供服务端读取媒体字节的上游地址和请求头。 */
+  resolveFileStreamAccess?(
+    connection: Record<string, unknown>,
+    locator: Record<string, unknown>,
+    signal?: AbortSignal,
+    context?: ProviderConnectionContext,
+  ): Promise<ProviderFileStreamAccess>;
   enumerate(
     connection: Record<string, unknown>,
     roots: ScanRoot[],

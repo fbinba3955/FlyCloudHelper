@@ -1,6 +1,6 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import { FolderPlus, Plus, RefreshCw, ScanLine, Settings2, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCatalogView";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { GuangyaAuthorizationPanel } from "@/components/GuangyaAuthorizationPanel";
@@ -19,6 +19,7 @@ import {
   reconnectServiceConnection,
   updateServiceConnection,
   updateServiceMetadataProfile,
+  updateServiceRelayPlayback,
   updateServiceScanProfile,
   updateServiceStatus,
   type CloudService,
@@ -43,6 +44,12 @@ const dataTypeLabels: Record<MediaType, string> = {
   video: "影视",
   music: "音乐",
   audiobook: "有声书",
+};
+
+const guangyaLoginModeLabels: Record<"official_api" | "web_qr" | "web_sms", string> = {
+  official_api: "光鸭官方 API 登录",
+  web_qr: "光鸭网页二维码登录",
+  web_sms: "光鸭网页验证码登录",
 };
 
 // 关键变量：服务详情最近任务卡片只展示中文状态，不修改接口返回的原始状态值。
@@ -314,7 +321,7 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
     const connection: Record<string, string> = {};
     if (descriptor.authenticationMode === "web_qr") {
       if (guangyaAuthorization?.status !== "authorized") {
-        setMessage("请先完成光鸭扫码登录，再创建服务");
+        setMessage("请先完成光鸭网页二维码或网页验证码登录，再创建服务");
         return;
       }
       connection.authorizationSessionId = guangyaAuthorization.authorizationSessionId;
@@ -391,6 +398,14 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   const providers = useApiResource(() => listProviders(), []);
   const [message, setMessage] = useState<string | null>(null);
   const [reconnecting, setReconnecting] = useState(false);
+  const [updatingRelayPlayback, setUpdatingRelayPlayback] = useState(false);
+  // 关键变量：同步占用播放开关，避免 React 刷新前连续点击产生相反请求。
+  const updatingRelayPlaybackRef = useRef(false);
+  const [clearingCatalog, setClearingCatalog] = useState(false);
+  // 关键变量：引用会在点击处理函数中同步占用，避免 React 刷新按钮状态前重复提交清空请求。
+  const clearingCatalogRef = useRef(false);
+  const [creatingScanMode, setCreatingScanMode] = useState<"full" | "incremental" | null>(null);
+  const creatingScanModeRef = useRef<"full" | "incremental" | null>(null);
   const service = resource.data;
   const [fullScanRoots, setFullScanRoots] = useState<ProviderDirectory[]>([]);
   const [incrementalScanRoots, setIncrementalScanRoots] = useState<ProviderDirectory[]>([]);
@@ -428,6 +443,17 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
 
   /** 从详情页创建用户选择的扫描任务。 */
   async function trigger(mode: "incremental" | "full"): Promise<void> {
+    if (creatingScanModeRef.current) {
+      console.warn("codex-flycloud-helper-job-operation", {
+        事件: "拦截重复创建扫描任务",
+        服务ID: serviceId,
+        正在创建模式: creatingScanModeRef.current,
+        本次模式: mode,
+      });
+      return;
+    }
+    creatingScanModeRef.current = mode;
+    setCreatingScanMode(mode);
     setMessage("正在创建扫描任务…");
     try {
       const job = await createScanJob(serviceId, mode, admin);
@@ -435,6 +461,9 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
       await resource.refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "创建任务失败");
+    } finally {
+      creatingScanModeRef.current = null;
+      setCreatingScanMode(null);
     }
   }
 
@@ -531,7 +560,8 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   /** 光鸭网页授权成功后，用一次性授权会话替换当前服务连接。 */
   async function saveGuangyaConnection(authorization: GuangyaAuthorizationStatus | null): Promise<void> {
     if (authorization?.status !== "authorized") return;
-    setMessage("光鸭扫码登录成功，正在验证并保存连接…");
+    const loginMethod = authorization.authMethod === "sms" ? "网页验证码" : "网页二维码";
+    setMessage(`光鸭${loginMethod}登录成功，正在验证并保存连接…`);
     try {
       await updateServiceConnection(serviceId, {
         authorizationSessionId: authorization.authorizationSessionId,
@@ -568,9 +598,34 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     }
   }
 
+  /** 立即保存当前服务的中转播放开关。 */
+  async function toggleRelayPlayback(): Promise<void> {
+    if (updatingRelayPlaybackRef.current) return;
+    const nextEnabled = !activeService.relayPlaybackEnabled;
+    updatingRelayPlaybackRef.current = true;
+    setUpdatingRelayPlayback(true);
+    setMessage(`正在${nextEnabled ? "启用" : "关闭"}中转播放…`);
+    try {
+      await updateServiceRelayPlayback(serviceId, nextEnabled, admin);
+      setMessage(nextEnabled ? "中转播放已启用" : "中转播放已关闭");
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "中转播放设置保存失败");
+    } finally {
+      updatingRelayPlaybackRef.current = false;
+      setUpdatingRelayPlayback(false);
+    }
+  }
+
   /** 二次确认后仅清空当前服务的扫描与刮削结果。 */
   async function clearCatalog(): Promise<void> {
+    if (clearingCatalogRef.current) {
+      console.warn("codex-flycloud-helper-catalog-clear", { 事件: "拦截重复清空请求", 服务ID: serviceId });
+      return;
+    }
     if (!window.confirm(`确定清空“${activeService.displayName}”的全部扫描刮削结果吗？服务连接和配置会保留，媒体条目、文件索引和目录版本将被清空。`)) return;
+    clearingCatalogRef.current = true;
+    setClearingCatalog(true);
     setMessage("正在清空当前服务的媒体库…");
     try {
       const result = await clearServiceCatalog(serviceId, admin);
@@ -578,10 +633,14 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
       await resource.refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "清空媒体库失败");
+    } finally {
+      clearingCatalogRef.current = false;
+      setClearingCatalog(false);
     }
   }
 
   const providerDescriptor = providers.data?.find((item) => item.type === service.providerType);
+  const relayPlaybackSupported = providerDescriptor?.capabilities.includes("relayPlayback") === true;
   const recommendedScanSettings = providerDescriptor?.recommendedScanSettings;
   const scanConcurrencyOptions = buildConcurrencyOptions(
     recommendedScanSettings?.scanDirectoryConcurrency.min ?? 1,
@@ -596,7 +655,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
 
   return (
     <>
-      <PageHeader title={service.displayName} actions={<><SecondaryButton disabled={fullScanRoots.length === 0} title={fullScanRoots.length === 0 ? "请先配置全量扫描路径" : undefined} onClick={() => void trigger("full")}>全量扫描</SecondaryButton><PrimaryButton disabled={incrementalScanRoots.length === 0} title={incrementalScanRoots.length === 0 ? "请先配置增量扫描路径" : undefined} onClick={() => void trigger("incremental")}><ScanLine className="size-4" /> 增量扫描</PrimaryButton></>} />
+      <PageHeader title={service.displayName} actions={<><SecondaryButton disabled={fullScanRoots.length === 0 || creatingScanMode !== null} title={fullScanRoots.length === 0 ? "请先配置全量扫描路径" : undefined} onClick={() => void trigger("full")}>{creatingScanMode === "full" ? "正在创建…" : "全量扫描"}</SecondaryButton><PrimaryButton disabled={incrementalScanRoots.length === 0 || creatingScanMode !== null} title={incrementalScanRoots.length === 0 ? "请先配置增量扫描路径" : undefined} onClick={() => void trigger("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "正在创建…" : "增量扫描"}</PrimaryButton></>} />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="媒体条目" value={service.itemCount.toLocaleString()} hint="当前已入库" />
@@ -605,11 +664,13 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         <StatCard
           label="连接状态"
           value={serviceStatusLabels[service.status]}
-          hint={service.credentialConfigured ? "Secret 已配置" : "Secret 未配置"}
+          hint={service.connectionAuthMode
+            ? guangyaLoginModeLabels[service.connectionAuthMode]
+            : service.credentialConfigured ? "Secret 已配置" : "Secret 未配置"}
           tone={service.status === "reauthorization_required" ? "warning" : "muted"}
           action={service.status === "reauthorization_required"
             ? providerDescriptor?.authenticationMode === "web_qr"
-              ? <SecondaryButton onClick={() => document.getElementById("guangya-authorization-panel")?.scrollIntoView({ behavior: "smooth", block: "center" })}>重新扫码登录</SecondaryButton>
+              ? <SecondaryButton onClick={() => document.getElementById("guangya-authorization-panel")?.scrollIntoView({ behavior: "smooth", block: "center" })}>{service.connectionAuthMode === "official_api" ? "查看同步方式" : "重新登录"}</SecondaryButton>
               : <SecondaryButton disabled={reconnecting} onClick={() => void reconnectCurrentConnection()}><RefreshCw className={`size-4 ${reconnecting ? "animate-spin" : ""}`} />{reconnecting ? "正在重连…" : "使用当前配置重连"}</SecondaryButton>
             : undefined}
         />
@@ -628,10 +689,10 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         </div>
       </Panel>
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <Panel title="替换连接" description={providerDescriptor?.authenticationMode === "web_qr" ? "重新扫码后会验证账号并替换当前服务连接。" : "Secret 不回显，保存时必须提交一套完整新连接。"}>
+        <Panel title="替换连接" description={providerDescriptor?.authenticationMode === "web_qr" ? "可使用网页二维码或网页验证码重新登录；官方 API 连接由 Flymby APP 同步。" : "Secret 不回显，保存时必须提交一套完整新连接。"}>
           {providerDescriptor?.authenticationMode === "web_qr" ? (
             <div id="guangya-authorization-panel">
-              <GuangyaAuthorizationPanel admin={admin} targetUserId={admin ? service.userId : undefined} resetKey={`${service.id}:${service.credentialRevision}`} onAuthorizationChange={(authorization) => void saveGuangyaConnection(authorization)} />
+              <GuangyaAuthorizationPanel admin={admin} targetUserId={admin ? service.userId : undefined} resetKey={`${service.id}:${service.credentialRevision}`} initialLoginMode={service.connectionAuthMode ?? "web_qr"} onAuthorizationChange={(authorization) => void saveGuangyaConnection(authorization)} />
             </div>
           ) : (
             <form onSubmit={(event) => void saveConnection(event)} className="grid gap-3">
@@ -644,7 +705,34 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
           <p className="mb-4 text-sm text-muted-foreground">当前状态：{serviceStatusLabels[service.status]}</p>
           <div className="flex flex-wrap gap-2">
             <SecondaryButton onClick={() => void toggleStatus()}>{service.status === "disabled" ? "启用服务" : "停用服务"}</SecondaryButton>
-            <button type="button" onClick={() => void clearCatalog()} disabled={service.status === "scanning"} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> 清空扫描刮削结果</button>
+            <button type="button" onClick={() => void clearCatalog()} disabled={service.status === "scanning" || clearingCatalog} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空扫描刮削结果"}</button>
+          </div>
+        </Panel>
+        <Panel title="播放设置" description="设置只对当前服务生效，默认关闭。">
+          <div className="rounded-xl border border-border bg-secondary/35 p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-medium">启用中转播放</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {!relayPlaybackSupported
+                    ? "当前网盘类型暂不支持中转播放。"
+                    : service.relayPlaybackEnabled
+                      ? "APP 可以让媒体流经过 FlyCloudHelper，服务器将承担播放带宽。"
+                      : "APP 不能通过 FlyCloudHelper 中转该服务的媒体文件。"}
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={service.relayPlaybackEnabled}
+                aria-label="启用中转播放"
+                disabled={!relayPlaybackSupported || updatingRelayPlayback}
+                onClick={() => void toggleRelayPlayback()}
+                className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40 ${service.relayPlaybackEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}
+              >
+                <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${service.relayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} />
+              </button>
+            </div>
           </div>
         </Panel>
         <Panel title="扫描路径" description="全量和增量任务分别选择网盘目录，不需要手动输入路径。" className="xl:col-span-2">

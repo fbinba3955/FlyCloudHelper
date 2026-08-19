@@ -1,6 +1,7 @@
 import dns from "node:dns/promises";
-import http from "node:http";
+import http, { type IncomingHttpHeaders, type IncomingMessage } from "node:http";
 import https from "node:https";
+import type { LookupFunction } from "node:net";
 import { ApiError } from "../errors.js";
 
 export interface ProviderNetworkOptions {
@@ -12,6 +13,29 @@ interface ResolvedProviderUrl {
   url: URL;
   address: string;
   family: 4 | 6;
+}
+
+/**
+ * 创建固定到本次 DNS 结果的 Node lookup 回调。
+ * Node 20 开启自动地址族选择时会传入 all=true，此时回调必须返回地址数组。
+ */
+function createPinnedProviderLookup(target: ResolvedProviderUrl): LookupFunction {
+  return (_hostname, lookupOptions, callback) => {
+    // 关键变量：all=true 时即使只有一个固定地址也必须保留数组形态，否则 Node 会抛出 ERR_INVALID_IP_ADDRESS。
+    if (lookupOptions.all === true) {
+      callback(null, [{ address: target.address, family: target.family }]);
+      return;
+    }
+    callback(null, target.address, target.family);
+  };
+}
+
+/** Provider 媒体中转建立完成后的原生流响应。 */
+export interface ProviderStreamResponse {
+  statusCode: number;
+  headers: IncomingHttpHeaders;
+  body: IncomingMessage;
+  finalUrl: URL;
 }
 
 /** 从 Node 网络异常、cause 或聚合异常中读取稳定错误码。 */
@@ -147,9 +171,7 @@ async function requestResolvedProvider(
     const request = transport.request(target.url, {
       method: init.method ?? "GET",
       headers,
-      lookup: (_hostname, _options, callback) => {
-        callback(null, target.address, target.family);
-      },
+      lookup: createPinnedProviderLookup(target),
     }, (incoming) => {
       const chunks: Buffer[] = [];
       incoming.on("data", (chunk: Buffer | string) => {
@@ -183,6 +205,46 @@ async function requestResolvedProvider(
   });
 }
 
+/** 使用固定 DNS 解析结果建立不会预读媒体正文的上游流请求。 */
+async function requestResolvedProviderStream(
+  target: ResolvedProviderUrl,
+  init: RequestInit,
+  signal: AbortSignal,
+): Promise<IncomingMessage> {
+  const headers: Record<string, string> = {};
+  new Headers(init.headers).forEach((value, name) => {
+    headers[name] = value;
+  });
+  const transport = target.url.protocol === "https:" ? https : http;
+  return new Promise<IncomingMessage>((resolve, reject) => {
+    const request = transport.request(target.url, {
+      method: init.method ?? "GET",
+      headers,
+      lookup: createPinnedProviderLookup(target),
+    }, resolve);
+    request.once("error", reject);
+    const abortRequest = () => request.destroy(new Error("provider_stream_aborted"));
+    signal.addEventListener("abort", abortRequest, { once: true });
+    request.once("close", () => signal.removeEventListener("abort", abortRequest));
+    request.end();
+  });
+}
+
+/** 判断 Provider 响应是否要求客户端跳转到新的资源地址。 */
+function isProviderRedirectStatus(status: number): boolean {
+  return [301, 302, 303, 307, 308].includes(status);
+}
+
+/** 跨域重定向时移除不能转发给新主机的敏感请求头。 */
+function buildRedirectRequestInit(init: RequestInit, isCrossOrigin: boolean): RequestInit {
+  if (!isCrossOrigin) return init;
+  const headers = new Headers(init.headers);
+  headers.delete("authorization");
+  headers.delete("proxy-authorization");
+  headers.delete("cookie");
+  return { ...init, headers };
+}
+
 /** 对 Provider 请求执行地址校验、DNS 固定和超时，并转换为稳定业务错误。 */
 export async function providerFetch(
   url: string | URL,
@@ -197,8 +259,42 @@ export async function providerFetch(
   const abortParent = () => timeoutController.abort();
   parentSignal?.addEventListener("abort", abortParent, { once: true });
   try {
-    resolvedTarget = await resolveProviderUrl(url, options);
-    const response = await requestResolvedProvider(resolvedTarget, init, timeoutController.signal);
+    // 关键变量：每次跳转都重新执行 URL 和 DNS 校验，最多跟随五次以阻止循环重定向。
+    let currentUrl: string | URL = url instanceof URL ? new URL(url.href) : url;
+    let currentInit = init;
+    let redirectCount = 0;
+    let response: Response;
+    while (true) {
+      resolvedTarget = await resolveProviderUrl(currentUrl, options);
+      response = await requestResolvedProvider(resolvedTarget, currentInit, timeoutController.signal);
+      const requestMethod = String(currentInit.method ?? "GET").toUpperCase();
+      const location = response.headers.get("location");
+      if (!isProviderRedirectStatus(response.status) || !location || !["GET", "HEAD"].includes(requestMethod)) {
+        break;
+      }
+      if (redirectCount >= 5) {
+        throw new ApiError(503, "provider_redirect_limit_exceeded", "网盘资源重定向次数过多");
+      }
+      let nextUrl: URL;
+      try {
+        nextUrl = new URL(location, resolvedTarget.url);
+      } catch {
+        throw new ApiError(503, "provider_redirect_invalid", "网盘资源返回了无效的重定向地址");
+      }
+      const isCrossOrigin = nextUrl.origin !== resolvedTarget.url.origin;
+      redirectCount += 1;
+      options.logConnectionFailure?.({
+        日志关键字: "codex-video-recognition-optimize",
+        事件: "Provider文本资源跟随重定向",
+        请求方法: requestMethod,
+        原请求路径: resolvedTarget.url.pathname,
+        重定向状态码: response.status,
+        是否跨域: isCrossOrigin,
+        重定向次数: redirectCount,
+      });
+      currentInit = buildRedirectRequestInit(currentInit, isCrossOrigin);
+      currentUrl = nextUrl;
+    }
     if (response.status === 401) {
       // 401 表示服务端没有接受当前凭据；保留 410 业务状态，避免被前端误认为 FlyCloudHelper 登录会话失效。
       throw new ApiError(410, "provider_authentication_failed", "网盘凭据未被接受，服务端返回 401");
@@ -248,5 +344,116 @@ export async function providerFetch(
   } finally {
     clearTimeout(timeout);
     parentSignal?.removeEventListener("abort", abortParent);
+  }
+}
+
+/**
+ * 建立 Provider 媒体流并保留原生 IncomingMessage，让 Fastify 直接执行背压转发。
+ * 只限制建立响应头的等待时间；流建立后不设置总时长上限，直到播放完成或客户端断开。
+ */
+export async function providerStream(
+  url: string | URL,
+  init: RequestInit,
+  options: ProviderNetworkOptions,
+  parentSignal?: AbortSignal,
+): Promise<ProviderStreamResponse> {
+  const requestController = new AbortController();
+  const startedAt = Date.now();
+  let resolvedTarget: ResolvedProviderUrl | null = null;
+  let finalBody: IncomingMessage | null = null;
+  let connectionTimedOut = false;
+  const timeout = setTimeout(() => {
+    connectionTimedOut = true;
+    requestController.abort();
+  }, 30_000);
+  const abortParent = () => requestController.abort();
+  parentSignal?.addEventListener("abort", abortParent, { once: true });
+  const cleanup = () => {
+    clearTimeout(timeout);
+    parentSignal?.removeEventListener("abort", abortParent);
+  };
+  try {
+    // 关键变量：每次重定向重新校验协议和 DNS，跨域时移除 WebDAV Authorization 等敏感请求头。
+    let currentUrl: string | URL = url instanceof URL ? new URL(url.href) : url;
+    let currentInit = init;
+    let redirectCount = 0;
+    while (true) {
+      resolvedTarget = await resolveProviderUrl(currentUrl, options);
+      const response = await requestResolvedProviderStream(
+        resolvedTarget,
+        currentInit,
+        requestController.signal,
+      );
+      const requestMethod = String(currentInit.method ?? "GET").toUpperCase();
+      const location = response.headers.location;
+      if (isProviderRedirectStatus(response.statusCode ?? 500) && location && ["GET", "HEAD"].includes(requestMethod)) {
+        response.destroy();
+        if (redirectCount >= 5) {
+          throw new ApiError(503, "provider_redirect_limit_exceeded", "网盘媒体重定向次数过多");
+        }
+        let nextUrl: URL;
+        try {
+          nextUrl = new URL(location, resolvedTarget.url);
+        } catch {
+          throw new ApiError(503, "provider_redirect_invalid", "网盘媒体返回了无效的重定向地址");
+        }
+        const isCrossOrigin = nextUrl.origin !== resolvedTarget.url.origin;
+        redirectCount += 1;
+        currentInit = buildRedirectRequestInit(currentInit, isCrossOrigin);
+        currentUrl = nextUrl;
+        continue;
+      }
+
+      const statusCode = response.statusCode ?? 500;
+      if (statusCode === 401) {
+        response.destroy();
+        throw new ApiError(410, "provider_authentication_failed", "网盘凭据未被接受，媒体请求返回 401");
+      }
+      if (statusCode === 403) {
+        response.destroy();
+        throw new ApiError(403, "provider_permission_denied", "网盘文件权限不足，媒体请求返回 403");
+      }
+      if (statusCode === 404) {
+        response.destroy();
+        throw new ApiError(404, "provider_resource_not_found", "网盘媒体文件不存在，可能已经被移动或删除");
+      }
+      if ((statusCode < 200 || statusCode >= 300) && statusCode !== 416) {
+        response.destroy();
+        throw new ApiError(503, "provider_stream_request_failed", `网盘媒体请求失败，状态码 ${statusCode}`);
+      }
+
+      finalBody = response;
+      clearTimeout(timeout);
+      response.once("close", cleanup);
+      return {
+        statusCode,
+        headers: response.headers,
+        body: response,
+        finalUrl: resolvedTarget.url,
+      };
+    }
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+    if (requestController.signal.aborted) {
+      if (connectionTimedOut) {
+        throw new ApiError(503, "provider_connection_timeout", "连接网盘媒体文件超时");
+      }
+      throw new ApiError(499, "provider_stream_aborted", "媒体中转请求已取消");
+    }
+    const errorCode = readNetworkErrorCode(error);
+    options.logConnectionFailure?.({
+      日志关键字: "codex-flycloud-helper-media-stream",
+      事件: "建立Provider媒体流失败",
+      协议: resolvedTarget?.url.protocol ?? "未解析",
+      主机: resolvedTarget?.url.hostname ?? "未解析",
+      端口: resolvedTarget?.url.port || (resolvedTarget?.url.protocol === "https:" ? "443" : "80"),
+      系统错误码: errorCode,
+      已等待毫秒: Date.now() - startedAt,
+    });
+    throw createProviderConnectionError(errorCode, false);
+  } finally {
+    if (!finalBody) cleanup();
   }
 }

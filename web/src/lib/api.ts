@@ -164,6 +164,7 @@ export interface CloudService {
   dataType: MediaType;
   status: ServiceStatus;
   connectionStatus: string;
+  relayPlaybackEnabled: boolean;
   credentialRevision: number;
   scanProfileRevision: number;
   metadataProfileRevision: number;
@@ -210,16 +211,20 @@ export interface ScanJob {
   errorMessage: string | null;
   nextRetryAt: string | null;
   retryCount: number;
+  controlAction: "none" | "pause" | "cancel";
   snapshot: Record<string, unknown>;
   checkpointUpdatedAt: string | null;
   resumeSupported: boolean;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  elapsedMs: number;
   updatedAt: string;
 }
 
 export interface ServiceDetail extends CloudService {
+  /** 光鸭服务当前使用的登录类型；其他 Provider 为 null。 */
+  connectionAuthMode: "official_api" | "web_qr" | "web_sms" | null;
   scanProfile: Record<string, unknown>;
   metadataProfile: Record<string, unknown>;
   credentialConfigured: boolean;
@@ -306,9 +311,10 @@ export interface ProviderDescriptor {
   }>;
 }
 
-/** 光鸭官网扫码登录状态；Token 始终只保存在服务端。 */
+/** 光鸭网页登录状态；手机号、验证码和 Token 始终不会由接口回显。 */
 export interface GuangyaAuthorizationStatus {
   authorizationSessionId: string;
+  authMethod: "qr" | "sms";
   status: "pending" | "authorized" | "expired" | "failed";
   verificationUri: string;
   verificationUriComplete: string;
@@ -316,7 +322,18 @@ export interface GuangyaAuthorizationStatus {
   expiresAt: string;
   intervalSeconds: number;
   accountLabel: string | null;
+  maskedPhone: string | null;
   errorMessage: string | null;
+}
+
+/** 启动短信登录后的服务端结果；光鸭要求交互时先打开官方人机验证页面。 */
+export interface GuangyaSmsAuthorizationStartResult {
+  authorization: GuangyaAuthorizationStatus | null;
+  captcha: {
+    captchaSessionId: string;
+    verificationUri: string;
+    expiresAt: string;
+  } | null;
 }
 
 /** 路径选择器显示并保存的网盘目录。 */
@@ -411,7 +428,7 @@ export async function listProviders(): Promise<ProviderDescriptor[]> {
   return (await requestJson<{ items: ProviderDescriptor[] }>("/api/v1/providers")).items;
 }
 
-/** 启动光鸭官网 Device Code 扫码登录；管理员需要同时绑定目标用户。 */
+/** 启动光鸭网页二维码登录；管理员需要同时绑定目标用户。 */
 export function startGuangyaAuthorization(
   admin = false,
   userId?: string,
@@ -423,6 +440,60 @@ export function startGuangyaAuthorization(
     {
       method: "POST",
       body: JSON.stringify(admin ? { userId } : {}),
+    },
+  );
+}
+
+/** 发送光鸭网页验证码；服务端只返回脱敏手机号和短期会话 ID。 */
+export function startGuangyaSmsAuthorization(
+  phoneNumber: string,
+  captchaRedirectUri: string,
+  admin = false,
+  userId?: string,
+): Promise<GuangyaSmsAuthorizationStartResult> {
+  return requestJson(
+    admin
+      ? "/api/v1/admin/providers/guangya/sms-auth-sessions"
+      : "/api/v1/providers/guangya/sms-auth-sessions",
+    {
+      method: "POST",
+      body: JSON.stringify(admin
+        ? { userId, phoneNumber, captchaRedirectUri }
+        : { phoneNumber, captchaRedirectUri }),
+    },
+  );
+}
+
+/** 提交光鸭官方人机验证回调 Token，并真正发送短信验证码。 */
+export function completeGuangyaSmsCaptcha(
+  captchaSessionId: string,
+  captchaToken: string,
+  admin = false,
+): Promise<GuangyaAuthorizationStatus> {
+  return requestJson(
+    admin
+      ? `/api/v1/admin/providers/guangya/sms-auth-sessions/${captchaSessionId}/captcha`
+      : `/api/v1/providers/guangya/sms-auth-sessions/${captchaSessionId}/captcha`,
+    {
+      method: "POST",
+      body: JSON.stringify({ captchaToken }),
+    },
+  );
+}
+
+/** 提交光鸭网页短信验证码并换取仅服务端可见的连接。 */
+export function verifyGuangyaSmsAuthorization(
+  authorizationSessionId: string,
+  verificationCode: string,
+  admin = false,
+): Promise<GuangyaAuthorizationStatus> {
+  return requestJson(
+    admin
+      ? `/api/v1/admin/providers/guangya/sms-auth-sessions/${authorizationSessionId}/verify`
+      : `/api/v1/providers/guangya/sms-auth-sessions/${authorizationSessionId}/verify`,
+    {
+      method: "POST",
+      body: JSON.stringify({ verificationCode }),
     },
   );
 }
@@ -624,6 +695,21 @@ export async function updateServiceStatus(
   const result = await requestJson<{ service: ServiceDetail }>(
     admin ? `/api/v1/admin/services/${serviceId}/status` : `/api/v1/services/${serviceId}/status`,
     { method: "PATCH", body: JSON.stringify({ status }) },
+  );
+  return result.service;
+}
+
+/** 开启或关闭单个服务的媒体中转播放。 */
+export async function updateServiceRelayPlayback(
+  serviceId: string,
+  relayPlaybackEnabled: boolean,
+  admin = false,
+): Promise<ServiceDetail> {
+  const result = await requestJson<{ service: ServiceDetail }>(
+    admin
+      ? `/api/v1/admin/services/${serviceId}/playback-settings`
+      : `/api/v1/services/${serviceId}/playback-settings`,
+    { method: "PATCH", body: JSON.stringify({ relayPlaybackEnabled }) },
   );
   return result.service;
 }

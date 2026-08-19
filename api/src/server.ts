@@ -15,6 +15,7 @@ import { registerAdminRoutes } from "./routes/admin-routes.js";
 import { registerAuthRoutes } from "./routes/auth-routes.js";
 import { registerCatalogRoutes } from "./routes/catalog-routes.js";
 import { registerGuangyaAuthRoutes } from "./routes/guangya-auth-routes.js";
+import { registerMediaStreamRoutes } from "./routes/media-stream-routes.js";
 import { registerPluginRoutes } from "./routes/plugin-routes.js";
 import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
@@ -268,6 +269,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
         realtimeEvents: true,
         catalogQuery: true,
         catalogExport: true,
+        relayPlayback: true,
       },
     };
   });
@@ -277,6 +279,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerServiceRoutes(server, runtime);
   await registerScanFailureReportRoutes(server, runtime);
   await registerCatalogRoutes(server, runtime);
+  await registerMediaStreamRoutes(server, runtime);
   await registerAdminRoutes(server, runtime);
   await registerPluginRoutes(server, runtime);
 

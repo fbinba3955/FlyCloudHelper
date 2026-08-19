@@ -43,7 +43,12 @@ export function createStableId(prefix: string, ...parts: string[]): string {
 
 /** 提取文件扩展名，不保留句点。 */
 export function getFileExtension(name: string): string {
-  return path.posix.extname(name).slice(1).toLocaleLowerCase("en-US");
+  const value = String(name ?? "").trim();
+  // 光鸭偶尔只返回“.mkv”作为文件名，此时仍应按视频处理并由父目录提供标题。
+  if (/^\.[A-Za-z0-9]{2,8}$/u.test(value)) {
+    return value.slice(1).toLocaleLowerCase("en-US");
+  }
+  return path.posix.extname(value).slice(1).toLocaleLowerCase("en-US");
 }
 
 /** 清理发布组、分辨率和年份标记，保留可用于刮削的可读标题。 */
@@ -134,6 +139,16 @@ function describeVideo(
         sourcePath: entry.path,
         scrapeTaskKey,
         query: parsed.query,
+        fallbackQuery: parsed.fallbackQuery,
+        recognitionReason: parsed.recognitionReason,
+        blockedFalseEpisode: parsed.blockedFalseEpisode,
+        usedParentTitleFallback: parsed.usedParentTitleFallback,
+        seriesYearCorrected: parsed.seriesYearCorrected,
+        overrodeMovieCategoryWithEpisodes: parsed.overrodeMovieCategoryWithEpisodes,
+        recoveredNumericMovieTitle: parsed.recoveredNumericMovieTitle,
+        overrodeTvCategoryWithMovieVariants: parsed.overrodeTvCategoryWithMovieVariants,
+        movieDirectoryYearCorrected: parsed.movieDirectoryYearCorrected,
+        confirmedNumericSeriesTitle: parsed.confirmedNumericSeriesTitle,
         imdbId: parsed.imdbId,
         explicitTmdbId: parsed.tmdbId,
         resolution: parsed.resolution,
@@ -163,6 +178,16 @@ function describeVideo(
       sourcePath: entry.path,
       scrapeTaskKey,
       query: parsed.query,
+      fallbackQuery: parsed.fallbackQuery,
+      recognitionReason: parsed.recognitionReason,
+      blockedFalseEpisode: parsed.blockedFalseEpisode,
+      usedParentTitleFallback: parsed.usedParentTitleFallback,
+      seriesYearCorrected: parsed.seriesYearCorrected,
+      overrodeMovieCategoryWithEpisodes: parsed.overrodeMovieCategoryWithEpisodes,
+      recoveredNumericMovieTitle: parsed.recoveredNumericMovieTitle,
+      overrodeTvCategoryWithMovieVariants: parsed.overrodeTvCategoryWithMovieVariants,
+      movieDirectoryYearCorrected: parsed.movieDirectoryYearCorrected,
+      confirmedNumericSeriesTitle: parsed.confirmedNumericSeriesTitle,
       seriesTitle: parsed.title,
       seasonNumber: season,
       episodeNumber: episode,

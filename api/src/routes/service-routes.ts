@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import type { JobStatus, MediaType, ServiceStatus } from "../domain.js";
+import type { JobStatus, MediaType, ServiceDetailRecord, ServiceStatus } from "../domain.js";
 import { ApiError, validationError } from "../errors.js";
 import {
   readPagination,
@@ -35,9 +35,50 @@ export function hasHttpProviderAddress(connection: Record<string, unknown>): boo
   return Object.values(connection).some((value) => typeof value === "string" && /^http:\/\//iu.test(value.trim()));
 }
 
+/** 从 APP 同步请求中读取光鸭官方 API 字段，并兼容 APP 当前运行时字段名称。 */
+function readGuangyaOfficialApiText(
+  connectionInput: Record<string, unknown>,
+  names: string[],
+  label: string,
+  required = true,
+  maximumLength = 10_000,
+): string {
+  for (const name of names) {
+    const value = connectionInput[name];
+    if (typeof value === "string" && value.trim()) {
+      const text = value.trim();
+      if ([...text].length > maximumLength || text.includes("\0")) {
+        throw validationError(names[0] ?? "connection", `${label}格式无效`);
+      }
+      return text;
+    }
+  }
+  if (required) throw validationError(names[0] ?? "connection", `${label}不能为空`);
+  return "";
+}
+
+/** 将 Flymby APP 提交的光鸭官方 API 连接裁剪为允许加密保存的固定字段。 */
+function resolveGuangyaOfficialApiConnection(connectionInput: Record<string, unknown>): Record<string, unknown> {
+  const rawExpiresAt = Number(connectionInput.expiresAt ?? connectionInput.guangyaTokenExpiresAt ?? 0);
+  return {
+    authMode: "official_api",
+    clientId: readGuangyaOfficialApiText(connectionInput, ["clientId", "guangyaClientId"], "光鸭官方 API clientId", true, 200),
+    projectId: readGuangyaOfficialApiText(connectionInput, ["projectId", "guangyaProjectId"], "光鸭官方 API projectId", true, 200),
+    signSecret: readGuangyaOfficialApiText(connectionInput, ["signSecret", "guangyaSignSecret"], "光鸭官方 API signSecret", true, 1_000),
+    deviceId: readGuangyaOfficialApiText(connectionInput, ["deviceId", "guangyaDeviceId"], "光鸭官方 API deviceId", true, 200),
+    accessToken: readGuangyaOfficialApiText(connectionInput, ["accessToken", "guangyaAccessToken"], "光鸭官方 API accessToken", false),
+    refreshToken: readGuangyaOfficialApiText(connectionInput, ["refreshToken", "guangyaRefreshToken"], "光鸭官方 API refreshToken"),
+    tokenType: readGuangyaOfficialApiText(connectionInput, ["tokenType", "guangyaTokenType"], "光鸭官方 API tokenType", false, 100) || "Bearer",
+    expiresAt: Number.isFinite(rawExpiresAt) && rawExpiresAt > 0
+      ? rawExpiresAt < 1_000_000_000_000 ? rawExpiresAt * 1_000 : rawExpiresAt
+      : 0,
+    userId: readGuangyaOfficialApiText(connectionInput, ["userId", "guangyaUserId"], "光鸭账号 ID", false, 500),
+  };
+}
+
 /**
- * 将光鸭一次性授权会话解析成服务端 Token 连接；其他 Provider 保持普通表单连接。
- * 返回的授权会话 ID 仅在连接成功落库后消费，验证失败时允许用户直接重试。
+ * 将光鸭网页一次性授权会话或 APP 官方 API 同步数据解析成服务端连接。
+ * 返回的网页授权会话 ID 仅在连接成功落库后消费，验证失败时允许用户直接重试。
  */
 export function resolveProviderConnection(
   runtime: ApiRuntime,
@@ -47,10 +88,13 @@ export function resolveProviderConnection(
   connectionInput: Record<string, unknown>,
 ): { connection: Record<string, unknown>; authorizationSessionId: string | null } {
   if (providerType !== "guangya") return { connection: connectionInput, authorizationSessionId: null };
+  if (connectionInput.authMode === "official_api") {
+    return { connection: resolveGuangyaOfficialApiConnection(connectionInput), authorizationSessionId: null };
+  }
   const authorizationSessionId = requireString(
     connectionInput,
     "authorizationSessionId",
-    "光鸭扫码登录会话 ID",
+    "光鸭网页登录会话 ID",
     100,
   );
   return {
@@ -72,6 +116,21 @@ export function consumeProviderAuthorization(
   if (authorizationSessionId) {
     runtime.providers.guangyaAuthorization.consume(actorUserId, authorizationSessionId);
   }
+}
+
+/** 为服务详情追加不含任何凭据的光鸭登录类型。 */
+export async function attachConnectionAuthMode(
+  runtime: ApiRuntime,
+  service: ServiceDetailRecord,
+): Promise<ServiceDetailRecord & { connectionAuthMode: "official_api" | "web_qr" | "web_sms" | null }> {
+  if (service.providerType !== "guangya") return { ...service, connectionAuthMode: null };
+  const encryptedConnection = await runtime.repository.getActiveEncryptedConnection(service.id, service.userId);
+  const connection = runtime.vault.decrypt(encryptedConnection);
+  const rawAuthMode = typeof connection.authMode === "string" ? connection.authMode.trim() : "";
+  const connectionAuthMode = rawAuthMode === "official_api" || rawAuthMode === "web_sms"
+    ? rawAuthMode
+    : "web_qr";
+  return { ...service, connectionAuthMode };
 }
 
 /** 校验单个扫描根并移除未声明字段。 */
@@ -416,6 +475,14 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       数据类型: dataType,
       自动创建扫描任务: false,
     });
+    if (providerType === "guangya" && connection.authMode === "official_api") {
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-helper-guangya-official-api",
+        事件: "用户从APP同步光鸭官方API连接并创建服务",
+        用户ID: user.id,
+        服务ID: service.id,
+      });
+    }
     if (hasHttpProviderAddress(connection)) {
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-provider-http",
@@ -430,7 +497,8 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
 
   server.get<{ Params: { serviceId: string } }>("/api/v1/services/:serviceId", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    return { service: await runtime.repository.getServiceDetail(request.params.serviceId, user.id) };
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+    return { service: await attachConnectionAuthMode(runtime, service) };
   });
 
   server.get<{ Params: { serviceId: string }; Querystring: Record<string, unknown> }>("/api/v1/services/:serviceId/directories", async (request) => {
@@ -516,6 +584,14 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
     });
     consumeProviderAuthorization(runtime, user.id, resolvedConnection.authorizationSessionId);
+    if (service.providerType === "guangya" && connection.authMode === "official_api") {
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-helper-guangya-official-api",
+        事件: "用户从APP同步光鸭官方API连接并更新服务",
+        用户ID: user.id,
+        服务ID: service.id,
+      });
+    }
     if (hasHttpProviderAddress(connection)) {
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-provider-http",
@@ -637,6 +713,31 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     return { service: updatedService };
   });
 
+  server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/playback-settings", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    if (typeof request.body.relayPlaybackEnabled !== "boolean") {
+      throw validationError("relayPlaybackEnabled", "中转播放开关必须是布尔值");
+    }
+    const currentService = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+    if (request.body.relayPlaybackEnabled
+      && !runtime.providers.get(currentService.providerType).descriptor.capabilities.includes("relayPlayback")) {
+      throw new ApiError(422, "provider_relay_playback_unsupported", "当前网盘类型暂不支持中转播放");
+    }
+    const service = await runtime.repository.updateRelayPlaybackEnabled(
+      request.params.serviceId,
+      user.id,
+      request.body.relayPlaybackEnabled,
+    );
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-relay-playback-setting",
+      事件: "用户更新服务中转播放开关",
+      用户ID: user.id,
+      服务ID: service.id,
+      是否启用中转播放: service.relayPlaybackEnabled,
+    });
+    return { service };
+  });
+
   server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/status", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const status = request.body.status;
@@ -657,6 +758,13 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.delete<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/catalog", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, request.params.serviceId);
+    const clearStartedAtMs = Date.now();
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-catalog-clear",
+      事件: "用户开始清空服务媒体库",
+      用户ID: user.id,
+      服务ID: request.params.serviceId,
+    });
     const cleared = await runtime.repository.clearServiceCatalog(request.params.serviceId, user.id);
     await runtime.database.addAudit({
       id: randomUUID(),
@@ -675,6 +783,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       服务ID: request.params.serviceId,
       清空媒体条目数: cleared.mediaItemCount,
       清空源文件数: cleared.sourceFileCount,
+      清空耗时毫秒: Date.now() - clearStartedAtMs,
     });
     return cleared;
   });
@@ -736,12 +845,14 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     server.post<{ Params: { jobId: string } }>(`/api/v1/scan-jobs/:jobId/${action}`, async (request) => {
       const user = await requireRequestUser(request, runtime.database);
       const job = await runtime.repository.requestJobControl(request.params.jobId, user.id, action);
+      const interrupted = runtime.worker.interruptJobControl(job.id, action);
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-job-control",
         事件: action === "cancel" ? "用户终止扫描任务" : "用户暂停扫描任务",
         用户ID: user.id,
         任务ID: job.id,
         控制动作: action,
+        是否中断运行请求: interrupted,
       });
       return { job };
     });

@@ -409,6 +409,31 @@ export class ScanWorker {
     };
   }
 
+  /**
+   * 收到暂停或终止请求后立即打断当前任务的 Provider、TMDB 和插件网络请求。
+   * 数据库控制动作已经由路由先行写入，Worker 退出当前窗口后据此落为暂停或已取消状态。
+   */
+  public interruptJobControl(jobId: string, action: "pause" | "cancel"): boolean {
+    const controller = this.abortControllers.get(jobId); // 关键变量：当前进程正在执行该任务的取消控制器。
+    if (!controller || controller.signal.aborted) {
+      this.logger.info({
+        日志关键字: "codex-scan-control-resume",
+        事件: "任务控制未命中运行中的Worker",
+        任务ID: jobId,
+        控制动作: action,
+      });
+      return false;
+    }
+    controller.abort();
+    this.logger.info({
+      日志关键字: "codex-scan-control-resume",
+      事件: "任务控制已中断运行请求",
+      任务ID: jobId,
+      控制动作: action,
+    });
+    return true;
+  }
+
   /** 安排下一次队列轮询。 */
   private schedulePoll(delay: number): void {
     this.pollTimer = setTimeout(() => {
@@ -463,6 +488,10 @@ export class ScanWorker {
     try {
       await this.scan(job, controller.signal);
     } catch (error) {
+      if (controller.signal.aborted) {
+        await this.applyAbortedJobState(job, "任务执行异常出口");
+        return;
+      }
       if (isTmdbTemporarilyUnavailableError(error)) {
         await this.failureReports.record(job, {
           stage: "scraping",
@@ -512,6 +541,7 @@ export class ScanWorker {
       });
     } finally {
       this.abortControllers.delete(job.id);
+      this.failureReports.release(job.id);
     }
   }
 
@@ -568,6 +598,8 @@ export class ScanWorker {
     const generationId = checkpoint.generationId;
     let enumeratedEntryCount = savedProgress.enumeratedEntryCount;
     let scannedMediaCount = savedProgress.scannedMediaCount;
+    // 关键变量：安全检查点可能落后于暂停前页面进度；重放窗口期间页面仍保留已展示过的扫描数量。
+    const visibleScannedMediaHighWater = Math.max(savedProgress.scannedMediaCount, job.discoveredCount);
     let skippedCount = savedProgress.skippedCount;
     const providerWarningKeys = new Set(savedProgress.providerWarningKeys);
     let currentScanPath: string | null = savedProgress.currentScanPath;
@@ -634,7 +666,7 @@ export class ScanWorker {
         stage,
         processedCount: getHandledBusinessTaskCount(businessProgress),
         totalCount: businessProgress.taskKeys.size,
-        discoveredCount: scannedMediaCount,
+        discoveredCount: Math.max(scannedMediaCount, visibleScannedMediaHighWater),
         skippedCount,
         matchedCount: businessProgress.matchedKeys.size,
         unmatchedCount: businessProgress.unmatchedKeys.size,
@@ -675,6 +707,7 @@ export class ScanWorker {
       扫描代次ID: generationId,
       Provider游标序号: restoredCheckpointSequence,
       恢复扫描视频数量: scannedMediaCount,
+      页面保留扫描视频数量: visibleScannedMediaHighWater,
       恢复处理影片数量: getHandledBusinessTaskCount(businessProgress),
     });
 
@@ -706,7 +739,7 @@ export class ScanWorker {
       let matched = false;
       let providerUnavailableFileCount = 0;
       for (const item of taskItems) {
-        if (tmdbRecoveryError) break;
+        if (tmdbRecoveryError || signal.aborted) break;
         const { candidate, descriptor } = item;
         if (!candidate.sourceFile) {
           const preparationError = candidate.preparationError ?? new Error("源文件记录未准备完成");
@@ -742,6 +775,7 @@ export class ScanWorker {
             forceCatalogChange: isRetryJob,
             signal,
           });
+          if (signal.aborted) break;
           successfulFileCount += 1;
           matched = matched || mediaResult.matched;
           if (mediaResult.providerUnavailable) providerUnavailableFileCount += 1;
@@ -767,6 +801,7 @@ export class ScanWorker {
             });
           }
         } catch (error) {
+          if (signal.aborted) break;
           if (rememberTmdbRecoveryError(error)) {
             const recoveryError = error as TmdbTemporarilyUnavailableError;
             this.logger.warn({
@@ -794,7 +829,7 @@ export class ScanWorker {
         }
       }
       // 当前窗口将从上一安全检查点重放，因此临时失败任务不写入成功、未匹配或错误统计。
-      if (tmdbRecoveryError) return;
+      if (tmdbRecoveryError || signal.aborted) return;
       if (successfulFileCount > 0 && (matched || providerUnavailableFileCount < successfulFileCount)) {
         recordBusinessTaskSuccess(businessProgress, businessTaskKey, matched);
       } else {
@@ -905,6 +940,33 @@ export class ScanWorker {
         firstItem.rootTypes,
         firstItem.rootPath,
       );
+      const videoFileNames = directoryItems.map((item) => item.entry.name);
+      const explicitEpisodeFileCount = videoFileNames.filter((fileName) =>
+        /(?:s\s*\d{1,2}\s*e\s*\d{1,4}|第\s*[0-9一二三四五六七八九十两]{1,4}\s*集)/iu.test(fileName),
+      ).length;
+      const dateEpisodeFileCount = videoFileNames.filter((fileName) =>
+        /(?:^|\D)(?:19|20)\d{2}[01]\d[0-3]\d(?:\D|$)/u.test(fileName),
+      ).length;
+      const recognizedEpisodeCount = [...descriptors.values()].filter((descriptor) =>
+        descriptor.itemType === "video.episode",
+      ).length;
+      const directoryName = path.posix.basename(String(flushedDirectoryKey ?? ""));
+      const movieTextConflictCorrected = /(?:影片|电影)/u.test(directoryName)
+        && explicitEpisodeFileCount > 0
+        && recognizedEpisodeCount > 0;
+      const dateEpisodeRuleApplied = dateEpisodeFileCount >= 2 && recognizedEpisodeCount >= 2;
+      if (movieTextConflictCorrected || dateEpisodeRuleApplied) {
+        this.logger.info({
+          日志关键字: "codex-video-recognition-optimize",
+          事件: "目录节目判型优化规则生效",
+          任务ID: job.id,
+          目录标识: flushedDirectoryKey,
+          识别依据: movieTextConflictCorrected ? "显式季集标记优先" : "八位播出日期序列",
+          显式季集文件数量: explicitEpisodeFileCount,
+          日期节目文件数量: dateEpisodeFileCount,
+          已识别节目文件数量: recognizedEpisodeCount,
+        });
+      }
       const directoryTasks = new Map<string, PendingBusinessMedia[]>();
       for (const candidate of directoryItems) {
         if (!candidate.shouldProcess) continue;
@@ -1020,25 +1082,26 @@ export class ScanWorker {
         });
     };
 
-    for await (const entry of adapter.enumerate(connection, roots, signal, (warning) => {
-      providerWarningKeys.add(`${warning.code}\u0000${warning.path}`);
-      void recordScanFailure({
-        stage: "enumerating",
-        errorCode: warning.code,
-        error: new Error(warning.message),
-        recovered: true,
-        mediaPath: warning.path,
-        context: { 处理结果: "已跳过异常子目录并继续扫描" },
-      });
-      this.logger.warn({
-        日志关键字: "codex-flycloud-helper-provider-request",
-        事件: "扫描任务跳过异常子目录",
-        任务ID: job.id,
-        目录路径: warning.path,
-        错误码: warning.code,
-        错误信息: warning.message,
-      });
-    }, {
+    try {
+      for await (const entry of adapter.enumerate(connection, roots, signal, (warning) => {
+        providerWarningKeys.add(`${warning.code}\u0000${warning.path}`);
+        void recordScanFailure({
+          stage: "enumerating",
+          errorCode: warning.code,
+          error: new Error(warning.message),
+          recovered: true,
+          mediaPath: warning.path,
+          context: { 处理结果: "已跳过异常子目录并继续扫描" },
+        });
+        this.logger.warn({
+          日志关键字: "codex-flycloud-helper-provider-request",
+          事件: "扫描任务跳过异常子目录",
+          任务ID: job.id,
+          目录路径: warning.path,
+          错误码: warning.code,
+          错误信息: warning.message,
+        });
+      }, {
       directoryConcurrency: effectiveScanDirectoryConcurrency,
       resumeState: checkpoint.providerState,
       checkpointDirectoryInterval: 50,
@@ -1086,12 +1149,25 @@ export class ScanWorker {
           目录警告数量: state.warningCount,
         });
       },
-    })) {
+      })) {
       await scheduleCheckpointCandidate();
       throwCheckpointCommitError();
       await throwTmdbRecoveryAfterDraining();
       const requestedControl = await this.repository.getJobControl(job.id);
       if (requestedControl !== "none") {
+        if (signal.aborted) {
+          await Promise.allSettled([...pendingBusinessTasks]);
+          await checkpointCommitChain;
+          await this.applyAbortedJobState(job, "枚举条目控制检查点");
+          this.logger.info({
+            日志关键字: "codex-scan-control-resume",
+            事件: requestedControl === "pause" ? "任务已快速暂停" : "任务已快速终止",
+            任务ID: job.id,
+            保留检查点: requestedControl === "pause",
+            Provider游标序号: savedCheckpointSequence,
+          });
+          return;
+        }
         // 当前窗口不覆盖上一安全检查点；恢复时重放该窗口，避免进度和游标跨时刻造成漏扫。
         await flushActiveDirectory();
         await Promise.all([...pendingBusinessTasks]);
@@ -1142,6 +1218,7 @@ export class ScanWorker {
               NFO类型: nfoSidecars.get(nfoPath)?.metadata.rootType ?? "unknown",
             });
           } catch (error) {
+            if (signal.aborted) throw error;
             await recordScanFailure({
               stage: "scraping",
               errorCode: readFailureCode(error, "nfo_read_failed"),
@@ -1216,15 +1293,25 @@ export class ScanWorker {
       if (shouldPublishProgress()) {
         await publishProgress("enumerating");
       }
+      }
+    } catch (error) {
+      if (!signal.aborted) throw error;
+      this.logger.info({
+        日志关键字: "codex-scan-control-resume",
+        事件: "任务控制已打断Provider枚举",
+        任务ID: job.id,
+        错误信息: error instanceof Error ? error.message : "Provider请求已中断",
+      });
     }
 
     if (signal.aborted) {
-      // 进程关闭时保留 running 状态和最近安全检查点；下次启动由 recoverInterruptedJobs 重新入队。
+      // 人工控制落为暂停/取消；进程关闭没有控制动作时保留 running，重启后重新入队。
       await Promise.allSettled([...pendingBusinessTasks]);
       await checkpointCommitChain;
+      await this.applyAbortedJobState(job, "Provider枚举出口");
       this.logger.info({
-        日志关键字: "codex-flycloud-helper-checkpoint",
-        事件: "Worker停止后保留扫描检查点",
+        日志关键字: "codex-scan-control-resume",
+        事件: "任务控制后保留扫描检查点",
         任务ID: job.id,
         扫描会话ID: checkpoint.scanSessionId,
         Provider游标序号: savedCheckpointSequence,
@@ -1263,9 +1350,10 @@ export class ScanWorker {
     await publishProgress("scraping");
 
     if (signal.aborted) {
+      await this.applyAbortedJobState(job, "刮削队列出口");
       this.logger.info({
-        日志关键字: "codex-flycloud-helper-checkpoint",
-        事件: "刮削阶段停止后保留扫描检查点",
+        日志关键字: "codex-scan-control-resume",
+        事件: "刮削阶段任务控制后保留扫描检查点",
         任务ID: job.id,
         扫描会话ID: checkpoint.scanSessionId,
         Provider游标序号: savedCheckpointSequence,
@@ -1274,6 +1362,10 @@ export class ScanWorker {
     }
 
     await publishProgress("persisting");
+    if (signal.aborted) {
+      await this.applyAbortedJobState(job, "持久化开始前");
+      return;
+    }
     this.logger.info({
       日志关键字: "codex-flycloud-helper-catalog-batch",
       事件: "准备分批写入目录变化",
@@ -1306,6 +1398,10 @@ export class ScanWorker {
         && removedRootPolicy === "delete_missing"
         && completedRootRuns.length > 0,
     });
+    if (signal.aborted) {
+      await this.applyAbortedJobState(job, "目录对账前");
+      return;
+    }
     await this.repository.finalizeGeneration({
       userId: job.userId,
       serviceId: job.serviceId,
@@ -1322,6 +1418,10 @@ export class ScanWorker {
       allowDestructiveCleanup,
       changedItemIds: [...changedItemIds],
     });
+    if (signal.aborted) {
+      await this.applyAbortedJobState(job, "任务完成前");
+      return;
+    }
     await this.repository.finishJob(job.id, { status: "completed" });
     this.logger.info({
       日志关键字: "codex-flycloud-helper-task-count",
@@ -1488,6 +1588,23 @@ export class ScanWorker {
       return true;
     }
     return false;
+  }
+
+  /** AbortSignal 生效后把数据库控制动作落为终态；进程关闭没有控制动作时继续保留 running 供重启恢复。 */
+  private async applyAbortedJobState(job: ScanJobRecord, boundary: string): Promise<void> {
+    const action = await this.repository.getJobControl(job.id); // 关键变量：区分人工控制和进程整体停止。
+    if (action === "pause") {
+      await this.repository.finishJob(job.id, { status: "paused" });
+    } else if (action === "cancel") {
+      await this.repository.finishJob(job.id, { status: "cancelled" });
+    }
+    this.logger.info({
+      日志关键字: "codex-scan-control-resume",
+      事件: action === "none" ? "Worker停止并保留任务" : "任务控制状态已生效",
+      任务ID: job.id,
+      控制动作: action,
+      退出边界: boundary,
+    });
   }
 
   /** 根据媒体 Profile 调用 TMDB 或 MusicBrainz，并保留本地识别结果作为降级。 */
@@ -1688,6 +1805,10 @@ export class ScanWorker {
     const mediaType = descriptor.itemType === "video.episode" ? "tv" : "movie";
     const query = String(descriptor.metadata.query ?? descriptor.parent?.title ?? descriptor.title).trim();
     if (!query) return null;
+    // 关键变量：仅在目录查询无候选时交给 TMDB 客户端执行一次的文件名回退查询。
+    const rawFallbackQuery = String(descriptor.metadata.fallbackQuery ?? "").trim();
+    const fallbackQuery = FlymbyVideoTitleCleaner.normalizeSearchText(rawFallbackQuery)
+      === FlymbyVideoTitleCleaner.normalizeSearchText(query) ? "" : rawFallbackQuery;
     const language = String(profile.language ?? "zh-CN");
     const region = String(profile.region ?? "CN");
     const imdbId = typeof descriptor.metadata.imdbId === "string" ? descriptor.metadata.imdbId : "";
@@ -1695,14 +1816,9 @@ export class ScanWorker {
     const temporaryError = this.tmdb.getTemporaryUnavailableError();
     if (temporaryError) throw temporaryError;
     if (this.tmdb.getStatus().healthyCount <= 0) return null;
-    if (explicitTmdbId <= 0 && !imdbId && isWeakFlymbyScrapeTitle(query)) {
-      this.logger.warn({
-        日志关键字: "codex-flycloud-helper-match-guard",
-        事件: "跳过弱标题自动匹配",
-        任务ID: jobId,
-        媒体类型: mediaType === "tv" ? "节目" : "电影",
-        查询标题: query,
-      });
+    const confirmedNumericSeriesTitle = Boolean(descriptor.metadata.confirmedNumericSeriesTitle);
+    if (explicitTmdbId <= 0 && !imdbId &&
+      !confirmedNumericSeriesTitle && isWeakFlymbyScrapeTitle(query)) {
       return null;
     }
     const cacheKey = `${mediaType}|${String(descriptor.metadata.scrapeTaskKey ?? query)}|${language}|${region}`;
@@ -1722,6 +1838,7 @@ export class ScanWorker {
       videoPromise = this.tmdb.scrapeVideo({
         mediaType,
         title: query,
+        fallbackTitle: fallbackQuery,
         year: descriptor.year,
         language,
         region,
@@ -1746,6 +1863,7 @@ export class ScanWorker {
       }
       return null;
     }
+    this.applyTmdbMediaTypeCorrection(descriptor, result, jobId);
     if (isFirstTaskQuery) {
       this.logger.info({
         日志关键字: "codex-flycloud-helper-scrape",
@@ -1760,7 +1878,7 @@ export class ScanWorker {
     }
 
     const parentMetadata = this.mapTmdbVideoMetadata(result, descriptor.parent?.subtitle ?? descriptor.subtitle);
-    if (mediaType === "movie") return parentMetadata;
+    if (result.mediaType === "movie") return parentMetadata;
     const seasonNumber = Math.max(0, Number(descriptor.metadata.seasonNumber ?? 1));
     const episodeNumber = Math.max(1, Number(descriptor.metadata.episodeNumber ?? 1));
     const seasonKey = `${result.id}|${seasonNumber}|${language}`;
@@ -1811,6 +1929,64 @@ export class ScanWorker {
       },
       parent: parentMetadata,
     };
+  }
+
+  /**
+   * 显式 TMDB ID 命中另一种媒体类型时，同步改写目录模型，避免只换详情但仍按错误类型落库。
+   */
+  private applyTmdbMediaTypeCorrection(
+    descriptor: MediaDescriptor,
+    result: TmdbVideoMetadata,
+    jobId: string,
+  ): void {
+    const originalType = descriptor.itemType === "video.episode" ? "tv" : "movie";
+    if (originalType === result.mediaType) return;
+    const originalTaskKey = String(descriptor.metadata.scrapeTaskKey ?? descriptor.identityKey);
+    const correctedTaskKey = originalTaskKey.replace(/^(?:movie|tv)\|/u, `${result.mediaType}|`);
+    descriptor.metadata.scrapeTaskKey = correctedTaskKey;
+    if (result.mediaType === "tv") {
+      const seasonNumber = originalType === "tv"
+        ? Math.max(0, Number(descriptor.metadata.seasonNumber ?? 1))
+        : 1;
+      const episodeNumber = Math.max(1, Number(descriptor.metadata.episodeNumber ?? 1));
+      descriptor.itemType = "video.episode";
+      descriptor.title = `第 ${seasonNumber} 季 · 第 ${episodeNumber} 集`;
+      descriptor.sortTitle = `${String(seasonNumber).padStart(3, "0")}-${String(episodeNumber).padStart(5, "0")}`;
+      descriptor.subtitle = result.title;
+      descriptor.metadata.seriesTitle = result.title;
+      descriptor.metadata.seasonNumber = seasonNumber;
+      descriptor.metadata.episodeNumber = episodeNumber;
+      descriptor.metadata.episodeNumbers = [episodeNumber];
+      descriptor.parent = {
+        identityKey: `video:series:${correctedTaskKey}`,
+        itemType: "video.series",
+        title: result.title,
+        subtitle: "剧集",
+        year: result.year ?? descriptor.year,
+        sortOrder: seasonNumber * 100_000 + episodeNumber,
+        relationType: "series_episode",
+      };
+    } else {
+      descriptor.itemType = "video.movie";
+      descriptor.title = result.title;
+      descriptor.sortTitle = result.title;
+      descriptor.subtitle = result.year ? String(result.year) : "电影";
+      descriptor.metadata.seasonNumber = 0;
+      descriptor.metadata.episodeNumber = 0;
+      descriptor.metadata.episodeNumbers = [];
+      delete descriptor.parent;
+    }
+    descriptor.year = result.year ?? descriptor.year;
+    this.logger.info({
+      日志关键字: "codex-video-recognition-optimize",
+      事件: "影片目录类型已按显式TMDB编号纠正",
+      任务ID: jobId,
+      原媒体类型: originalType === "tv" ? "节目" : "电影",
+      纠正后媒体类型: result.mediaType === "tv" ? "节目" : "电影",
+      TMDB编号: result.id,
+      原影片任务标识: originalTaskKey,
+      新影片任务标识: correctedTaskKey,
+    });
   }
 
   /** 把 TMDB 详情转换为媒体目录统一字段。 */
