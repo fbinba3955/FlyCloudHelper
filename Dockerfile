@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1
+# check=skip=SecretsUsedInArgOrEnv
 
 # 编译阶段固定使用构建主机架构，避免在跨架构仿真中运行 esbuild。
 FROM --platform=$BUILDPLATFORM node:20-bookworm-slim AS build
@@ -26,11 +27,20 @@ RUN npm ci --omit=dev
 
 FROM node:20-bookworm-slim AS runtime
 
+# 这里只声明容器管理界面需要展示的变量名和安全默认值；真实密码必须在运行容器时注入。
 ENV NODE_ENV=production \
     FLYCLOUDHELPER_API_HOST=0.0.0.0 \
     FLYCLOUDHELPER_API_PORT=9934 \
     FLYCLOUDHELPER_DATABASE_TYPE=sqlite \
+    FLYCLOUDHELPER_DATABASE_HOST= \
+    FLYCLOUDHELPER_DATABASE_PORT= \
+    FLYCLOUDHELPER_DATABASE_NAME= \
+    FLYCLOUDHELPER_DATABASE_USER= \
+    FLYCLOUDHELPER_DATABASE_PASSWORD= \
+    FLYCLOUDHELPER_DATABASE_AUTO_CREATE=true \
     FLYCLOUDHELPER_SQLITE_PATH=/data/database/flycloud-helper.db \
+    FLYCLOUDHELPER_COOKIE_SECURE=false \
+    FLYCLOUDHELPER_ALLOW_INSECURE_HTTP=true \
     FLYCLOUDHELPER_GENERATED_CREDENTIAL_KEY_PATH=/data/secrets/credential-master-key \
     FLYCLOUDHELPER_PLUGIN_DIR=/data/plugins \
     FLYCLOUDHELPER_EXPORT_DIR=/data/exports \

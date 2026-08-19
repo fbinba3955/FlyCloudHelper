@@ -94,6 +94,12 @@ export interface ScanCheckpointProgress {
   seriesTaskKeys: string[];
 }
 
+/** 批量准备源文件后返回的稳定记录及变化判断。 */
+export interface PreparedSourceFileRecord {
+  sourceFile: SourceFileRecord;
+  unchanged: boolean;
+}
+
 /** 单个扫描任务的安全检查点；不包含任何 Provider 连接凭据。 */
 export interface ScanJobCheckpointRecord {
   jobId: string;
@@ -587,6 +593,29 @@ export class ServiceRepository {
     }).first();
     if (!credential) throw new ApiError(410, "service_credential_unavailable", "服务当前凭据不可用");
     return String(credential.encrypted_payload);
+  }
+
+  /**
+   * 原地更新当前活动凭据中的 OAuth Token，不增加用户可见的连接修订。
+   * 扫描任务仍冻结同一凭据修订，但后续任务可以读取刷新令牌轮换后的最新密文。
+   */
+  public async refreshActiveEncryptedConnection(input: {
+    serviceId: string;
+    userId: string;
+    credentialRevision: number;
+    encryptedConnection: string;
+  }): Promise<void> {
+    const updatedCount = await this.database.query("service_credentials")
+      .where({
+        service_id: input.serviceId,
+        user_id: input.userId,
+        revision: input.credentialRevision,
+        status: "active",
+      })
+      .update({ encrypted_payload: input.encryptedConnection });
+    if (updatedCount !== 1) {
+      throw new ApiError(410, "service_credential_unavailable", "OAuth Token 刷新后无法更新当前服务凭据");
+    }
   }
 
   /** 更新服务连接并生成不可变凭据修订。 */
@@ -1524,6 +1553,101 @@ export class ServiceRepository {
       updated_at: new Date().toISOString(),
     });
     return { ...input, id: String(row.id) };
+  }
+
+  /**
+   * 按目录批量查询并写入扫描发现的源文件。
+   * 一次目录只执行分批 SELECT 与 UPSERT，避免每个视频产生多次 PostgreSQL 往返。
+   */
+  public async prepareSourceFiles(inputs: SourceFileRecord[]): Promise<PreparedSourceFileRecord[]> {
+    if (inputs.length === 0) return [];
+    const firstInput = inputs[0]!;
+    if (inputs.some((input) => input.userId !== firstInput.userId || input.libraryId !== firstInput.libraryId)) {
+      throw new Error("批量准备源文件时混入了不同用户或媒体库");
+    }
+
+    // 关键变量：同一目录偶尔可能返回重复资源，只允许一条记录参与批量 Upsert。
+    const uniqueInputs = [...new Map(inputs.map((input) => [input.providerResourceId, input])).values()];
+    return this.database.query.transaction(async (transaction) => {
+      const existingRows: Record<string, unknown>[] = [];
+      for (const resourceIdBatch of chunkStrings(uniqueInputs.map((input) => input.providerResourceId), 200)) {
+        const rows = await transaction("source_files")
+          .where({ user_id: firstInput.userId, library_id: firstInput.libraryId })
+          .whereIn("provider_resource_id", resourceIdBatch);
+        existingRows.push(...rows as Record<string, unknown>[]);
+      }
+      const existingByResourceId = new Map(existingRows.map((row) => [String(row.provider_resource_id), row]));
+      const unchangedByResourceId = new Map<string, boolean>();
+      const now = new Date().toISOString();
+
+      for (const input of uniqueInputs) {
+        const existing = existingByResourceId.get(input.providerResourceId);
+        const locatorJson = JSON.stringify(input.locator);
+        unchangedByResourceId.set(input.providerResourceId, Boolean(existing)
+          && existing!.status === "active"
+          && String(existing!.scan_root_key ?? "") === input.scanRootKey
+          && String(existing!.parent_resource_id ?? "") === String(input.parentResourceId ?? "")
+          && String(existing!.path) === input.path
+          && String(existing!.name) === input.name
+          && Number(existing!.size) === input.size
+          && String(existing!.modified_at ?? "") === String(input.modifiedAt ?? "")
+          && String(existing!.etag ?? "") === String(input.etag ?? "")
+          && String(existing!.locator_json) === locatorJson);
+      }
+
+      for (let index = 0; index < uniqueInputs.length; index += 200) {
+        const inputBatch = uniqueInputs.slice(index, index + 200);
+        await transaction("source_files")
+          .insert(inputBatch.map((input) => ({
+            id: existingByResourceId.has(input.providerResourceId)
+              ? String(existingByResourceId.get(input.providerResourceId)!.id)
+              : input.id,
+            user_id: input.userId,
+            service_id: input.serviceId,
+            library_id: input.libraryId,
+            provider_resource_id: input.providerResourceId,
+            parent_resource_id: input.parentResourceId,
+            path: input.path,
+            name: input.name,
+            extension: input.extension,
+            size: input.size,
+            modified_at: input.modifiedAt,
+            etag: input.etag,
+            scan_root_key: input.scanRootKey,
+            generation_id: input.generationId,
+            locator_json: JSON.stringify(input.locator),
+            status: "active",
+            created_at: now,
+            updated_at: now,
+          })))
+          .onConflict(["user_id", "library_id", "provider_resource_id"])
+          .merge([
+            "service_id",
+            "parent_resource_id",
+            "path",
+            "name",
+            "extension",
+            "size",
+            "modified_at",
+            "etag",
+            "scan_root_key",
+            "generation_id",
+            "locator_json",
+            "status",
+            "updated_at",
+          ]);
+      }
+
+      return inputs.map((input) => ({
+        sourceFile: {
+          ...input,
+          id: existingByResourceId.has(input.providerResourceId)
+            ? String(existingByResourceId.get(input.providerResourceId)!.id)
+            : input.id,
+        },
+        unchanged: unchangedByResourceId.get(input.providerResourceId) === true,
+      }));
+    });
   }
 
   /** upsert 扫描发现的源文件并返回稳定记录。 */

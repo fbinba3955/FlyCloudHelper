@@ -65,6 +65,13 @@ export interface ProviderDirectoryListing {
   items: ProviderDirectory[];
 }
 
+/** Provider 返回给 APP 的临时文件访问结果，严禁包含服务端访问令牌。 */
+export interface ProviderFileAccess {
+  url: string;
+  expiresAt: string | null;
+  headers: Record<string, string>;
+}
+
 /** Provider 建议的扫描和刮削并发范围，默认值与 Flymby APP 保持一致。 */
 export interface ProviderRecommendedScanSettings {
   scanDirectoryConcurrency: {
@@ -94,6 +101,13 @@ export interface ProviderEnumerationOptions {
   onRootStart?: (state: ProviderRootRunState) => Promise<void>;
   /** 扫描根完成时通知 Worker 提交根运行结果。 */
   onRootComplete?: (state: ProviderRootRunState) => Promise<void>;
+  /** OAuth Token 自动刷新后持久化当前任务使用的连接，不生成新的用户配置修订。 */
+  persistConnection?: (connection: Record<string, unknown>) => Promise<void>;
+}
+
+/** 路由执行 Provider 操作时携带的连接刷新持久化能力。 */
+export interface ProviderConnectionContext {
+  persistConnection?: (connection: Record<string, unknown>) => Promise<void>;
 }
 
 export interface ProviderDescriptor {
@@ -103,6 +117,8 @@ export interface ProviderDescriptor {
   credentialSchemaVersion: number;
   capabilities: string[];
   recommendedScanSettings: ProviderRecommendedScanSettings;
+  /** 表单型 Provider 动态填写字段；web_qr Provider 通过官网二维码取得连接。 */
+  authenticationMode?: "form" | "web_qr";
   connectionFields: Array<{
     name: string;
     label: string;
@@ -114,13 +130,30 @@ export interface ProviderDescriptor {
 
 export interface ProviderAdapter {
   readonly descriptor: ProviderDescriptor;
-  validateConnection(connection: Record<string, unknown>, signal?: AbortSignal): Promise<ProviderValidationResult>;
-  validateRoots(connection: Record<string, unknown>, roots: ScanRoot[], signal?: AbortSignal): Promise<void>;
+  validateConnection(
+    connection: Record<string, unknown>,
+    signal?: AbortSignal,
+    context?: ProviderConnectionContext,
+  ): Promise<ProviderValidationResult>;
+  validateRoots(
+    connection: Record<string, unknown>,
+    roots: ScanRoot[],
+    signal?: AbortSignal,
+    context?: ProviderConnectionContext,
+  ): Promise<void>;
   browseDirectories(
     connection: Record<string, unknown>,
     parent?: ScanRoot,
     signal?: AbortSignal,
+    context?: ProviderConnectionContext,
   ): Promise<ProviderDirectoryListing>;
+  /** Provider 支持文件访问时，把扫描 locator 转换为短期有效的下载地址。 */
+  resolveFileAccess?(
+    connection: Record<string, unknown>,
+    locator: Record<string, unknown>,
+    signal?: AbortSignal,
+    context?: ProviderConnectionContext,
+  ): Promise<ProviderFileAccess>;
   enumerate(
     connection: Record<string, unknown>,
     roots: ScanRoot[],

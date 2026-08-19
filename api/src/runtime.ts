@@ -5,6 +5,7 @@ import type { MusicBrainzClient } from "./metadata/musicbrainz.js";
 import type { TmdbKeyPool } from "./metadata/tmdb.js";
 import type { MetadataPluginManager } from "./plugin-manager.js";
 import type { ProviderRegistry } from "./providers/registry.js";
+import type { ScanFailureReportService } from "./scan-failure-report-service.js";
 import type { CredentialVault } from "./secrets.js";
 import type { ServiceRepository } from "./service-repository.js";
 import type { ScanWorker } from "./worker.js";
@@ -21,6 +22,7 @@ export interface ApiRuntime {
   worker: ScanWorker;
   plugins: MetadataPluginManager;
   exports: LibraryExportService;
+  failureReports: ScanFailureReportService;
   logBusinessEvent: (
     level: "info" | "warn",
     fields: Record<string, string | number | boolean | null>,

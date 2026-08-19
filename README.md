@@ -21,7 +21,7 @@ FlyCloudHelper 是面向 Flymby 客户端的自部署云端媒体扫描、刮削
 - 用户注册、登录和多用户数据隔离。
 - 一个用户可创建多个独立网盘服务和媒体库。
 - 服务、任务和媒体目录全部直接使用用户 ID 归属。
-- 支持 WebDAV、光鸭、阿里云盘、百度网盘 Provider 接口。
+- 支持 WebDAV、光鸭、阿里云盘、百度网盘 Provider 接口；光鸭使用官网同源的二维码登录。
 - 配置全量扫描目录、增量扫描目录、本地 NFO、元数据规则和服务级任务并发。
 - 扫描任务进度、当前路径、WebDAV 检查点暂停/继续、终止、删除和失败重试。
 - TMDB 多 Key 自动切换；全部 Key 因限流或临时故障不可用时，任务保留检查点并到期自动恢复。
@@ -179,7 +179,7 @@ docker compose up -d --build
 cp .env.example .env
 ```
 
-常用环境变量：
+常用环境变量如下。镜像已经在 `ENV` 元数据中声明数据库拆分字段、自动建库、Cookie 和 HTTP Provider 开关，因此 Docker 管理界面可以直接显示这些配置项；数据库地址、端口、名称、用户名和密码默认留空。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -204,6 +204,19 @@ TMDB Key 不再通过环境变量配置。超级管理员登录后，在“系�
 PostgreSQL 与 MySQL 使用拆分字段时，服务会自动处理密码中的特殊字符。目标数据库不存在且自动创建开启时，PostgreSQL 用户需要 `CREATEDB` 权限，MySQL 用户需要 `CREATE` 权限；服务只创建指定数据库，之后自动初始化自身表结构，不会创建数据库用户。
 
 网盘服务默认使用 Flymby APP 的任务参数：扫描任务数为 8、刮削任务数为 4。扫描任务数可在 1–16 之间调整，刮削任务数可在 1–4 之间调整；全量扫描的实际目录并发固定不超过 1，增量扫描使用服务设置。实际刮削并发还会受当前可用 TMDB Key 容量限制。
+
+## 光鸭扫码、扫描与文件访问
+
+创建或替换光鸭服务连接时，Web 控制台会显示光鸭官方扫码登录二维码。用户使用光鸭 APP 扫码并确认后，FlyCloudHelper 只在服务端保存加密 Token；二维码对应的设备码、Access Token 和 Refresh Token 不会返回前端或写入诊断日志。
+
+授权完成后可在服务详情中逐级选择光鸭目录，再创建全量或增量扫描任务。光鸭文件枚举结果进入与 WebDAV 相同的影视处理管线，继续执行视频过滤、电影/节目识别、TMDB 刮削、媒体目录落库和增量变更记录。
+
+APP 可使用以下接口访问结果：
+
+- `GET /api/v1/libraries/:libraryId/items/:itemId/files`：读取影片绑定的源文件及稳定定位。
+- `POST /api/v1/libraries/:libraryId/items/:itemId/files/:fileId/access`：用 APP Bearer Token 换取短期文件下载地址；响应不会包含光鸭账号 Token。
+
+文件访问接口返回 `accessType=temporary_url`、`url`、`headers` 和 `expiresAt`。APP 应在地址过期前直接访问网盘/CDN，不由 FlyCloudHelper 代理文件内容，因此不会占用扫描服务的播放或下载带宽。光鸭网页接口发生变更时，Provider 适配器也需要同步升级。
 
 ## 数据与密钥
 

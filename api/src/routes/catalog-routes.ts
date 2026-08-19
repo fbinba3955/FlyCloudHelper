@@ -268,6 +268,65 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     };
   });
 
+  server.post<{ Params: { libraryId: string; itemId: string; fileId: string } }>(
+    "/api/v1/libraries/:libraryId/items/:itemId/files/:fileId/access",
+    async (request) => {
+      requireAppBearer(request);
+      const user = await requireRequestUser(request, runtime.database);
+      const library = await requireLibrary(runtime, request.params.libraryId, user.id);
+      await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
+      const files = await runtime.repository.listItemFiles(request.params.itemId, user.id);
+      // 关键变量：只能为当前媒体条目已绑定的源文件签发访问地址，禁止跨服务猜测 fileId。
+      const sourceFile = files.find((file) => String(file.fileId) === request.params.fileId);
+      if (!sourceFile) throw new ApiError(404, "source_file_not_found", "媒体源文件不存在");
+      const adapter = runtime.providers.get(String(library.provider_type));
+      if (!adapter.resolveFileAccess) {
+        throw new ApiError(422, "provider_file_access_unsupported", "当前网盘类型暂不支持服务端文件访问");
+      }
+      const service = await runtime.repository.getServiceDetail(String(library.service_id), user.id);
+      const connection = runtime.vault.decrypt(
+        await runtime.repository.getActiveEncryptedConnection(service.id, user.id),
+      );
+      const locator = sourceFile.playbackLocator && typeof sourceFile.playbackLocator === "object"
+        ? sourceFile.playbackLocator as Record<string, unknown>
+        : {};
+      const access = await adapter.resolveFileAccess(connection, locator, undefined, {
+        persistConnection: async (nextConnection) => {
+          await runtime.repository.refreshActiveEncryptedConnection({
+            serviceId: service.id,
+            userId: user.id,
+            credentialRevision: service.credentialRevision,
+            encryptedConnection: runtime.vault.encrypt(nextConnection),
+          });
+          runtime.logBusinessEvent("info", {
+            日志关键字: "codex-flycloud-helper-guangya-token-refresh",
+            事件: "文件访问期间保存光鸭刷新令牌",
+            用户ID: user.id,
+            服务ID: service.id,
+            凭据修订: service.credentialRevision,
+          });
+        },
+      });
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-helper-file-access",
+        事件: "APP 获取网盘临时文件地址",
+        用户ID: user.id,
+        服务ID: service.id,
+        媒体条目ID: request.params.itemId,
+        源文件ID: request.params.fileId,
+        网盘类型: service.providerType,
+        是否包含失效时间: Boolean(access.expiresAt),
+      });
+      return {
+        schemaVersion: 1,
+        accessType: "temporary_url",
+        url: access.url,
+        headers: access.headers,
+        expiresAt: access.expiresAt,
+      };
+    },
+  );
+
   server.get<{ Params: { libraryId: string }; Querystring: Record<string, unknown> }>("/api/v1/libraries/:libraryId/changes", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const library = await requireLibrary(runtime, request.params.libraryId, user.id);

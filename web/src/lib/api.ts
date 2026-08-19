@@ -296,6 +296,7 @@ export interface ProviderDescriptor {
     scrapeTaskConcurrency: { default: number; min: number; max: number };
     fullScanDirectoryConcurrency: number;
   };
+  authenticationMode?: "form" | "web_qr";
   connectionFields: Array<{
     name: string;
     label: string;
@@ -303,6 +304,19 @@ export interface ProviderDescriptor {
     required: boolean;
     secret: boolean;
   }>;
+}
+
+/** 光鸭官网扫码登录状态；Token 始终只保存在服务端。 */
+export interface GuangyaAuthorizationStatus {
+  authorizationSessionId: string;
+  status: "pending" | "authorized" | "expired" | "failed";
+  verificationUri: string;
+  verificationUriComplete: string;
+  userCode: string;
+  expiresAt: string;
+  intervalSeconds: number;
+  accountLabel: string | null;
+  errorMessage: string | null;
 }
 
 /** 路径选择器显示并保存的网盘目录。 */
@@ -397,6 +411,34 @@ export async function listProviders(): Promise<ProviderDescriptor[]> {
   return (await requestJson<{ items: ProviderDescriptor[] }>("/api/v1/providers")).items;
 }
 
+/** 启动光鸭官网 Device Code 扫码登录；管理员需要同时绑定目标用户。 */
+export function startGuangyaAuthorization(
+  admin = false,
+  userId?: string,
+): Promise<GuangyaAuthorizationStatus> {
+  return requestJson(
+    admin
+      ? "/api/v1/admin/providers/guangya/auth-sessions"
+      : "/api/v1/providers/guangya/auth-sessions",
+    {
+      method: "POST",
+      body: JSON.stringify(admin ? { userId } : {}),
+    },
+  );
+}
+
+/** 读取由服务端轮询光鸭官网推进的授权状态。 */
+export function pollGuangyaAuthorization(
+  authorizationSessionId: string,
+  admin = false,
+): Promise<GuangyaAuthorizationStatus> {
+  return requestJson(
+    admin
+      ? `/api/v1/admin/providers/guangya/auth-sessions/${authorizationSessionId}`
+      : `/api/v1/providers/guangya/auth-sessions/${authorizationSessionId}`,
+  );
+}
+
 /** 创建用户或管理员代建的云端服务。 */
 export async function createService(
   input: CreateCloudServiceInput,
@@ -473,6 +515,40 @@ export async function deleteScanJob(jobId: string, admin = false): Promise<void>
     method: "DELETE",
     body: JSON.stringify({ confirmation: jobId }),
   });
+}
+
+/** 下载任务级扫描刮削失败报告，并使用服务端文件名保存到本地。 */
+export async function downloadScanFailureReport(jobId: string, admin = false): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(
+      admin ? `/api/v1/admin/jobs/${jobId}/failure-report` : `/api/v1/scan-jobs/${jobId}/failure-report`,
+      { credentials: "include" },
+    );
+  } catch {
+    throw new ApiClientError(0, "network_error", "无法连接 FlyCloudHelper API");
+  }
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as ApiErrorResponse;
+    throw new ApiClientError(
+      response.status,
+      payload.error?.code ?? "scan_failure_report_download_failed",
+      payload.error?.message ?? "扫描失败报告下载失败",
+    );
+  }
+
+  const contentDisposition = response.headers.get("Content-Disposition") ?? "";
+  // 关键变量：接口文件名只包含任务 ID；解析失败时仍使用可识别的本地文件名。
+  const fileName = contentDisposition.match(/filename="?([^";]+)"?/iu)?.[1]
+    ?? `scan-failures-${jobId}.jsonl`;
+  const objectUrl = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
 }
 
 /** 清空单个服务的扫描与刮削结果，保留服务连接和配置。 */

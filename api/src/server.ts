@@ -14,9 +14,12 @@ import { ProviderRegistry } from "./providers/registry.js";
 import { registerAdminRoutes } from "./routes/admin-routes.js";
 import { registerAuthRoutes } from "./routes/auth-routes.js";
 import { registerCatalogRoutes } from "./routes/catalog-routes.js";
+import { registerGuangyaAuthRoutes } from "./routes/guangya-auth-routes.js";
 import { registerPluginRoutes } from "./routes/plugin-routes.js";
+import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
 import type { ApiRuntime } from "./runtime.js";
+import { ScanFailureReportService } from "./scan-failure-report-service.js";
 import { CredentialVault } from "./secrets.js";
 import { ServiceRepository } from "./service-repository.js";
 import { loadTmdbKeys } from "./system-settings.js";
@@ -96,6 +99,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const tmdb = new TmdbKeyPool(config, await loadTmdbKeys(database, vault), (fields) => server.log.warn(fields));
   const musicBrainz = new MusicBrainzClient(config);
   const plugins = new MetadataPluginManager(database, config, vault);
+  const failureReports = new ScanFailureReportService(config, server.log);
   const worker = new ScanWorker({
     repository,
     providers,
@@ -103,6 +107,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     tmdb,
     musicBrainz,
     plugins,
+    failureReports,
     logger: server.log,
     config,
   });
@@ -117,6 +122,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     worker,
     plugins,
     exports: new LibraryExportService(database, config),
+    failureReports,
     logBusinessEvent: logger,
   };
 
@@ -267,7 +273,9 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   });
 
   await registerAuthRoutes(server, { config, database, logBusinessEvent: logger });
+  await registerGuangyaAuthRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
+  await registerScanFailureReportRoutes(server, runtime);
   await registerCatalogRoutes(server, runtime);
   await registerAdminRoutes(server, runtime);
   await registerPluginRoutes(server, runtime);

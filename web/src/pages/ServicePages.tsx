@@ -3,6 +3,7 @@ import { FolderPlus, Plus, RefreshCw, ScanLine, Settings2, Trash2 } from "lucide
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCatalogView";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
+import { GuangyaAuthorizationPanel } from "@/components/GuangyaAuthorizationPanel";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
 import { Panel, StatCard, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
@@ -23,6 +24,7 @@ import {
   type CloudService,
   type CreateCloudServiceInput,
   type JobStatus,
+  type GuangyaAuthorizationStatus,
   type MediaType,
   type ProviderDirectory,
   type ProviderDescriptor,
@@ -289,6 +291,8 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
   const providers = useApiResource(() => listProviders(), []);
   const users = useApiResource(() => admin ? listAdminUsers() : Promise.resolve({ items: [], total: 0 }), [admin]);
   const [providerType, setProviderType] = useState("");
+  const [adminTargetUserId, setAdminTargetUserId] = useState("");
+  const [guangyaAuthorization, setGuangyaAuthorization] = useState<GuangyaAuthorizationStatus | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const selectedProvider: ProviderDescriptor | undefined = providers.data?.find((item) => item.type === providerType) ?? providers.data?.[0];
 
@@ -308,10 +312,18 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
       return;
     }
     const connection: Record<string, string> = {};
-    descriptor.connectionFields.forEach((field) => {
-      const value = String(form.get(`connection.${field.name}`) ?? "").trim();
-      if (value) connection[field.name] = value;
-    });
+    if (descriptor.authenticationMode === "web_qr") {
+      if (guangyaAuthorization?.status !== "authorized") {
+        setMessage("请先完成光鸭扫码登录，再创建服务");
+        return;
+      }
+      connection.authorizationSessionId = guangyaAuthorization.authorizationSessionId;
+    } else {
+      descriptor.connectionFields.forEach((field) => {
+        const value = String(form.get(`connection.${field.name}`) ?? "").trim();
+        if (value) connection[field.name] = value;
+      });
+    }
     const input: CreateCloudServiceInput = {
       displayName: String(form.get("displayName") ?? "").trim(),
       dataType,
@@ -335,7 +347,7 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
         },
       },
     };
-    if (admin) input.userId = String(form.get("userId") ?? "");
+    if (admin) input.userId = adminTargetUserId;
     setMessage("正在验证连接并创建服务，不会自动开始扫描…");
     try {
       const service = await createService(input, admin);
@@ -350,7 +362,7 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
       <PageHeader title="创建云端服务" />
       <Panel>
         <form onSubmit={(event) => void submit(event)} className="grid gap-5 lg:grid-cols-2">
-          {admin && <label className="block"><span className="text-xs text-muted-foreground">所属用户</span><select name="userId" required className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm"><option value="">选择目标用户</option>{users.data?.items.map((user) => <option key={user.userId} value={user.userId}>{user.username}</option>)}</select></label>}
+          {admin && <label className="block"><span className="text-xs text-muted-foreground">所属用户</span><select name="userId" required value={adminTargetUserId} onChange={(event) => setAdminTargetUserId(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm"><option value="">选择目标用户</option>{users.data?.items.map((user) => <option key={user.userId} value={user.userId}>{user.username}</option>)}</select></label>}
           <label className="block"><span className="text-xs text-muted-foreground">服务名称</span><input name="displayName" required maxLength={100} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
           <label className="block">
             <span className="text-xs text-muted-foreground">数据类型</span>
@@ -360,10 +372,12 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
               <option value="audiobook" disabled>有声书（暂未支持）</option>
             </select>
           </label>
-          <label className="block"><span className="text-xs text-muted-foreground">Provider 类型</span><select name="providerType" required value={selectedProvider?.type ?? ""} onChange={(event) => setProviderType(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm"><option value="">选择 Provider</option>{providers.data?.map((provider) => <option key={provider.type} value={provider.type}>{provider.displayName}</option>)}</select></label>
-          {selectedProvider?.connectionFields.map((field) => <label key={field.name} className="block"><span className="text-xs text-muted-foreground">{field.label}</span><input name={`connection.${field.name}`} type={field.type === "password" ? "password" : field.type} required={field.required} autoComplete="off" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>)}
+          <label className="block"><span className="text-xs text-muted-foreground">Provider 类型</span><select name="providerType" required value={selectedProvider?.type ?? ""} onChange={(event) => { setProviderType(event.target.value); setGuangyaAuthorization(null); }} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm"><option value="">选择 Provider</option>{providers.data?.map((provider) => <option key={provider.type} value={provider.type}>{provider.displayName}</option>)}</select></label>
+          {selectedProvider?.authenticationMode === "web_qr"
+            ? <GuangyaAuthorizationPanel admin={admin} targetUserId={adminTargetUserId || undefined} resetKey={`${selectedProvider.type}:${adminTargetUserId}`} onAuthorizationChange={setGuangyaAuthorization} />
+            : selectedProvider?.connectionFields.map((field) => <label key={field.name} className="block"><span className="text-xs text-muted-foreground">{field.label}</span><input name={`connection.${field.name}`} type={field.type === "password" ? "password" : field.type} required={field.required} autoComplete="off" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>)}
           {selectedProvider && <div className="rounded-xl border border-border bg-secondary/35 p-4 lg:col-span-2"><p className="text-sm font-medium">默认任务并发</p><p className="mt-2 text-xs text-muted-foreground">扫描任务 {selectedProvider.recommendedScanSettings.scanDirectoryConcurrency.default}，刮削任务 {selectedProvider.recommendedScanSettings.scrapeTaskConcurrency.default}。创建后可以在服务详情中修改。</p></div>}
-          <div className="lg:col-span-2 flex items-center justify-between gap-4"><p className="text-xs text-muted-foreground">创建成功后不会自动扫描或刮削，需要先在服务详情中设置扫描路径。</p><PrimaryButton type="submit">验证连接并创建服务</PrimaryButton></div>
+          <div className="lg:col-span-2 flex items-center justify-between gap-4"><p className="text-xs text-muted-foreground">创建成功后不会自动扫描或刮削，需要先在服务详情中设置扫描路径。</p><PrimaryButton type="submit" disabled={selectedProvider?.authenticationMode === "web_qr" && guangyaAuthorization?.status !== "authorized"}>验证连接并创建服务</PrimaryButton></div>
           {message && <p className="lg:col-span-2 text-sm text-muted-foreground">{message}</p>}
         </form>
       </Panel>
@@ -514,6 +528,21 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     }
   }
 
+  /** 光鸭网页授权成功后，用一次性授权会话替换当前服务连接。 */
+  async function saveGuangyaConnection(authorization: GuangyaAuthorizationStatus | null): Promise<void> {
+    if (authorization?.status !== "authorized") return;
+    setMessage("光鸭扫码登录成功，正在验证并保存连接…");
+    try {
+      await updateServiceConnection(serviceId, {
+        authorizationSessionId: authorization.authorizationSessionId,
+      }, admin);
+      setMessage("光鸭连接已更新，后续访问令牌将由服务端自动刷新");
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "光鸭连接保存失败");
+    }
+  }
+
   /** 使用服务端当前保存的连接配置重新验证并恢复服务连接状态。 */
   async function reconnectCurrentConnection(): Promise<void> {
     setReconnecting(true);
@@ -579,7 +608,9 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
           hint={service.credentialConfigured ? "Secret 已配置" : "Secret 未配置"}
           tone={service.status === "reauthorization_required" ? "warning" : "muted"}
           action={service.status === "reauthorization_required"
-            ? <SecondaryButton disabled={reconnecting} onClick={() => void reconnectCurrentConnection()}><RefreshCw className={`size-4 ${reconnecting ? "animate-spin" : ""}`} />{reconnecting ? "正在重连…" : "使用当前配置重连"}</SecondaryButton>
+            ? providerDescriptor?.authenticationMode === "web_qr"
+              ? <SecondaryButton onClick={() => document.getElementById("guangya-authorization-panel")?.scrollIntoView({ behavior: "smooth", block: "center" })}>重新扫码登录</SecondaryButton>
+              : <SecondaryButton disabled={reconnecting} onClick={() => void reconnectCurrentConnection()}><RefreshCw className={`size-4 ${reconnecting ? "animate-spin" : ""}`} />{reconnecting ? "正在重连…" : "使用当前配置重连"}</SecondaryButton>
             : undefined}
         />
       </div>
@@ -597,11 +628,17 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         </div>
       </Panel>
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <Panel title="替换连接" description="Secret 不回显，保存时必须提交一套完整新连接。">
-          <form onSubmit={(event) => void saveConnection(event)} className="grid gap-3">
-            {providers.data?.find((item) => item.type === service.providerType)?.connectionFields.map((field) => <label key={field.name}><span className="text-xs text-muted-foreground">{field.label}</span><input name={field.name} type={field.type === "password" ? "password" : field.type} required={field.required} autoComplete="off" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>)}
-            <PrimaryButton type="submit">验证并保存连接</PrimaryButton>
-          </form>
+        <Panel title="替换连接" description={providerDescriptor?.authenticationMode === "web_qr" ? "重新扫码后会验证账号并替换当前服务连接。" : "Secret 不回显，保存时必须提交一套完整新连接。"}>
+          {providerDescriptor?.authenticationMode === "web_qr" ? (
+            <div id="guangya-authorization-panel">
+              <GuangyaAuthorizationPanel admin={admin} targetUserId={admin ? service.userId : undefined} resetKey={`${service.id}:${service.credentialRevision}`} onAuthorizationChange={(authorization) => void saveGuangyaConnection(authorization)} />
+            </div>
+          ) : (
+            <form onSubmit={(event) => void saveConnection(event)} className="grid gap-3">
+              {providerDescriptor?.connectionFields.map((field) => <label key={field.name}><span className="text-xs text-muted-foreground">{field.label}</span><input name={field.name} type={field.type === "password" ? "password" : field.type} required={field.required} autoComplete="off" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>)}
+              <PrimaryButton type="submit">验证并保存连接</PrimaryButton>
+            </form>
+          )}
         </Panel>
         <Panel title="服务状态" description="停用服务前必须确保没有运行中的扫描任务。">
           <p className="mb-4 text-sm text-muted-foreground">当前状态：{serviceStatusLabels[service.status]}</p>

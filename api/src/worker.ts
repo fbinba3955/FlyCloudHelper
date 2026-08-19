@@ -32,6 +32,10 @@ import {
   type ScanRoot,
 } from "./providers/types.js";
 import { ProviderRegistry } from "./providers/registry.js";
+import {
+  ScanFailureReportService,
+  type ScanFailureRecordInput,
+} from "./scan-failure-report-service.js";
 import { CredentialVault } from "./secrets.js";
 import {
   ServiceRepository,
@@ -42,6 +46,13 @@ interface WorkerLogger {
   info(fields: Record<string, unknown>): void;
   warn(fields: Record<string, unknown>): void;
   error(fields: Record<string, unknown>): void;
+}
+
+/** 从业务异常读取稳定错误码，缺少错误码时使用调用方给出的分类。 */
+function readFailureCode(error: unknown, fallback: string): string {
+  return error && typeof error === "object" && "code" in error
+    ? String((error as { code?: string }).code || fallback)
+    : fallback;
 }
 
 interface EnrichedMetadata {
@@ -91,6 +102,10 @@ interface PendingDirectoryMedia {
   rootPath: string;
   /** 增量扫描未变化时为 false，但仍保留为同目录识别上下文。 */
   shouldProcess: boolean;
+  /** 批量写入数据库前准备好的源文件数据。 */
+  sourceFileInput: SourceFileRecord;
+  /** 当前枚举窗口是否允许把未变化文件跳过。 */
+  skipIfUnchanged: boolean;
   /** 已更新的源文件记录，准备阶段失败时为空。 */
   sourceFile: SourceFileRecord | null;
   /** 枚举阶段写入源文件失败的原始错误。 */
@@ -141,6 +156,23 @@ function createCheckpointProgress(input: {
     failedKeys: [...input.businessProgress.failedKeys],
     movieTaskKeys: [...input.movieTaskKeys],
     seriesTaskKeys: [...input.seriesTaskKeys],
+  };
+}
+
+/** 只保留指定水位之前的业务任务统计，避免异步检查点混入后续窗口的任务。 */
+function createCheckpointBusinessProgress(
+  progress: BusinessTaskProgress,
+  checkpointTaskKeys: Set<string>,
+): BusinessTaskProgress {
+  const filterKeys = (values: Set<string>): Set<string> => new Set(
+    [...values].filter((value) => checkpointTaskKeys.has(value)),
+  );
+  return {
+    taskKeys: new Set(checkpointTaskKeys),
+    processedKeys: filterKeys(progress.processedKeys),
+    matchedKeys: filterKeys(progress.matchedKeys),
+    unmatchedKeys: filterKeys(progress.unmatchedKeys),
+    failedKeys: filterKeys(progress.failedKeys),
   };
 }
 
@@ -315,6 +347,7 @@ export class ScanWorker {
   private readonly tmdb: TmdbKeyPool;
   private readonly musicBrainz: MusicBrainzClient;
   private readonly plugins: MetadataPluginManager;
+  private readonly failureReports: ScanFailureReportService;
   private readonly logger: WorkerLogger;
   private readonly config: ApiConfig;
   private readonly abortControllers = new Map<string, AbortController>();
@@ -329,6 +362,7 @@ export class ScanWorker {
     tmdb: TmdbKeyPool;
     musicBrainz: MusicBrainzClient;
     plugins: MetadataPluginManager;
+    failureReports: ScanFailureReportService;
     logger: WorkerLogger;
     config: ApiConfig;
   }) {
@@ -338,6 +372,7 @@ export class ScanWorker {
     this.tmdb = input.tmdb;
     this.musicBrainz = input.musicBrainz;
     this.plugins = input.plugins;
+    this.failureReports = input.failureReports;
     this.logger = input.logger;
     this.config = input.config;
   }
@@ -429,6 +464,17 @@ export class ScanWorker {
       await this.scan(job, controller.signal);
     } catch (error) {
       if (isTmdbTemporarilyUnavailableError(error)) {
+        await this.failureReports.record(job, {
+          stage: "scraping",
+          errorCode: error.code,
+          error,
+          recovered: true,
+          context: {
+            恢复方式: "任务延迟后自动重试",
+            下次重试时间: error.nextRetryAt,
+            原因代码: error.reasonCode,
+          },
+        });
         const waitingJob = await this.repository.waitForJobRetry(job.id, {
           nextRetryAt: error.nextRetryAt,
           errorCode: error.code,
@@ -445,9 +491,14 @@ export class ScanWorker {
         });
         return;
       }
-      const code = error && typeof error === "object" && "code" in error
-        ? String((error as { code?: string }).code)
-        : "scan_failed";
+      const code = readFailureCode(error, "scan_failed");
+      await this.failureReports.record(job, {
+        stage: "task",
+        errorCode: code,
+        error,
+        recovered: false,
+        mediaPath: job.currentPath,
+      });
       await this.repository.finishJob(job.id, {
         status: "failed",
         errorCode: code,
@@ -469,6 +520,10 @@ export class ScanWorker {
     const runtime = await this.repository.getJobRuntimeConfiguration(job);
     const connection = this.vault.decrypt(runtime.encryptedConnection);
     const adapter = this.providers.get(runtime.providerType);
+    /** 记录当前任务的脱敏失败信息，扫描业务不依赖报告文件写入结果。 */
+    const recordScanFailure = (input: ScanFailureRecordInput): Promise<void> => (
+      this.failureReports.record(job, input)
+    );
     const roots = readScanRoots(runtime.scanProfile, job.scanMode);
     if (roots.length === 0) {
       throw new ApiError(409, "scan_paths_not_configured", `未配置${job.scanMode === "full" ? "全量" : "增量"}扫描路径`);
@@ -549,8 +604,8 @@ export class ScanWorker {
     let activeDirectoryKey: string | null = null;
     let activeDirectoryItems: PendingDirectoryMedia[] = [];
     let scannedDirectoryCount = savedProgress.scannedDirectoryCount;
-    // 关键变量：刮削队列允许扫描适度领先，确保只有一个 TMDB Key 时也能真正并行扫描与刮削。
-    const scrapeQueueLimit = Math.max(scrapeConcurrency * 4, scrapeConcurrency + 4);
+    // 关键变量：云端服务允许扫描明显领先于 TMDB；仍保留上限，避免超大媒体库无限占用内存。
+    const scrapeQueueLimit = Math.max(scrapeConcurrency * 256, 1_024);
     const pendingBusinessTasks = new Set<Promise<void>>();
     // 关键变量：任意刮削任务发现全部 TMDB Key 临时不可用后，停止提交新结果并在安全窗口回退。
     let tmdbRecoveryError: TmdbTemporarilyUnavailableError | null = null;
@@ -567,6 +622,10 @@ export class ScanWorker {
     let replayingCheckpointWindow = checkpointResult.restored;
     let checkpointCandidate: ProviderEnumerationCheckpoint | null = null;
     let savedCheckpointSequence = restoredCheckpointSequence;
+    let scheduledCheckpointSequence = restoredCheckpointSequence;
+    let checkpointCommitError: unknown | null = null;
+    // 关键变量：检查点按 Provider 序号串行提交，但不阻塞后续目录枚举。
+    let checkpointCommitChain: Promise<void> = Promise.resolve();
     // 关键变量：源文件使用所属扫描根的稳定 generation，完整根才能独立执行缺失对账。
     const scanRootGenerations = new Map<string, string>();
     /** 把当前业务任务集合和扫描路径发布到数据库，供 5 秒轮询页面读取。 */
@@ -584,9 +643,8 @@ export class ScanWorker {
       });
       lastProgressPublishedAt = Date.now();
     };
-    /** 控制扫描中进度写入频率，目录较慢时也至少每秒更新一次当前路径。 */
+    /** 控制扫描中进度写入频率；前端每 5 秒读取一次，数据库最多每秒接收一次进度。 */
     const shouldPublishProgress = (): boolean => enumeratedEntryCount === 1
-      || enumeratedEntryCount % 20 === 0
       || Date.now() - lastProgressPublishedAt >= 1_000;
     this.logger.info({
       日志关键字: "codex-flycloud-helper-worker-tuning",
@@ -598,6 +656,7 @@ export class ScanWorker {
       扫描实际并发: effectiveScanDirectoryConcurrency,
       刮削配置并发: configuredScrapeTaskConcurrency,
       刮削实际并发: scrapeConcurrency,
+      刮削等待队列上限: scrapeQueueLimit,
       TMDB可用Key数量: this.tmdb.getStatus().healthyCount,
     });
     this.logger.info({
@@ -650,10 +709,23 @@ export class ScanWorker {
         if (tmdbRecoveryError) break;
         const { candidate, descriptor } = item;
         if (!candidate.sourceFile) {
+          const preparationError = candidate.preparationError ?? new Error("源文件记录未准备完成");
+          await recordScanFailure({
+            stage: "persisting",
+            errorCode: readFailureCode(preparationError, "source_file_prepare_failed"),
+            error: preparationError,
+            recovered: false,
+            mediaPath: candidate.entry.path,
+            resourceId: candidate.entry.resourceId,
+            fileName: candidate.entry.name,
+            itemType: descriptor.itemType,
+            parsedTitle: descriptor.title,
+            businessTaskKey,
+          });
           this.logMediaItemFailure(
             job.id,
             candidate.entry.resourceId,
-            candidate.preparationError ?? new Error("源文件记录未准备完成"),
+            preparationError,
           );
           continue;
         }
@@ -674,6 +746,26 @@ export class ScanWorker {
           matched = matched || mediaResult.matched;
           if (mediaResult.providerUnavailable) providerUnavailableFileCount += 1;
           mediaResult.changedItemIds.forEach((itemId) => changedItemIds.add(itemId));
+          if (!mediaResult.matched) {
+            const errorCode = mediaResult.providerUnavailable
+              ? "metadata_provider_unavailable"
+              : "metadata_not_matched";
+            await recordScanFailure({
+              stage: "scraping",
+              errorCode,
+              error: new Error(mediaResult.providerUnavailable ? "当前没有可用的影视元数据来源" : "没有匹配到影视元数据"),
+              recovered: false,
+              mediaPath: candidate.entry.path,
+              resourceId: candidate.entry.resourceId,
+              fileName: candidate.entry.name,
+              itemType: descriptor.itemType,
+              parsedTitle: descriptor.title,
+              businessTaskKey,
+              context: {
+                使用元数据Provider: readMetadataProviderId(videoMetadataProfile) || "builtin.tmdb",
+              },
+            });
+          }
         } catch (error) {
           if (rememberTmdbRecoveryError(error)) {
             const recoveryError = error as TmdbTemporarilyUnavailableError;
@@ -686,6 +778,18 @@ export class ScanWorker {
             });
             break;
           }
+          await recordScanFailure({
+            stage: "scraping",
+            errorCode: readFailureCode(error, "media_item_failed"),
+            error,
+            recovered: false,
+            mediaPath: candidate.entry.path,
+            resourceId: candidate.entry.resourceId,
+            fileName: candidate.entry.name,
+            itemType: descriptor.itemType,
+            parsedTitle: descriptor.title,
+            businessTaskKey,
+          });
           this.logMediaItemFailure(job.id, candidate.entry.resourceId, error);
         }
       }
@@ -720,14 +824,29 @@ export class ScanWorker {
       }).catch(() => undefined);
     };
 
-    /** 队列达到上限时等待任意刮削任务完成，控制内存并让扫描与刮削保持流水线运行。 */
+    /** 队列达到上限时等待任意刮削任务完成，控制内存并记录可诊断的背压耗时。 */
     const waitForScrapeQueueCapacity = async (): Promise<void> => {
+      const waitingStartedAt = pendingBusinessTasks.size >= scrapeQueueLimit ? Date.now() : 0;
+      const pendingCountAtStart = pendingBusinessTasks.size;
       while (pendingBusinessTasks.size >= scrapeQueueLimit) {
         await Promise.race(pendingBusinessTasks);
         await throwTmdbRecoveryAfterDraining();
         if (Date.now() - lastProgressPublishedAt >= 1_000) {
           await publishProgress("enumerating");
         }
+      }
+      const waitingElapsedMs = waitingStartedAt > 0 ? Date.now() - waitingStartedAt : 0;
+      if (waitingElapsedMs >= 1_000) {
+        this.logger.info({
+          日志关键字: "codex-flycloud-helper-scan-backpressure",
+          事件: "扫描等待刮削队列后继续",
+          任务ID: job.id,
+          等待毫秒: waitingElapsedMs,
+          等待前队列数量: pendingCountAtStart,
+          恢复时队列数量: pendingBusinessTasks.size,
+          队列上限: scrapeQueueLimit,
+          扫描视频数量: scannedMediaCount,
+        });
       }
     };
 
@@ -742,6 +861,45 @@ export class ScanWorker {
       scannedDirectoryCount += 1;
       const firstItem = directoryItems[0];
       if (!firstItem) return;
+      const candidatesToPrepare = directoryItems.filter((candidate) => candidate.shouldProcess);
+      const sourceBatchStartedAt = Date.now();
+      try {
+        const preparedFiles = await this.repository.prepareSourceFiles(
+          candidatesToPrepare.map((candidate) => candidate.sourceFileInput),
+        );
+        preparedFiles.forEach((prepared, index) => {
+          const candidate = candidatesToPrepare[index];
+          if (!candidate) return;
+          candidate.sourceFile = prepared.sourceFile;
+          if (candidate.skipIfUnchanged && prepared.unchanged) {
+            candidate.shouldProcess = false;
+            skippedCount += 1;
+          }
+        });
+        const sourceBatchElapsedMs = Date.now() - sourceBatchStartedAt;
+        if (candidatesToPrepare.length >= 100 || sourceBatchElapsedMs >= 1_000) {
+          this.logger.info({
+            日志关键字: "codex-flycloud-helper-source-batch",
+            事件: "目录源文件批量准备完成",
+            任务ID: job.id,
+            目录标识: flushedDirectoryKey,
+            文件数量: candidatesToPrepare.length,
+            数据库耗时毫秒: sourceBatchElapsedMs,
+          });
+        }
+      } catch (error) {
+        candidatesToPrepare.forEach((candidate) => {
+          candidate.preparationError = error;
+        });
+        this.logger.warn({
+          日志关键字: "codex-flycloud-helper-source-batch",
+          事件: "目录源文件批量准备失败",
+          任务ID: job.id,
+          目录标识: flushedDirectoryKey,
+          文件数量: candidatesToPrepare.length,
+          错误信息: error instanceof Error ? error.message : "未知数据库错误",
+        });
+      }
       const descriptors = describeMediaDirectory(
         directoryItems.map((item) => item.entry),
         firstItem.rootTypes,
@@ -764,6 +922,7 @@ export class ScanWorker {
         }
       }
       for (const [businessTaskKey, taskItems] of directoryTasks) {
+        await waitForScrapeQueueCapacity();
         enqueueBusinessTask(businessTaskKey, taskItems);
       }
       if (directoryTasks.size > 0 && (scannedDirectoryCount <= 10 || scannedDirectoryCount % 50 === 0)) {
@@ -778,55 +937,99 @@ export class ScanWorker {
           已发现影片任务数量: businessProgress.taskKeys.size,
         });
       }
-      await waitForScrapeQueueCapacity();
     };
 
-    /** 在当前 Provider 批次开始前，把上一窗口的刮削结果和枚举游标一起提交为安全检查点。 */
-    const persistCheckpointCandidate = async (): Promise<void> => {
+    /** 如果异步检查点提交失败，在下一次安全边界终止任务，避免继续扫描却无法恢复。 */
+    const throwCheckpointCommitError = (): void => {
+      if (checkpointCommitError) throw checkpointCommitError;
+    };
+
+    /**
+     * 在当前 Provider 批次开始前记录完成水位，并异步提交上一窗口检查点。
+     * 只等待水位之前已经入队的刮削任务，不再清空后续扫描产生的整个队列。
+     */
+    const scheduleCheckpointCandidate = async (): Promise<void> => {
       const candidate = checkpointCandidate;
       checkpointCandidate = null;
-      if (!candidate || candidate.checkpointSequence === savedCheckpointSequence) return;
+      if (!candidate || candidate.checkpointSequence <= scheduledCheckpointSequence) return;
       await flushActiveDirectory();
-      await Promise.all([...pendingBusinessTasks]);
-      // 不能把包含 TMDB 临时失败的窗口保存成新游标，否则恢复后会漏掉该窗口的影片。
-      await throwTmdbRecoveryAfterDraining();
-      await publishProgress("enumerating");
-      await this.repository.saveScanJobCheckpoint({
-        checkpoint,
-        providerState: candidate as unknown as Record<string, unknown>,
-        progress: createCheckpointProgress({
-          enumeratedEntryCount,
-          scannedMediaCount,
-          skippedCount,
-          currentScanPath,
-          scannedDirectoryCount,
-          providerWarningKeys,
-          businessProgress,
-          movieTaskKeys,
-          seriesTaskKeys,
-        }),
-        nfoSidecars: serializeNfoSidecars(nfoSidecars),
-        changedItemIds: [...changedItemIds],
-      });
-      savedCheckpointSequence = candidate.checkpointSequence;
-      if (replayingCheckpointWindow && candidate.checkpointSequence > restoredCheckpointSequence) {
-        replayingCheckpointWindow = false;
-      }
-      this.logger.info({
-        日志关键字: "codex-flycloud-helper-checkpoint",
-        事件: "扫描安全检查点已保存",
-        任务ID: job.id,
-        扫描会话ID: checkpoint.scanSessionId,
-        Provider游标序号: candidate.checkpointSequence,
-        扫描根序号: candidate.rootIndex,
-        待扫描目录数量: candidate.pendingDirectories.length,
-        扫描视频数量: scannedMediaCount,
-        处理影片数量: getHandledBusinessTaskCount(businessProgress),
-      });
+      const checkpointTaskKeys = new Set(businessProgress.taskKeys);
+      const checkpointProviderWarningKeys = new Set(providerWarningKeys);
+      const checkpointNfoSidecars = serializeNfoSidecars(nfoSidecars);
+      const tasksBeforeCheckpoint = [...pendingBusinessTasks];
+      const checkpointEnumeratedEntryCount = enumeratedEntryCount;
+      const checkpointScannedMediaCount = scannedMediaCount;
+      const checkpointSkippedCount = skippedCount;
+      const checkpointCurrentScanPath = currentScanPath;
+      const checkpointScannedDirectoryCount = scannedDirectoryCount;
+      scheduledCheckpointSequence = candidate.checkpointSequence;
+
+      checkpointCommitChain = checkpointCommitChain
+        .then(async () => {
+          if (checkpointCommitError) return;
+          await Promise.all(tasksBeforeCheckpoint);
+          // 不能把包含 TMDB 临时失败的窗口保存成新游标，否则恢复后会漏掉该窗口的影片。
+          if (tmdbRecoveryError) return;
+          const checkpointBusinessProgress = createCheckpointBusinessProgress(
+            businessProgress,
+            checkpointTaskKeys,
+          );
+          await this.repository.saveScanJobCheckpoint({
+            checkpoint,
+            providerState: candidate as unknown as Record<string, unknown>,
+            progress: createCheckpointProgress({
+              enumeratedEntryCount: checkpointEnumeratedEntryCount,
+              scannedMediaCount: checkpointScannedMediaCount,
+              skippedCount: checkpointSkippedCount,
+              currentScanPath: checkpointCurrentScanPath,
+              scannedDirectoryCount: checkpointScannedDirectoryCount,
+              providerWarningKeys: checkpointProviderWarningKeys,
+              businessProgress: checkpointBusinessProgress,
+              movieTaskKeys: new Set([...movieTaskKeys].filter((key) => checkpointTaskKeys.has(key))),
+              seriesTaskKeys: new Set([...seriesTaskKeys].filter((key) => checkpointTaskKeys.has(key))),
+            }),
+            nfoSidecars: checkpointNfoSidecars,
+            // 水位任务完成后读取当前集合；即使包含后续窗口条目，恢复重放仍保持幂等且不会漏通知。
+            changedItemIds: [...changedItemIds],
+          });
+          savedCheckpointSequence = candidate.checkpointSequence;
+          if (replayingCheckpointWindow && candidate.checkpointSequence > restoredCheckpointSequence) {
+            replayingCheckpointWindow = false;
+          }
+          this.logger.info({
+            日志关键字: "codex-flycloud-helper-checkpoint",
+            事件: "扫描安全检查点异步保存完成",
+            任务ID: job.id,
+            扫描会话ID: checkpoint.scanSessionId,
+            Provider游标序号: candidate.checkpointSequence,
+            扫描根序号: candidate.rootIndex,
+            待扫描目录数量: candidate.pendingDirectories.length,
+            扫描视频数量: checkpointScannedMediaCount,
+            处理影片数量: getHandledBusinessTaskCount(checkpointBusinessProgress),
+          });
+        })
+        .catch((error) => {
+          checkpointCommitError = error;
+          this.logger.error({
+            日志关键字: "codex-flycloud-helper-checkpoint",
+            事件: "扫描安全检查点异步保存失败",
+            任务ID: job.id,
+            Provider游标序号: candidate.checkpointSequence,
+            错误信息: error instanceof Error ? error.message : "未知检查点错误",
+          });
+        });
     };
 
     for await (const entry of adapter.enumerate(connection, roots, signal, (warning) => {
       providerWarningKeys.add(`${warning.code}\u0000${warning.path}`);
+      void recordScanFailure({
+        stage: "enumerating",
+        errorCode: warning.code,
+        error: new Error(warning.message),
+        recovered: true,
+        mediaPath: warning.path,
+        context: { 处理结果: "已跳过异常子目录并继续扫描" },
+      });
       this.logger.warn({
         日志关键字: "codex-flycloud-helper-provider-request",
         事件: "扫描任务跳过异常子目录",
@@ -838,7 +1041,23 @@ export class ScanWorker {
     }, {
       directoryConcurrency: effectiveScanDirectoryConcurrency,
       resumeState: checkpoint.providerState,
-      checkpointDirectoryInterval: 20,
+      checkpointDirectoryInterval: 50,
+      persistConnection: async (nextConnection) => {
+        const credentialRevision = Number(job.snapshot.credentialRevision);
+        await this.repository.refreshActiveEncryptedConnection({
+          serviceId: job.serviceId,
+          userId: job.userId,
+          credentialRevision,
+          encryptedConnection: this.vault.encrypt(nextConnection),
+        });
+        this.logger.info({
+          日志关键字: "codex-flycloud-helper-guangya-token-refresh",
+          事件: "扫描期间保存光鸭刷新令牌",
+          任务ID: job.id,
+          服务ID: job.serviceId,
+          凭据修订: credentialRevision,
+        });
+      },
       onCheckpoint: (providerCheckpoint) => {
         checkpointCandidate = providerCheckpoint;
       },
@@ -868,13 +1087,16 @@ export class ScanWorker {
         });
       },
     })) {
-      await persistCheckpointCandidate();
+      await scheduleCheckpointCandidate();
+      throwCheckpointCommitError();
       await throwTmdbRecoveryAfterDraining();
       const requestedControl = await this.repository.getJobControl(job.id);
       if (requestedControl !== "none") {
         // 当前窗口不覆盖上一安全检查点；恢复时重放该窗口，避免进度和游标跨时刻造成漏扫。
         await flushActiveDirectory();
         await Promise.all([...pendingBusinessTasks]);
+        await checkpointCommitChain;
+        throwCheckpointCommitError();
         await publishProgress("enumerating");
         await this.applyControlAction(job);
         this.logger.info({
@@ -920,14 +1142,22 @@ export class ScanWorker {
               NFO类型: nfoSidecars.get(nfoPath)?.metadata.rootType ?? "unknown",
             });
           } catch (error) {
+            await recordScanFailure({
+              stage: "scraping",
+              errorCode: readFailureCode(error, "nfo_read_failed"),
+              error,
+              recovered: true,
+              mediaPath: entry.path,
+              resourceId: entry.resourceId,
+              fileName: entry.name,
+              context: { 处理结果: "已回退到在线刮削" },
+            });
             this.logger.warn({
               日志关键字: "codex-flycloud-helper-scrape",
               事件: "读取NFO失败并回退在线刮削",
               任务ID: job.id,
               NFO路径: entry.path,
-              错误码: error && typeof error === "object" && "code" in error
-                ? String((error as { code?: string }).code)
-                : "nfo_read_failed",
+              错误码: readFailureCode(error, "nfo_read_failed"),
             });
           }
         }
@@ -955,12 +1185,7 @@ export class ScanWorker {
         rootTypes,
         rootPath,
         shouldProcess: true,
-        sourceFile: null,
-        preparationError: null,
-      };
-      activeDirectoryItems.push(candidate);
-      try {
-        const sourceFileInput: SourceFileRecord = {
+        sourceFileInput: {
           id: createStableId("src", job.userId, job.libraryId, entry.resourceId),
           userId: job.userId,
           serviceId: job.serviceId,
@@ -980,20 +1205,14 @@ export class ScanWorker {
           scanRootKey,
           generationId: sourceGenerationId,
           locator: entry.locator,
-        };
-        const unchangedSource = await this.repository.markSourceFileSeenIfUnchanged(sourceFileInput);
-        if (job.scanMode === "incremental" && unchangedSource && !isRetryJob && !replayingCheckpointWindow) {
-          candidate.shouldProcess = false;
-          skippedCount += 1;
-          if (shouldPublishProgress()) {
-            await publishProgress("enumerating");
-          }
-          continue;
-        }
-        candidate.sourceFile = await this.repository.upsertSourceFile(sourceFileInput);
-      } catch (error) {
-        candidate.preparationError = error;
-      }
+        },
+        skipIfUnchanged: job.scanMode === "incremental"
+          && !isRetryJob
+          && !replayingCheckpointWindow,
+        sourceFile: null,
+        preparationError: null,
+      };
+      activeDirectoryItems.push(candidate);
       if (shouldPublishProgress()) {
         await publishProgress("enumerating");
       }
@@ -1002,6 +1221,7 @@ export class ScanWorker {
     if (signal.aborted) {
       // 进程关闭时保留 running 状态和最近安全检查点；下次启动由 recoverInterruptedJobs 重新入队。
       await Promise.allSettled([...pendingBusinessTasks]);
+      await checkpointCommitChain;
       this.logger.info({
         日志关键字: "codex-flycloud-helper-checkpoint",
         事件: "Worker停止后保留扫描检查点",
@@ -1037,6 +1257,8 @@ export class ScanWorker {
     }
     await publishProgress("scraping");
     await Promise.all(pendingBusinessTasks);
+    await checkpointCommitChain;
+    throwCheckpointCommitError();
     await throwTmdbRecoveryAfterDraining();
     await publishProgress("scraping");
 

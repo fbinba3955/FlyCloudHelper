@@ -13,6 +13,7 @@
     "@tanstack/react-router": "^1.170.18",
     "clsx": "^2.1.1",
     "lucide-react": "^0.575.0",
+    "qrcode.react": "^4.2.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "tailwind-merge": "^3.5.0"

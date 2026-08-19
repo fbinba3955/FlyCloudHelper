@@ -1,11 +1,12 @@
 import { Link } from "@tanstack/react-router";
-import { Pause, Play, Radio, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
+import { Download, Pause, Play, Radio, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   cancelScanJob,
   deleteScanJob,
+  downloadScanFailureReport,
   listJobs,
   listServices,
   pauseScanJob,
@@ -147,6 +148,7 @@ function JobsView({ admin }: { admin: boolean }) {
   const canResumeActiveJob = activeJob?.status === "paused";
   const canCancelActiveJob = Boolean(activeJob && ["queued", "running", "retry_waiting", "paused"].includes(activeJob.status));
   const canDeleteActiveJob = Boolean(activeJob && ["completed", "failed", "cancelled"].includes(activeJob.status));
+  const canDownloadFailureReport = Boolean(activeJob && activeJob.status !== "queued");
   const snapshotFields = activeJob ? getJobSnapshotFields(activeJob.snapshot) : [];
   const pluginSnapshots = activeJob ? getJobPluginSnapshots(activeJob.snapshot) : [];
 
@@ -234,6 +236,23 @@ function JobsView({ admin }: { admin: boolean }) {
     }
   }
 
+  /** 下载任务扫描、识别和刮削阶段产生的脱敏失败报告。 */
+  async function downloadSelectedFailureReport(): Promise<void> {
+    if (!activeJob || !canDownloadFailureReport) return;
+    setMessage("正在下载扫描失败报告…");
+    try {
+      await downloadScanFailureReport(activeJob.id, admin);
+      setMessage(`任务 ${activeJob.id} 的失败报告已开始下载`);
+    } catch (error) {
+      console.warn("codex-scan-failure-report", {
+        "事件": "扫描失败报告下载失败",
+        "任务ID": activeJob.id,
+        "错误信息": error instanceof Error ? error.message : "未知错误",
+      });
+      setMessage(error instanceof Error ? error.message : "扫描失败报告下载失败");
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -259,6 +278,11 @@ function JobsView({ admin }: { admin: boolean }) {
                 <span title="完整电影或节目中取得元数据匹配结果的数量">已匹配 {formatOptionalCount(activeJob.matchedCount)}</span>
                 <span title="完整电影或节目中已处理但没有取得元数据匹配结果的数量">未匹配 {formatOptionalCount(activeJob.unmatchedCount)}</span>
                 <span title="完整电影或节目处理失败的数量">错误 {activeJob.errorCount.toLocaleString()}</span>
+              </div>
+              <div className="mt-4 flex justify-end border-t border-border/70 pt-4">
+                <SecondaryButton onClick={() => void downloadSelectedFailureReport()} disabled={!canDownloadFailureReport}>
+                  <Download className="size-4" /> 下载失败报告
+                </SecondaryButton>
               </div>
             </div>
             <h3 className="mt-6 mb-3 text-sm font-semibold">配置快照（只读）</h3>

@@ -13,6 +13,7 @@ import type { ApiRuntime } from "../runtime.js";
 import {
   createFlymbyRecommendedScanSettings,
   type ProviderAdapter,
+  type ProviderConnectionContext,
   type ProviderRecommendedScanSettings,
   type ScanRoot,
 } from "../providers/types.js";
@@ -32,6 +33,45 @@ export function validateServiceDataType(value: unknown): MediaType {
 /** 判断连接配置中是否包含明文 HTTP Provider 地址，不记录完整地址。 */
 export function hasHttpProviderAddress(connection: Record<string, unknown>): boolean {
   return Object.values(connection).some((value) => typeof value === "string" && /^http:\/\//iu.test(value.trim()));
+}
+
+/**
+ * 将光鸭一次性授权会话解析成服务端 Token 连接；其他 Provider 保持普通表单连接。
+ * 返回的授权会话 ID 仅在连接成功落库后消费，验证失败时允许用户直接重试。
+ */
+export function resolveProviderConnection(
+  runtime: ApiRuntime,
+  actorUserId: string,
+  targetUserId: string,
+  providerType: string,
+  connectionInput: Record<string, unknown>,
+): { connection: Record<string, unknown>; authorizationSessionId: string | null } {
+  if (providerType !== "guangya") return { connection: connectionInput, authorizationSessionId: null };
+  const authorizationSessionId = requireString(
+    connectionInput,
+    "authorizationSessionId",
+    "光鸭扫码登录会话 ID",
+    100,
+  );
+  return {
+    connection: runtime.providers.guangyaAuthorization.getAuthorizedConnection(
+      actorUserId,
+      targetUserId,
+      authorizationSessionId,
+    ),
+    authorizationSessionId,
+  };
+}
+
+/** 在服务连接成功落库后销毁光鸭一次性授权会话。 */
+export function consumeProviderAuthorization(
+  runtime: ApiRuntime,
+  actorUserId: string,
+  authorizationSessionId: string | null,
+): void {
+  if (authorizationSessionId) {
+    runtime.providers.guangyaAuthorization.consume(actorUserId, authorizationSessionId);
+  }
 }
 
 /** 校验单个扫描根并移除未声明字段。 */
@@ -204,14 +244,15 @@ export async function validateConfiguredScanRoots(
   adapter: ProviderAdapter,
   connection: Record<string, unknown>,
   scanProfile: Record<string, unknown>,
+  context?: ProviderConnectionContext,
 ): Promise<void> {
   const fullRoots = getScanRootsForMode(scanProfile, "full");
   const incrementalRoots = getScanRootsForMode(scanProfile, "incremental");
   if (fullRoots.length > 0) {
-    await adapter.validateRoots(connection, fullRoots);
+    await adapter.validateRoots(connection, fullRoots, undefined, context);
   }
   if (incrementalRoots.length > 0) {
-    await adapter.validateRoots(connection, incrementalRoots);
+    await adapter.validateRoots(connection, incrementalRoots, undefined, context);
   }
 }
 
@@ -262,12 +303,16 @@ export async function validateProviderAccess(
   adapter: ProviderAdapter,
   connection: Record<string, unknown>,
   scanProfile: Record<string, unknown>,
+  context?: ProviderConnectionContext,
 ): Promise<void> {
-  const validation = await adapter.validateConnection(connection);
+  const validation = await adapter.validateConnection(connection, undefined, context);
   if (!validation.valid || !validation.rootAccessible) {
     throw new ApiError(422, "provider_connection_invalid", "网盘连接或根目录不可用");
   }
-  await validateConfiguredScanRoots(adapter, connection, scanProfile);
+  const fullRoots = getScanRootsForMode(scanProfile, "full");
+  const incrementalRoots = getScanRootsForMode(scanProfile, "incremental");
+  if (fullRoots.length > 0) await adapter.validateRoots(connection, fullRoots, undefined, context);
+  if (incrementalRoots.length > 0) await adapter.validateRoots(connection, incrementalRoots, undefined, context);
 }
 
 /** 从 SSE 请求读取兼容 Header 和查询参数的事件游标。 */
@@ -289,9 +334,16 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   });
 
   server.post<{ Body: Record<string, unknown> }>("/api/v1/providers/:providerType/validate", async (request) => {
-    await requireRequestUser(request, runtime.database);
+    const user = await requireRequestUser(request, runtime.database);
     const providerType = String((request.params as { providerType: string }).providerType);
-    const connection = requireObject(request.body, "connection", "连接配置");
+    const resolved = resolveProviderConnection(
+      runtime,
+      user.id,
+      user.id,
+      providerType,
+      requireObject(request.body, "connection", "连接配置"),
+    );
+    const connection = resolved.connection;
     const result = await runtime.providers.get(providerType).validateConnection(connection);
     return { providerType, ...result };
   });
@@ -315,7 +367,14 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const dataType = validateServiceDataType(request.body.dataType);
     const provider = requireObject(request.body, "provider", "Provider");
     const providerType = requireString(provider, "type", "Provider 类型", 64);
-    const connection = requireObject(provider, "connection", "连接配置");
+    const resolvedConnection = resolveProviderConnection(
+      runtime,
+      user.id,
+      user.id,
+      providerType,
+      requireObject(provider, "connection", "连接配置"),
+    );
+    const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(providerType);
     const scanProfile = validateScanProfile(
       request.body.scan === undefined
@@ -347,6 +406,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
         ? { id: randomUUID(), clientDeviceId, clientServiceId }
         : undefined,
     });
+    consumeProviderAuthorization(runtime, user.id, resolvedConnection.authorizationSessionId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-service-data-type",
       事件: "创建云端服务",
@@ -380,6 +440,24 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const listing = await runtime.providers.get(service.providerType).browseDirectories(
       connection,
       readProviderDirectoryParent(request.query),
+      undefined,
+      {
+        persistConnection: async (nextConnection) => {
+          await runtime.repository.refreshActiveEncryptedConnection({
+            serviceId: service.id,
+            userId: user.id,
+            credentialRevision: service.credentialRevision,
+            encryptedConnection: runtime.vault.encrypt(nextConnection),
+          });
+          runtime.logBusinessEvent("info", {
+            日志关键字: "codex-flycloud-helper-guangya-token-refresh",
+            事件: "目录浏览期间保存光鸭刷新令牌",
+            用户ID: user.id,
+            服务ID: service.id,
+            凭据修订: service.credentialRevision,
+          });
+        },
+      },
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-directory-picker",
@@ -408,14 +486,27 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/connection/validate", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
-    const connection = requireObject(request.body, "connection", "连接配置");
+    const connection = resolveProviderConnection(
+      runtime,
+      user.id,
+      user.id,
+      service.providerType,
+      requireObject(request.body, "connection", "连接配置"),
+    ).connection;
     return runtime.providers.get(service.providerType).validateConnection(connection);
   });
 
   server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/connection", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
-    const connection = requireObject(request.body, "connection", "连接配置");
+    const resolvedConnection = resolveProviderConnection(
+      runtime,
+      user.id,
+      user.id,
+      service.providerType,
+      requireObject(request.body, "connection", "连接配置"),
+    );
+    const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(service.providerType);
     await validateProviderAccess(adapter, connection, service.scanProfile);
     const updated = await runtime.repository.updateConnection({
@@ -424,6 +515,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       encryptedConnection: runtime.vault.encrypt(connection),
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
     });
+    consumeProviderAuthorization(runtime, user.id, resolvedConnection.authorizationSessionId);
     if (hasHttpProviderAddress(connection)) {
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-provider-http",
@@ -444,7 +536,23 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       await runtime.repository.getActiveEncryptedConnection(service.id, user.id),
     );
     try {
-      await validateProviderAccess(adapter, connection, service.scanProfile);
+      await validateProviderAccess(adapter, connection, service.scanProfile, {
+        persistConnection: async (nextConnection) => {
+          await runtime.repository.refreshActiveEncryptedConnection({
+            serviceId: service.id,
+            userId: user.id,
+            credentialRevision: service.credentialRevision,
+            encryptedConnection: runtime.vault.encrypt(nextConnection),
+          });
+          runtime.logBusinessEvent("info", {
+            日志关键字: "codex-flycloud-helper-guangya-token-refresh",
+            事件: "重连期间保存光鸭刷新令牌",
+            用户ID: user.id,
+            服务ID: service.id,
+            凭据修订: service.credentialRevision,
+          });
+        },
+      });
     } catch (error) {
       runtime.logBusinessEvent("warn", {
         日志关键字: "codex-flycloud-helper-provider-reconnect",
@@ -480,7 +588,23 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       runtime.providers.get(service.providerType).descriptor.recommendedScanSettings,
     );
     const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, user.id));
-    await validateConfiguredScanRoots(runtime.providers.get(service.providerType), connection, profile);
+    await validateConfiguredScanRoots(runtime.providers.get(service.providerType), connection, profile, {
+      persistConnection: async (nextConnection) => {
+        await runtime.repository.refreshActiveEncryptedConnection({
+          serviceId: service.id,
+          userId: user.id,
+          credentialRevision: service.credentialRevision,
+          encryptedConnection: runtime.vault.encrypt(nextConnection),
+        });
+        runtime.logBusinessEvent("info", {
+          日志关键字: "codex-flycloud-helper-guangya-token-refresh",
+          事件: "扫描路径验证期间保存光鸭刷新令牌",
+          用户ID: user.id,
+          服务ID: service.id,
+          凭据修订: service.credentialRevision,
+        });
+      },
+    });
     const updatedService = await runtime.repository.updateScanProfile(request.params.serviceId, user.id, profile);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-scan-path",
@@ -626,7 +750,9 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.delete<{ Params: { jobId: string }; Body: Record<string, unknown> }>("/api/v1/scan-jobs/:jobId", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, request.params.jobId);
+    const job = await runtime.repository.getJob(request.params.jobId, user.id);
     await runtime.repository.deleteScanJob(request.params.jobId, user.id);
+    await runtime.failureReports.remove(job);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-delete",
       事件: "用户删除扫描任务",

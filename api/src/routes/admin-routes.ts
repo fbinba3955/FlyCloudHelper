@@ -20,10 +20,12 @@ import type { ApiRuntime } from "../runtime.js";
 import { tmdbKeySettingName, validateTmdbKeyList } from "../system-settings.js";
 import { streamJobEvents } from "./event-stream.js";
 import {
+  consumeProviderAuthorization,
   getScanRootsForMode,
   hasHttpProviderAddress,
   readProviderDirectoryParent,
   readVideoMetadataLogFields,
+  resolveProviderConnection,
   validateConfiguredScanRoots,
   validateMetadataProfile,
   validateProviderAccess,
@@ -266,7 +268,14 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const dataType = validateServiceDataType(request.body.dataType);
     const provider = requireObject(request.body, "provider", "Provider");
     const providerType = requireString(provider, "type", "Provider 类型", 64);
-    const connection = requireObject(provider, "connection", "连接配置");
+    const resolvedConnection = resolveProviderConnection(
+      runtime,
+      operator.id,
+      owner.id,
+      providerType,
+      requireObject(provider, "connection", "连接配置"),
+    );
+    const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(providerType);
     const scanProfile = validateScanProfile(
       request.body.scan === undefined
@@ -292,6 +301,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
         dataType,
       ),
     });
+    consumeProviderAuthorization(runtime, operator.id, resolvedConnection.authorizationSessionId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-service-data-type",
       事件: "管理员创建云端服务",
@@ -330,6 +340,24 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const listing = await runtime.providers.get(service.providerType).browseDirectories(
       connection,
       readProviderDirectoryParent(request.query),
+      undefined,
+      {
+        persistConnection: async (nextConnection) => {
+          await runtime.repository.refreshActiveEncryptedConnection({
+            serviceId: service.id,
+            userId: service.userId,
+            credentialRevision: service.credentialRevision,
+            encryptedConnection: runtime.vault.encrypt(nextConnection),
+          });
+          runtime.logBusinessEvent("info", {
+            日志关键字: "codex-flycloud-helper-guangya-token-refresh",
+            事件: "管理员目录浏览期间保存光鸭刷新令牌",
+            管理员ID: operator.id,
+            服务ID: service.id,
+            凭据修订: service.credentialRevision,
+          });
+        },
+      },
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-directory-picker",
@@ -343,15 +371,29 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   });
 
   server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/connection/validate", async (request) => {
-    await requireSuperAdmin(request, runtime.database);
+    const operator = await requireSuperAdmin(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-    return runtime.providers.get(service.providerType).validateConnection(requireObject(request.body, "connection", "连接配置"));
+    const connection = resolveProviderConnection(
+      runtime,
+      operator.id,
+      service.userId,
+      service.providerType,
+      requireObject(request.body, "connection", "连接配置"),
+    ).connection;
+    return runtime.providers.get(service.providerType).validateConnection(connection);
   });
 
   server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/connection", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
-    const connection = requireObject(request.body, "connection", "连接配置");
+    const resolvedConnection = resolveProviderConnection(
+      runtime,
+      operator.id,
+      service.userId,
+      service.providerType,
+      requireObject(request.body, "connection", "连接配置"),
+    );
+    const connection = resolvedConnection.connection;
     const adapter = runtime.providers.get(service.providerType);
     await validateProviderAccess(adapter, connection, service.scanProfile);
     const updated = await runtime.repository.updateConnection({
@@ -360,6 +402,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       encryptedConnection: runtime.vault.encrypt(connection),
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
     });
+    consumeProviderAuthorization(runtime, operator.id, resolvedConnection.authorizationSessionId);
     if (hasHttpProviderAddress(connection)) {
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-provider-http",
@@ -381,7 +424,23 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       await runtime.repository.getActiveEncryptedConnection(service.id, service.userId),
     );
     try {
-      await validateProviderAccess(adapter, connection, service.scanProfile);
+      await validateProviderAccess(adapter, connection, service.scanProfile, {
+        persistConnection: async (nextConnection) => {
+          await runtime.repository.refreshActiveEncryptedConnection({
+            serviceId: service.id,
+            userId: service.userId,
+            credentialRevision: service.credentialRevision,
+            encryptedConnection: runtime.vault.encrypt(nextConnection),
+          });
+          runtime.logBusinessEvent("info", {
+            日志关键字: "codex-flycloud-helper-guangya-token-refresh",
+            事件: "管理员重连期间保存光鸭刷新令牌",
+            管理员ID: operator.id,
+            服务ID: service.id,
+            凭据修订: service.credentialRevision,
+          });
+        },
+      });
     } catch (error) {
       runtime.logBusinessEvent("warn", {
         日志关键字: "codex-flycloud-helper-provider-reconnect",
@@ -420,7 +479,23 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       runtime.providers.get(service.providerType).descriptor.recommendedScanSettings,
     );
     const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, service.userId));
-    await validateConfiguredScanRoots(runtime.providers.get(service.providerType), connection, scanProfile);
+    await validateConfiguredScanRoots(runtime.providers.get(service.providerType), connection, scanProfile, {
+      persistConnection: async (nextConnection) => {
+        await runtime.repository.refreshActiveEncryptedConnection({
+          serviceId: service.id,
+          userId: service.userId,
+          credentialRevision: service.credentialRevision,
+          encryptedConnection: runtime.vault.encrypt(nextConnection),
+        });
+        runtime.logBusinessEvent("info", {
+          日志关键字: "codex-flycloud-helper-guangya-token-refresh",
+          事件: "管理员扫描路径验证期间保存光鸭刷新令牌",
+          管理员ID: operator.id,
+          服务ID: service.id,
+          凭据修订: service.credentialRevision,
+        });
+      },
+    });
     const updated = await runtime.repository.updateScanProfile(
       service.id,
       service.userId,
@@ -579,7 +654,9 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.delete<{ Params: { jobId: string }; Body: Record<string, unknown> }>("/api/v1/admin/jobs/:jobId", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, request.params.jobId);
+    const job = await runtime.repository.getJob(request.params.jobId);
     await runtime.repository.deleteScanJob(request.params.jobId);
+    await runtime.failureReports.remove(job);
     await audit(runtime, operator, "delete_scan_job", "scan_job", request.params.jobId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-delete",
