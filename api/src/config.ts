@@ -312,7 +312,7 @@ export function loadApiConfig(): ApiConfig {
     tmdbPerKeyConcurrency: readPositiveInteger("FLYCLOUDHELPER_TMDB_PER_KEY_CONCURRENCY", 1),
     tmdbMaxConcurrency: readPositiveInteger("FLYCLOUDHELPER_TMDB_MAX_CONCURRENCY", 32),
     musicbrainzUserAgent: readEnvironmentValue("FLYCLOUDHELPER_MUSICBRAINZ_USER_AGENT")
-      || "FlyCloudHelper/0.1.1 (self-hosted)",
+      || "FlyCloudHelper/0.1.3 (self-hosted)",
     acoustidApiKey: acoustidSecret.value,
     fpcalcPath: readEnvironmentValue("FLYCLOUDHELPER_FPCALC_PATH") || null,
     workerEnabled: readBoolean("FLYCLOUDHELPER_WORKER_ENABLED", true),
