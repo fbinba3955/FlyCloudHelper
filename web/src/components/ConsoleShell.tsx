@@ -16,8 +16,17 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { useState, type ButtonHTMLAttributes, type ComponentType, type ReactNode } from "react";
-import { logout, type AuthRole } from "@/lib/api";
+import { useEffect, useRef, useState, type ButtonHTMLAttributes, type ComponentType, type ReactNode } from "react";
+import {
+  clearNotifications,
+  deleteNotification,
+  listNotifications,
+  logout,
+  type AuthRole,
+  type ConsoleNotification,
+  type ConsoleNotificationTone,
+} from "@/lib/api";
+import { useApiResource } from "@/lib/use-api-resource";
 import { cn } from "@/lib/utils";
 import { StatusPill } from "@/components/ui-kit";
 
@@ -25,6 +34,29 @@ interface NavigationItem {
   to: string;
   label: string;
   icon: ComponentType<{ className?: string }>;
+}
+
+const notificationCategoryLabels: Record<ConsoleNotification["category"], string> = {
+  task: "任务",
+  security: "敏感操作",
+  system: "系统",
+};
+
+const notificationToneClasses: Record<ConsoleNotificationTone, string> = {
+  info: "bg-primary",
+  success: "bg-success",
+  warning: "bg-warning",
+  danger: "bg-destructive",
+};
+
+/** 把通知时间格式化为当前浏览器所在时区的中文时间。 */
+function formatNotificationTime(createdAt: string): string {
+  return new Date(createdAt).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 /** 普通用户控制台导航。 */
@@ -127,7 +159,78 @@ export function ConsoleShell({
   actualRole: AuthRole;
 }) {
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
+  const [notificationOpen, setNotificationOpen] = useState(false);
+  const [notificationActionId, setNotificationActionId] = useState<string | null>(null);
+  const [notificationError, setNotificationError] = useState<string | null>(null);
+  const notificationPanelRef = useRef<HTMLDivElement | null>(null);
+  // 关键变量：同步占用清除操作，避免 React 按钮状态刷新前重复提交。
+  const notificationActionRef = useRef<string | null>(null);
+  const notifications = useApiResource(() => listNotifications(30), []);
   const navigationItems = role === "super_admin" ? adminNavigation : userNavigation;
+  const notificationItems = notifications.data ?? [];
+
+  useEffect(() => {
+    // 通知不要求扫描进度级实时性，每 10 秒检查一次任务完成与敏感操作。
+    const timer = window.setInterval(() => void notifications.refresh(), 10_000);
+    return () => window.clearInterval(timer);
+  }, [notifications.refresh]);
+
+  useEffect(() => {
+    if (!notificationOpen) return;
+    /** 点击通知面板之外的区域时收起面板。 */
+    function closeNotificationPanel(event: MouseEvent): void {
+      if (!notificationPanelRef.current?.contains(event.target as Node)) {
+        setNotificationOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", closeNotificationPanel);
+    return () => document.removeEventListener("mousedown", closeNotificationPanel);
+  }, [notificationOpen]);
+
+  /** 清除一条当前账号通知，并拦截重复操作。 */
+  async function removeNotification(notificationId: string): Promise<void> {
+    if (notificationActionRef.current !== null) return;
+    notificationActionRef.current = notificationId;
+    setNotificationActionId(notificationId);
+    setNotificationError(null);
+    try {
+      await deleteNotification(notificationId);
+      await notifications.refresh();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "通知清除失败";
+      console.warn("codex-flycloud-notification", {
+        事件: "网页清除单条通知失败",
+        通知ID: notificationId,
+        错误信息: errorMessage,
+      });
+      setNotificationError(errorMessage);
+    } finally {
+      notificationActionRef.current = null;
+      setNotificationActionId(null);
+    }
+  }
+
+  /** 清除当前账号全部通知，并拦截清除期间的其他操作。 */
+  async function removeAllNotifications(): Promise<void> {
+    if (notificationActionRef.current !== null || notificationItems.length === 0) return;
+    notificationActionRef.current = "all";
+    setNotificationActionId("all");
+    setNotificationError(null);
+    try {
+      await clearNotifications();
+      await notifications.refresh();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "全部通知清除失败";
+      console.warn("codex-flycloud-notification", {
+        事件: "网页清除全部通知失败",
+        错误信息: errorMessage,
+      });
+      setNotificationError(errorMessage);
+    } finally {
+      notificationActionRef.current = null;
+      setNotificationActionId(null);
+    }
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -231,14 +334,74 @@ export function ConsoleShell({
                   className="w-44 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
                 />
               </div>
-              <button
-                type="button"
-                aria-label="通知"
-                className="relative grid size-9 place-items-center rounded-lg border border-border text-muted-foreground"
-              >
-                <Bell className="size-4" />
-                <span className="absolute top-2 right-2.5 size-1.5 rounded-full bg-destructive" />
-              </button>
+              <div ref={notificationPanelRef} className="relative">
+                <button
+                  type="button"
+                  aria-label="通知"
+                  aria-expanded={notificationOpen}
+                  onClick={() => {
+                    setNotificationOpen((current) => !current);
+                    if (!notificationOpen) void notifications.refresh();
+                  }}
+                  className="relative grid size-9 place-items-center rounded-lg border border-border text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <Bell className="size-4" />
+                  {notificationItems.length > 0 && <span className="absolute top-2 right-2.5 size-1.5 rounded-full bg-destructive" />}
+                </button>
+                {notificationOpen && (
+                  <div className="absolute top-11 right-0 z-50 w-[min(24rem,calc(100vw-2rem))] overflow-hidden rounded-xl border border-border bg-background shadow-2xl">
+                    <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
+                      <div>
+                        <p className="text-sm font-semibold">通知</p>
+                        <p className="mt-0.5 text-[11px] text-muted-foreground">共 {notificationItems.length} 条</p>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={notificationItems.length === 0 || notificationActionId !== null}
+                        onClick={() => void removeAllNotifications()}
+                        className="text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {notificationActionId === "all" ? "正在清除…" : "全部清除"}
+                      </button>
+                    </div>
+                    {notificationError && <p className="border-b border-border px-4 py-2 text-xs text-destructive">{notificationError}</p>}
+                    <div className="max-h-[min(30rem,70vh)] overflow-y-auto">
+                      {notifications.loading && notificationItems.length === 0 && <p className="px-4 py-10 text-center text-xs text-muted-foreground">正在读取通知…</p>}
+                      {!notifications.loading && notificationItems.length === 0 && <p className="px-4 py-10 text-center text-xs text-muted-foreground">暂无通知</p>}
+                      {notificationItems.map((notification) => {
+                        const content = (
+                          <>
+                            <div className="flex items-center gap-2">
+                              <span className={cn("size-2 shrink-0 rounded-full", notificationToneClasses[notification.tone])} />
+                              <span className="text-[10px] text-muted-foreground">{notificationCategoryLabels[notification.category]}</span>
+                              <span className="ml-auto text-[10px] text-muted-foreground">{formatNotificationTime(notification.createdAt)}</span>
+                            </div>
+                            <p className="mt-2 pr-7 text-sm font-medium text-foreground">{notification.title}</p>
+                            <p className="mt-1 pr-7 text-xs leading-5 text-muted-foreground">{notification.message}</p>
+                            {notification.actionPath && <p className="mt-2 text-[11px] text-primary-soft">查看详情</p>}
+                          </>
+                        );
+                        return (
+                          <article key={notification.id} className="relative border-b border-border px-4 py-3 last:border-b-0 hover:bg-secondary/35">
+                            {notification.actionPath ? <a href={notification.actionPath} onClick={() => setNotificationOpen(false)}>{content}</a> : content}
+                            <button
+                              type="button"
+                              aria-label={`清除通知：${notification.title}`}
+                              title="清除这条通知"
+                              disabled={notificationActionId !== null}
+                              onClick={() => void removeNotification(notification.id)}
+                              className="absolute right-3 top-9 grid size-7 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              <X className="size-3.5" />
+                            </button>
+                          </article>
+                        );
+                      })}
+                    </div>
+                    {notifications.error && <p className="border-t border-border px-4 py-2 text-xs text-destructive">{notifications.error}</p>}
+                  </div>
+                )}
+              </div>
               <div className="flex items-center gap-2 rounded-lg border border-border bg-secondary/50 py-1.5 pr-3 pl-1.5">
                 <span
                   className="grid size-6 place-items-center rounded-md text-[11px] font-semibold text-primary-foreground"

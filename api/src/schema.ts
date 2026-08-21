@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
+import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 17;
+export const currentSchemaVersion = 24;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -29,9 +30,30 @@ async function addIndexIfMissing(
   } catch (error) {
     const databaseError = error as Error & { code?: string };
     const duplicateIndex = databaseError.code === "42P07"
-      || databaseError.code === "23505"
+      || databaseError.code === "42710"
       || databaseError.code === "ER_DUP_KEYNAME"
       || /index .* already exists/iu.test(databaseError.message);
+    if (!duplicateIndex) throw error;
+  }
+}
+
+/** 单独创建唯一约束，并容忍上次迁移已经完成但版本号尚未写回的情况。 */
+async function addUniqueIfMissing(
+  database: Knex,
+  tableName: string,
+  columns: string[],
+  indexName: string,
+): Promise<void> {
+  try {
+    await database.schema.alterTable(tableName, (table) => {
+      table.unique(columns, { indexName });
+    });
+  } catch (error) {
+    const databaseError = error as Error & { code?: string };
+    const duplicateIndex = databaseError.code === "42P07"
+      || databaseError.code === "23505"
+      || databaseError.code === "ER_DUP_KEYNAME"
+      || /(?:index|constraint) .* already exists/iu.test(databaseError.message);
     if (!duplicateIndex) throw error;
   }
 }
@@ -90,6 +112,19 @@ async function createIdentityTables(database: Knex): Promise<void> {
       table.string("user_id", 64).primary().references("id").inTable("user_accounts").onDelete("CASCADE");
       table.text("password_hash").notNullable();
       table.string("password_changed_at", 40).notNullable();
+    });
+  }
+
+  if (!(await database.schema.hasTable("user_external_identities"))) {
+    await database.schema.createTable("user_external_identities", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("provider", 32).notNullable();
+      table.string("identity_hash", 128).notNullable();
+      table.string("created_at", 40).notNullable();
+      table.unique(["provider", "identity_hash"], { indexName: "uq_user_external_identity" });
+      table.unique(["user_id", "provider"], { indexName: "uq_user_external_provider" });
+      table.index(["user_id"], "idx_user_external_identities_user");
     });
   }
 
@@ -220,6 +255,61 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.unique(["user_id", "client_device_id", "client_service_id"], { indexName: "uq_client_service_links_device" });
     });
   }
+
+  if (!(await database.schema.hasTable("service_migrations"))) {
+    await database.schema.createTable("service_migrations", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.string("request_id", 200).notNullable();
+      table.string("client_device_id", 200).notNullable();
+      table.string("client_service_id", 200).notNullable();
+      table.string("provider_type", 64).notNullable();
+      table.string("status", 32).notNullable();
+      table.string("stage", 32).notNullable();
+      table.integer("progress_percent").notNullable().defaultTo(0);
+      table.text("current_operation").notNullable();
+      table.bigInteger("processed_count").notNullable().defaultTo(0);
+      table.bigInteger("total_count").notNullable().defaultTo(0);
+      table.bigInteger("uploaded_bytes").notNullable().defaultTo(0);
+      table.bigInteger("expected_bytes").notNullable();
+      table.integer("uploaded_chunk_count").notNullable().defaultTo(0);
+      table.integer("expected_chunk_count").notNullable();
+      table.string("snapshot_sha256", 64).notNullable();
+      table.integer("snapshot_format_version").notNullable();
+      table.bigInteger("active_duration_ms").notNullable().defaultTo(0);
+      table.string("active_started_at", 40).nullable();
+      table.string("error_code", 100).nullable();
+      table.text("error_message").nullable();
+      table.integer("retryable").notNullable().defaultTo(0);
+      table.text("checkpoint_json").notNullable();
+      table.text("result_json").notNullable();
+      table.string("lease_owner", 100).nullable();
+      table.string("lease_expires_at", 40).nullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.string("finished_at", 40).nullable();
+      table.unique(["user_id", "client_device_id", "request_id"], { indexName: "uq_service_migrations_request" });
+      table.index(["user_id", "created_at"], "idx_service_migrations_user_created");
+      table.index(["status", "updated_at"], "idx_service_migrations_status_updated");
+      table.index(["user_id", "client_device_id", "client_service_id"], "idx_service_migrations_client_service");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_migration_chunks"))) {
+    await database.schema.createTable("service_migration_chunks", (table) => {
+      table.string("id", 64).primary();
+      table.string("migration_id", 64).notNullable().references("id").inTable("service_migrations").onDelete("CASCADE");
+      table.integer("chunk_index").notNullable();
+      table.bigInteger("size_bytes").notNullable();
+      table.string("sha256", 64).notNullable();
+      table.text("file_path").notNullable();
+      table.string("created_at", 40).notNullable();
+      table.unique(["migration_id", "chunk_index"], { indexName: "uq_service_migration_chunks_index" });
+      table.index(["migration_id"], "idx_service_migration_chunks_migration");
+    });
+  }
 }
 
 /** 创建扫描任务、源文件和媒体目录表。 */
@@ -346,6 +436,26 @@ async function createCatalogTables(database: Knex): Promise<void> {
     });
   }
 
+  if (!(await database.schema.hasTable("tmdb_metadata_cache"))) {
+    await database.schema.createTable("tmdb_metadata_cache", (table) => {
+      // 缓存键为查询条件的 SHA-256，不保存用户、服务、网盘凭据或原始查询标题。
+      table.string("cache_key", 64).primary();
+      table.string("cache_kind", 32).notNullable();
+      table.string("media_type", 16).notNullable();
+      table.bigInteger("provider_item_id").notNullable();
+      table.integer("season_number").nullable();
+      table.string("language", 32).notNullable();
+      table.string("region", 16).notNullable();
+      table.integer("details_synchronized").notNullable().defaultTo(0);
+      table.text("payload_json").notNullable();
+      table.string("expires_at", 40).notNullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.index(["expires_at"], "idx_tmdb_metadata_cache_expires");
+      table.index(["cache_kind", "provider_item_id"], "idx_tmdb_metadata_cache_provider_item");
+    });
+  }
+
   if (!(await database.schema.hasTable("source_files"))) {
     await database.schema.createTable("source_files", (table) => {
       table.string("id", 64).primary();
@@ -362,6 +472,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("etag", 255).nullable();
       table.string("scan_root_key", 64).nullable();
       table.string("generation_id", 64).notNullable();
+      table.integer("metadata_profile_revision").notNullable().defaultTo(0);
       table.text("locator_json").notNullable();
       table.string("status", 32).notNullable();
       table.string("created_at", 40).notNullable();
@@ -373,6 +484,9 @@ async function createCatalogTables(database: Knex): Promise<void> {
   }
   await addColumnIfMissing(database, "source_files", "scan_root_key", (table) => {
     table.string("scan_root_key", 64).nullable();
+  });
+  await addColumnIfMissing(database, "source_files", "metadata_profile_revision", (table) => {
+    table.integer("metadata_profile_revision").notNullable().defaultTo(0);
   });
 
   if (!(await database.schema.hasTable("media_items"))) {
@@ -436,6 +550,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("source_file_id", 64).notNullable().references("id").inTable("source_files").onDelete("CASCADE");
       table.text("locator_json").notNullable();
       table.unique(["user_id", "item_id", "source_file_id"], { indexName: "uq_file_links_item_file" });
+      table.unique(["user_id", "library_id", "source_file_id"], { indexName: "uq_file_links_source_owner" });
       table.index(["library_id"], "idx_file_links_library");
       table.index(["item_id"], "idx_file_links_item");
       table.index(["source_file_id"], "idx_file_links_source_file");
@@ -545,8 +660,45 @@ async function migrateCatalogDeletionIndexes(database: Knex): Promise<void> {
   await addIndexIfMissing(database, "catalog_changes", ["library_id"], "idx_catalog_changes_library");
 }
 
+/** 清理历史重复文件归属，并从数据库层保证一个源文件只能归属一个媒体条目。 */
+async function migrateUniqueSourceFileOwnership(database: Knex): Promise<void> {
+  const results = await repairDuplicateCatalogFileLinks(database);
+  for (const result of results) {
+    console.info(JSON.stringify({
+      日志关键字: "codex-flycloud-file-link-repair",
+      事件: "历史重复文件归属修复完成",
+      媒体库ID: result.libraryId,
+      重复源文件数量: result.duplicateSourceFileCount,
+      删除旧关联数量: result.removedFileLinkCount,
+      删除孤立子项数量: result.deletedLeafItemCount,
+      删除孤立父项数量: result.deletedParentItemCount,
+      最新目录版本: result.catalogVersion,
+    }));
+  }
+  await addUniqueIfMissing(
+    database,
+    "file_links",
+    ["user_id", "library_id", "source_file_id"],
+    "uq_file_links_source_owner",
+  );
+}
+
 /** 创建导出、插件和扩展审计表。 */
 async function createOperationTables(database: Knex): Promise<void> {
+  if (!(await database.schema.hasTable("user_notifications"))) {
+    await database.schema.createTable("user_notifications", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("category", 32).notNullable();
+      table.string("tone", 32).notNullable();
+      table.string("title", 255).notNullable();
+      table.text("message").notNullable();
+      table.string("action_path", 500).nullable();
+      table.string("created_at", 40).notNullable();
+      table.index(["user_id", "created_at"], "idx_user_notifications_user_created");
+    });
+  }
+
   if (!(await database.schema.hasTable("system_secret_settings"))) {
     await database.schema.createTable("system_secret_settings", (table) => {
       table.string("setting_key", 100).primary();
@@ -565,12 +717,56 @@ async function createOperationTables(database: Knex): Promise<void> {
       table.string("library_id", 64).notNullable();
       table.string("export_type", 32).notNullable();
       table.string("status", 32).notNullable();
+      table.string("stage", 32).notNullable().defaultTo("queued");
+      table.integer("progress_percent").notNullable().defaultTo(0);
+      table.bigInteger("processed_count").notNullable().defaultTo(0);
+      table.bigInteger("total_count").notNullable().defaultTo(0);
+      table.bigInteger("catalog_version").notNullable().defaultTo(0);
+      table.integer("format_version").notNullable().defaultTo(1);
       table.text("file_path").nullable();
       table.bigInteger("file_size").nullable();
       table.text("error_message").nullable();
       table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).nullable();
+      table.string("completed_at", 40).nullable();
     });
   }
+  await addColumnIfMissing(database, "library_exports", "stage", (table) => {
+    table.string("stage", 32).notNullable().defaultTo("completed");
+  });
+  await addColumnIfMissing(database, "library_exports", "progress_percent", (table) => {
+    table.integer("progress_percent").notNullable().defaultTo(0);
+  });
+  await addColumnIfMissing(database, "library_exports", "processed_count", (table) => {
+    table.bigInteger("processed_count").notNullable().defaultTo(0);
+  });
+  await addColumnIfMissing(database, "library_exports", "total_count", (table) => {
+    table.bigInteger("total_count").notNullable().defaultTo(0);
+  });
+  await addColumnIfMissing(database, "library_exports", "catalog_version", (table) => {
+    table.bigInteger("catalog_version").notNullable().defaultTo(0);
+  });
+  await addColumnIfMissing(database, "library_exports", "format_version", (table) => {
+    table.integer("format_version").notNullable().defaultTo(1);
+  });
+  await addColumnIfMissing(database, "library_exports", "updated_at", (table) => {
+    table.string("updated_at", 40).nullable();
+  });
+  await addColumnIfMissing(database, "library_exports", "completed_at", (table) => {
+    table.string("completed_at", 40).nullable();
+  });
+  await addIndexIfMissing(
+    database,
+    "library_exports",
+    ["user_id", "library_id", "created_at"],
+    "idx_library_exports_user_library_created",
+  );
+  await addIndexIfMissing(
+    database,
+    "library_exports",
+    ["library_id", "status"],
+    "idx_library_exports_library_status",
+  );
 
   if (!(await database.schema.hasTable("metadata_plugin_versions"))) {
     await database.schema.createTable("metadata_plugin_versions", (table) => {
@@ -653,6 +849,9 @@ export async function migrateDatabase(database: Knex): Promise<void> {
     }
     if (Number(existingState.schema_version ?? 0) < 16) {
       await migrateCatalogDeletionIndexes(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 20) {
+      await migrateUniqueSourceFileOwnership(database);
     }
     await database("system_state").where({ singleton_id: 1 }).update({
       service_instance_id: existingState.service_instance_id || randomUUID(),

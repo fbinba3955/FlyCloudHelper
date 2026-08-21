@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ApiConfig } from "../config.js";
 import { FlymbyVideoTitleCleaner } from "../media/flymby-video-title-cleaner.js";
+import type { TmdbMetadataCache } from "./tmdb-cache.js";
 
 interface TmdbKeyState {
   key: string;
@@ -107,6 +108,8 @@ export interface TmdbVideoMetadata {
   people: TmdbPersonMetadata[];
   matchedQuery: string;
   candidateCount: number;
+  /** true 表示已经读取详情接口；false 表示当前只有搜索候选摘要。 */
+  detailsSynchronized: boolean;
 }
 
 export interface TmdbEpisodeMetadata {
@@ -131,6 +134,8 @@ export interface TmdbVideoQuery {
   region: string;
   imdbId?: string;
   explicitTmdbId?: number;
+  /** false 时普通标题匹配命中后直接返回搜索摘要，不在扫描阶段读取详情。 */
+  includeDetails?: boolean;
   signal?: AbortSignal;
 }
 
@@ -152,9 +157,15 @@ export class TmdbKeyPool {
   private readonly perKeyConcurrency: number;
   private readonly maxConcurrency: number;
   private readonly diagnosticLogger: TmdbDiagnosticLogger;
+  private readonly persistentCache?: TmdbMetadataCache;
   private revisionValue: string;
 
-  public constructor(config: ApiConfig, keys: string[] = [], diagnosticLogger: TmdbDiagnosticLogger = () => undefined) {
+  public constructor(
+    config: ApiConfig,
+    keys: string[] = [],
+    diagnosticLogger: TmdbDiagnosticLogger = () => undefined,
+    persistentCache?: TmdbMetadataCache,
+  ) {
     this.states = keys.map((key) => ({
       key,
       inFlight: 0,
@@ -166,6 +177,7 @@ export class TmdbKeyPool {
     this.perKeyConcurrency = config.tmdbPerKeyConcurrency;
     this.maxConcurrency = config.tmdbMaxConcurrency;
     this.diagnosticLogger = diagnosticLogger;
+    this.persistentCache = persistentCache;
     this.revisionValue = this.createRevision(keys);
   }
 
@@ -222,6 +234,35 @@ export class TmdbKeyPool {
    * 命中候选后继续读取详情和演职人员，避免只把搜索摘要当作完整刮削结果。
    */
   public async scrapeVideo(query: TmdbVideoQuery): Promise<TmdbVideoMetadata | null> {
+    if (query.signal?.aborted) return null;
+    const explicitTmdbId = Number(query.explicitTmdbId ?? 0);
+    if (explicitTmdbId > 0) {
+      const directMetadata = await this.readCachedVideo(
+        this.buildVideoIdCacheKey(query.mediaType, explicitTmdbId, query.language, query.region),
+      );
+      if (directMetadata) return directMetadata;
+    }
+    // 关键变量：查询缓存键包含会影响匹配结果的全部公共参数，不包含用户、服务或网盘身份。
+    const queryCacheKey = this.buildVideoQueryCacheKey(query);
+    const cachedMetadata = await this.readCachedVideo(queryCacheKey);
+    if (cachedMetadata) return cachedMetadata;
+    if (this.states.length === 0) return null;
+    const metadata = await this.scrapeVideoFromRemote(query);
+    if (!metadata) return null;
+    await this.writeCachedVideo(queryCacheKey, query.language, query.region, metadata);
+    if (metadata.detailsSynchronized) {
+      await this.writeCachedVideo(
+        this.buildVideoIdCacheKey(metadata.mediaType, metadata.id, query.language, query.region),
+        query.language,
+        query.region,
+        metadata,
+      );
+    }
+    return metadata;
+  }
+
+  /** 未命中部署级缓存时，按 APP 的搜索、类型纠正和详情读取顺序请求 TMDB。 */
+  private async scrapeVideoFromRemote(query: TmdbVideoQuery): Promise<TmdbVideoMetadata | null> {
     if (this.states.length === 0 || query.signal?.aborted) return null;
     const explicitId = Number(query.explicitTmdbId ?? 0);
     if (explicitId > 0) {
@@ -297,6 +338,9 @@ export class TmdbKeyPool {
       );
       if (candidates.length === 0) continue;
       const candidate = this.pickCandidate(query.mediaType, candidates, attempt.title, attempt.year);
+      if (query.includeDetails === false) {
+        return this.mapSearchCandidateMetadata(query.mediaType, candidate, attempt.title, candidates.length);
+      }
       return this.readDetails(
         query.mediaType,
         candidate.id,
@@ -363,8 +407,14 @@ export class TmdbKeyPool {
     region: string,
     signal?: AbortSignal,
   ): Promise<TmdbVideoMetadata | null> {
-    if (this.states.length === 0 || tmdbId <= 0 || signal?.aborted) return null;
-    return this.readDetails(mediaType, tmdbId, "手动匹配", 1, language, region, signal);
+    if (tmdbId <= 0 || signal?.aborted) return null;
+    const cacheKey = this.buildVideoIdCacheKey(mediaType, tmdbId, language, region);
+    const cachedMetadata = await this.readCachedVideo(cacheKey);
+    if (cachedMetadata) return cachedMetadata;
+    if (this.states.length === 0) return null;
+    const metadata = await this.readDetails(mediaType, tmdbId, "手动匹配", 1, language, region, signal);
+    if (metadata) await this.writeCachedVideo(cacheKey, language, region, metadata);
+    return metadata;
   }
 
   /** 读取节目季信息，并只返回本地文件实际需要的单集元数据。 */
@@ -374,14 +424,19 @@ export class TmdbKeyPool {
     language: string,
     signal?: AbortSignal,
   ): Promise<TmdbEpisodeMetadata[]> {
-    if (tvId <= 0 || seasonNumber < 0) return [];
+    if (tvId <= 0 || seasonNumber < 0 || signal?.aborted) return [];
+    const cacheKey = this.buildTvSeasonCacheKey(tvId, seasonNumber, language);
+    const cachedEpisodes = await this.readCachedTvSeason(cacheKey);
+    // 空数组也表示已经确认该季没有可用单集，不能再次请求 TMDB。
+    if (cachedEpisodes !== null) return cachedEpisodes;
+    if (this.states.length === 0) return [];
     const payload = await this.requestJson<Record<string, unknown>>(
       `/tv/${tvId}/season/${seasonNumber}`,
       { language: language || "zh-CN" },
       signal,
     );
     const episodes = Array.isArray(payload?.episodes) ? payload.episodes : [];
-    return episodes.flatMap((raw): TmdbEpisodeMetadata[] => {
+    const metadata = episodes.flatMap((raw): TmdbEpisodeMetadata[] => {
       const item = asRecord(raw);
       const episodeNumber = toPositiveNumber(item.episode_number);
       if (episodeNumber <= 0) return [];
@@ -397,6 +452,148 @@ export class TmdbKeyPool {
         stillUrl: buildImageUrl(toText(item.still_path), "w780"),
         durationMs: runtime * 60_000,
       }];
+    });
+    await this.writeCachedTvSeason(cacheKey, tvId, seasonNumber, language, metadata);
+    return metadata;
+  }
+
+  /** 为标题匹配生成部署级公共缓存键，避免不同语言、地区或详情模式互相覆盖。 */
+  private buildVideoQueryCacheKey(query: TmdbVideoQuery): string {
+    return this.createMetadataCacheKey([
+      "v1",
+      "video_query",
+      query.mediaType,
+      this.normalizeCacheQueryText(query.title),
+      this.normalizeCacheQueryText(query.fallbackTitle ?? ""),
+      query.year ?? null,
+      String(query.imdbId ?? "").trim().toLowerCase(),
+      Number(query.explicitTmdbId ?? 0),
+      this.readLanguage(query.language),
+      this.readRegion(query.region),
+      query.includeDetails === false ? "summary" : "details",
+    ]);
+  }
+
+  /** 为已知 TMDB ID 的完整详情生成公共缓存键。 */
+  private buildVideoIdCacheKey(
+    mediaType: "movie" | "tv",
+    tmdbId: number,
+    language: string,
+    region: string,
+  ): string {
+    return this.createMetadataCacheKey([
+      "v1",
+      "video_id",
+      mediaType,
+      tmdbId,
+      this.readLanguage(language),
+      this.readRegion(region),
+      "details",
+    ]);
+  }
+
+  /** 为节目季详情生成公共缓存键。 */
+  private buildTvSeasonCacheKey(tvId: number, seasonNumber: number, language: string): string {
+    return this.createMetadataCacheKey([
+      "v1",
+      "tv_season",
+      tvId,
+      seasonNumber,
+      this.readLanguage(language),
+    ]);
+  }
+
+  /** 对结构化参数计算 SHA-256，数据库不保存原始查询标题。 */
+  private createMetadataCacheKey(parts: Array<string | number | null>): string {
+    return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+  }
+
+  /** 只统一 Unicode、大小写和连续空白，避免过度清洗让不同查询误用同一缓存。 */
+  private normalizeCacheQueryText(value: string): string {
+    return String(value ?? "").normalize("NFKC").trim().replace(/\s+/gu, " ").toLocaleLowerCase();
+  }
+
+  /** 读取 TMDB 语言，并统一空值的默认语义。 */
+  private readLanguage(language: string): string {
+    return String(language || "zh-CN").trim() || "zh-CN";
+  }
+
+  /** 读取 TMDB 地区，并统一大小写和空值的默认语义。 */
+  private readRegion(region: string): string {
+    return (String(region || "CN").trim() || "CN").toUpperCase();
+  }
+
+  /** 缓存读取失败只降级为正常 TMDB 请求，不能让扫描任务失败。 */
+  private async readCachedVideo(cacheKey: string): Promise<TmdbVideoMetadata | null> {
+    if (!this.persistentCache) return null;
+    try {
+      return await this.persistentCache.getVideo(cacheKey);
+    } catch (error) {
+      this.logCacheFailure("共享缓存读取失败", "影视", error);
+      return null;
+    }
+  }
+
+  /** 把成功匹配的电影或节目加入共享缓存写入批次。 */
+  private async writeCachedVideo(
+    cacheKey: string,
+    language: string,
+    region: string,
+    metadata: TmdbVideoMetadata,
+  ): Promise<void> {
+    if (!this.persistentCache) return;
+    try {
+      await this.persistentCache.putVideo({
+        cacheKey,
+        language: this.readLanguage(language),
+        region: this.readRegion(region),
+        metadata,
+      });
+    } catch (error) {
+      this.logCacheFailure("共享缓存写入失败", "影视", error);
+    }
+  }
+
+  /** 缓存节目季读取失败时继续请求 TMDB。 */
+  private async readCachedTvSeason(cacheKey: string): Promise<TmdbEpisodeMetadata[] | null> {
+    if (!this.persistentCache) return null;
+    try {
+      return await this.persistentCache.getTvSeason(cacheKey);
+    } catch (error) {
+      this.logCacheFailure("共享缓存读取失败", "节目季", error);
+      return null;
+    }
+  }
+
+  /** 把节目季结果加入共享缓存写入批次。 */
+  private async writeCachedTvSeason(
+    cacheKey: string,
+    tvId: number,
+    seasonNumber: number,
+    language: string,
+    episodes: TmdbEpisodeMetadata[],
+  ): Promise<void> {
+    if (!this.persistentCache) return;
+    try {
+      await this.persistentCache.putTvSeason({
+        cacheKey,
+        tvId,
+        seasonNumber,
+        language: this.readLanguage(language),
+        episodes,
+      });
+    } catch (error) {
+      this.logCacheFailure("共享缓存写入失败", "节目季", error);
+    }
+  }
+
+  /** 记录缓存降级信息，不输出标题、Key、服务或用户身份。 */
+  private logCacheFailure(event: string, cacheType: string, error: unknown): void {
+    this.diagnosticLogger({
+      日志关键字: "codex-flycloud-helper-tmdb-cache",
+      事件: event,
+      缓存类型: cacheType,
+      错误信息: error instanceof Error ? error.message : "未知缓存错误",
     });
   }
 
@@ -549,6 +746,34 @@ export class TmdbKeyPool {
       people: readPeople(isMovie ? details.credits : details.aggregate_credits),
       matchedQuery,
       candidateCount,
+      detailsSynchronized: Boolean(payload),
+    };
+  }
+
+  /** 将 TMDB 搜索候选转换为扫描可直接落库的摘要，不触发详情接口调用。 */
+  private mapSearchCandidateMetadata(
+    mediaType: "movie" | "tv",
+    candidate: TmdbSearchCandidate,
+    matchedQuery: string,
+    candidateCount: number,
+  ): TmdbVideoMetadata {
+    return {
+      id: candidate.id,
+      mediaType,
+      title: candidate.title || matchedQuery,
+      originalTitle: candidate.originalTitle,
+      overview: candidate.overview,
+      year: extractDateYear(candidate.date),
+      releaseDate: candidate.date,
+      rating: candidate.voteAverage,
+      genres: readGenres(undefined, candidate.genreIds, mediaType),
+      posterUrl: buildImageUrl(candidate.posterPath, "w500"),
+      backdropUrl: buildImageUrl(candidate.backdropPath, "w1280"),
+      episodeCount: 0,
+      people: [],
+      matchedQuery,
+      candidateCount,
+      detailsSynchronized: false,
     };
   }
 

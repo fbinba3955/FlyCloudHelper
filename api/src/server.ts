@@ -8,6 +8,7 @@ import { FlyCloudHelperDatabase } from "./database.js";
 import { ApiError } from "./errors.js";
 import { LibraryExportService } from "./export-service.js";
 import { MusicBrainzClient } from "./metadata/musicbrainz.js";
+import { TmdbMetadataCache } from "./metadata/tmdb-cache.js";
 import { TmdbKeyPool } from "./metadata/tmdb.js";
 import { MetadataPluginManager } from "./plugin-manager.js";
 import { ProviderRegistry } from "./providers/registry.js";
@@ -16,13 +17,17 @@ import { registerAuthRoutes } from "./routes/auth-routes.js";
 import { registerCatalogRoutes } from "./routes/catalog-routes.js";
 import { registerGuangyaAuthRoutes } from "./routes/guangya-auth-routes.js";
 import { registerMediaStreamRoutes } from "./routes/media-stream-routes.js";
+import { registerNotificationRoutes } from "./routes/notification-routes.js";
 import { registerPluginRoutes } from "./routes/plugin-routes.js";
 import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
+import { registerServiceMigrationRoutes } from "./routes/service-migration-routes.js";
 import type { ApiRuntime } from "./runtime.js";
 import { ScanFailureReportService } from "./scan-failure-report-service.js";
 import { CredentialVault } from "./secrets.js";
 import { ServiceRepository } from "./service-repository.js";
+import { ServiceMigrationRepository } from "./service-migration-repository.js";
+import { ServiceMigrationWorker } from "./service-migration-worker.js";
 import { loadTmdbKeys } from "./system-settings.js";
 import { ScanWorker } from "./worker.js";
 
@@ -82,7 +87,11 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
         censor: "[已脱敏]",
       },
     },
-    bodyLimit: Math.max(1024 * 1024, config.pluginMaxBytes + 1024 * 1024),
+    bodyLimit: Math.max(
+      1024 * 1024,
+      config.pluginMaxBytes + 1024 * 1024,
+      config.migrationChunkMaxBytes + 1024 * 1024,
+    ),
   });
   const database = new FlyCloudHelperDatabase(config, (level, fields) => {
     server.log[level](fields);
@@ -97,11 +106,26 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const providers = new ProviderRegistry(config, (fields) => logger("warn", fields));
   const vault = new CredentialVault(config.credentialMasterKey);
   const repository = new ServiceRepository(database);
-  const tmdb = new TmdbKeyPool(config, await loadTmdbKeys(database, vault), (fields) => server.log.warn(fields));
+  const migrations = new ServiceMigrationRepository(database);
+  const tmdbCache = new TmdbMetadataCache(database, logger);
+  const tmdb = new TmdbKeyPool(
+    config,
+    await loadTmdbKeys(database, vault),
+    (fields) => server.log.warn(fields),
+    tmdbCache,
+  );
   const musicBrainz = new MusicBrainzClient(config);
   const plugins = new MetadataPluginManager(database, config, vault);
   const failureReports = new ScanFailureReportService(config, server.log);
+  const exports = new LibraryExportService(database, config, (level, fields) => {
+    if (level === "warn") {
+      server.log.warn(fields);
+      return;
+    }
+    server.log.info(fields);
+  });
   const worker = new ScanWorker({
+    database,
     repository,
     providers,
     vault,
@@ -112,27 +136,44 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     logger: server.log,
     config,
   });
+  const migrationWorker = new ServiceMigrationWorker({
+    database,
+    repository: migrations,
+    exports,
+    config,
+    logger: server.log,
+  });
   const runtime: ApiRuntime = {
     config,
     database,
     repository,
+    migrations,
+    migrationWorker,
     providers,
     vault,
+    tmdbCache,
     tmdb,
     musicBrainz,
     worker,
     plugins,
-    exports: new LibraryExportService(database, config),
+    exports,
     failureReports,
     logBusinessEvent: logger,
   };
 
   await server.register(cookie);
   await server.register(multipart, {
-    limits: { fileSize: config.pluginMaxBytes, files: 1, fields: 10, parts: 12 },
+    limits: {
+      fileSize: Math.max(config.pluginMaxBytes, config.migrationChunkMaxBytes),
+      files: 1,
+      fields: 10,
+      parts: 12,
+    },
   });
   server.addHook("onClose", async () => {
+    await migrationWorker.stop();
     await worker.stop();
+    await tmdbCache.close();
     await database.close();
   });
 
@@ -277,9 +318,11 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerAuthRoutes(server, { config, database, logBusinessEvent: logger });
   await registerGuangyaAuthRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
+  await registerServiceMigrationRoutes(server, runtime);
   await registerScanFailureReportRoutes(server, runtime);
   await registerCatalogRoutes(server, runtime);
   await registerMediaStreamRoutes(server, runtime);
+  await registerNotificationRoutes(server, runtime);
   await registerAdminRoutes(server, runtime);
   await registerPluginRoutes(server, runtime);
 
@@ -301,6 +344,15 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   if (recoveredJobs > 0) {
     logger("warn", { 事件: "恢复中断扫描任务", 任务数量: recoveredJobs });
   }
+  const recoveredMigrations = await migrations.recoverInterrupted();
+  if (recoveredMigrations > 0) {
+    logger("warn", {
+      日志关键字: "codex-flycloud-service-migration",
+      事件: "恢复中断服务迁移",
+      迁移数量: recoveredMigrations,
+    });
+  }
+  migrationWorker.start();
   worker.start();
   return server;
 }

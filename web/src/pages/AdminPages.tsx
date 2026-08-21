@@ -4,6 +4,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatCard, StatusPill } from "@/components/ui-kit";
 import {
+  clearAdminTmdbCache,
   createAdminUser,
   getAdminConfigStatus,
   getAdminStatus,
@@ -222,6 +223,7 @@ export function AdminPluginsPage() {
 export function AdminConfigurationPage() {
   const resource = useApiResource(() => getAdminConfigStatus(), []);
   const [message, setMessage] = useState<string | null>(null);
+  const [clearingTmdbCache, setClearingTmdbCache] = useState(false);
 
   /** 二次确认后使用表单中的完整列表替换 TMDB Key 池。 */
   async function saveTmdbKeys(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -261,6 +263,23 @@ export function AdminConfigurationPage() {
     }
   }
 
+  /** 二次确认后清空数据库、待写入队列和进程内的全部 TMDB 共享缓存。 */
+  async function clearTmdbCache(): Promise<void> {
+    if (clearingTmdbCache) return;
+    if (!window.confirm("确定要删除全部 TMDB 缓存吗？删除后不会影响已经入库的影片；正在运行的任务仍会继续写入新缓存。")) return;
+    setClearingTmdbCache(true);
+    setMessage("正在删除 TMDB 缓存…");
+    try {
+      const result = await clearAdminTmdbCache();
+      const clearedCount = result.deletedCount + result.discardedPendingCount;
+      setMessage(`TMDB 缓存已删除，共清理 ${clearedCount.toLocaleString()} 条`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "TMDB 缓存删除失败");
+    } finally {
+      setClearingTmdbCache(false);
+    }
+  }
+
   return (
     <>
       <PageHeader title="系统配置" actions={<SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新状态</SecondaryButton>} />
@@ -281,6 +300,14 @@ export function AdminConfigurationPage() {
             </div>
           </div>
         </form>
+      </Panel>
+      <Panel title="TMDB 缓存" description="删除当前部署中由所有用户和服务共用的 TMDB 元数据缓存。" className="mt-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-xs text-muted-foreground">已经入库的媒体数据不会被删除；正在运行的任务仍会继续写入新缓存。</p>
+          <button type="button" onClick={() => void clearTmdbCache()} disabled={clearingTmdbCache} className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40">
+            <Trash2 className="size-4" /> {clearingTmdbCache ? "正在删除…" : "删除 TMDB 缓存"}
+          </button>
+        </div>
       </Panel>
     </>
   );

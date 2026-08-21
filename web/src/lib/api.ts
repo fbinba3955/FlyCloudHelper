@@ -8,6 +8,20 @@ export interface AuthUser {
   createdAt: string;
 }
 
+export type ConsoleNotificationTone = "info" | "success" | "warning" | "danger";
+
+/** 控制台右上角展示的账号通知。 */
+export interface ConsoleNotification {
+  id: string;
+  userId: string;
+  category: "task" | "security" | "system";
+  tone: ConsoleNotificationTone;
+  title: string;
+  message: string;
+  actionPath: string | null;
+  createdAt: string;
+}
+
 export interface CredentialKeyBackup {
   masterKey: string;
   fileName: string;
@@ -106,6 +120,7 @@ export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | 
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";
 export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "completed" | "failed" | "cancelled";
+export type LibrarySnapshotStatus = "queued" | "running" | "completed" | "failed";
 
 export interface OverviewResult {
   serviceCount: number;
@@ -220,6 +235,26 @@ export interface ScanJob {
   finishedAt: string | null;
   elapsedMs: number;
   updatedAt: string;
+}
+
+/** 网页服务详情展示的云端媒体库快照任务。 */
+export interface LibrarySnapshotExport {
+  id: string;
+  userId: string;
+  libraryId: string;
+  exportType: "snapshot";
+  status: LibrarySnapshotStatus;
+  stage: string;
+  progressPercent: number;
+  processedCount: number;
+  totalCount: number;
+  catalogVersion: number;
+  formatVersion: number;
+  fileSize: number | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
 }
 
 export interface ServiceDetail extends CloudService {
@@ -405,6 +440,41 @@ export async function getService(serviceId: string, admin = false): Promise<Serv
     admin ? `/api/v1/admin/services/${serviceId}` : `/api/v1/services/${serviceId}`,
   );
   return result.service;
+}
+
+/** 读取当前服务最近的云端快照任务，管理员接口自动使用服务所属用户。 */
+export async function listServiceSnapshots(
+  serviceId: string,
+  libraryId: string,
+  admin = false,
+): Promise<LibrarySnapshotExport[]> {
+  const path = admin
+    ? `/api/v1/admin/services/${serviceId}/exports?limit=20`
+    : `/api/v1/libraries/${libraryId}/exports?limit=20`;
+  return (await requestJson<{ exports: LibrarySnapshotExport[] }>(path)).exports;
+}
+
+/** 从用户端或管理端网页创建当前服务的云端快照后台任务。 */
+export async function createServiceSnapshot(
+  serviceId: string,
+  libraryId: string,
+  admin = false,
+): Promise<LibrarySnapshotExport> {
+  const path = admin
+    ? `/api/v1/admin/services/${serviceId}/exports`
+    : `/api/v1/libraries/${libraryId}/exports`;
+  return (await requestJson<{ export: LibrarySnapshotExport }>(path, {
+    method: "POST",
+    body: JSON.stringify({ exportType: "snapshot" }),
+  })).export;
+}
+
+/** 二次确认后删除已完成或失败的云端快照。 */
+export async function deleteLibrarySnapshot(exportId: string, admin = false): Promise<void> {
+  await requestJson<void>(admin ? `/api/v1/admin/exports/${exportId}` : `/api/v1/exports/${exportId}`, {
+    method: "DELETE",
+    body: JSON.stringify({ confirmation: exportId }),
+  });
 }
 
 /** 读取单个服务中某个目录的直接子目录。 */
@@ -628,6 +698,14 @@ export function clearServiceCatalog(
   admin = false,
 ): Promise<{ mediaItemCount: number; sourceFileCount: number }> {
   return requestJson(admin ? `/api/v1/admin/services/${serviceId}/catalog` : `/api/v1/services/${serviceId}/catalog`, {
+    method: "DELETE",
+    body: JSON.stringify({ confirmation: serviceId }),
+  });
+}
+
+/** 删除单个云端服务，并由服务端同时解除 APP 服务关联。 */
+export function deleteCloudService(serviceId: string, admin = false): Promise<void> {
+  return requestJson(admin ? `/api/v1/admin/services/${serviceId}` : `/api/v1/services/${serviceId}`, {
     method: "DELETE",
     body: JSON.stringify({ confirmation: serviceId }),
   });
@@ -891,6 +969,18 @@ export async function updateAdminTmdbKeys(keys: string[]): Promise<AdminConfigSt
   return result.tmdb;
 }
 
+/** 清空数据库、待写入队列和进程内的部署级 TMDB 共享缓存。 */
+export function clearAdminTmdbCache(): Promise<{
+  deletedCount: number;
+  discardedPendingCount: number;
+  clearedMemoryCount: number;
+}> {
+  return requestJson("/api/v1/admin/config/tmdb-cache", {
+    method: "DELETE",
+    body: JSON.stringify({ confirmation: "tmdb-cache" }),
+  });
+}
+
 /** 读取已安装的声明式插件版本。 */
 export function listPlugins(): Promise<{ items: PluginVersion[]; total: number }> {
   return requestJson("/api/v1/admin/plugins?limit=200");
@@ -981,6 +1071,23 @@ export async function register(input: {
 export async function getCurrentUser(): Promise<AuthUser> {
   const result = await requestJson<{ user: AuthUser }>("/api/v1/auth/me");
   return result.user;
+}
+
+/** 读取当前登录账号最近的通知。 */
+export async function listNotifications(limit = 30): Promise<ConsoleNotification[]> {
+  const result = await requestJson<{ notifications: ConsoleNotification[] }>(`/api/v1/notifications?limit=${limit}`);
+  return result.notifications;
+}
+
+/** 清除当前账号的一条通知。 */
+export async function deleteNotification(notificationId: string): Promise<void> {
+  await requestJson<void>(`/api/v1/notifications/${notificationId}`, { method: "DELETE" });
+}
+
+/** 清除当前账号的全部通知。 */
+export async function clearNotifications(): Promise<number> {
+  const result = await requestJson<{ deletedCount: number }>("/api/v1/notifications", { method: "DELETE" });
+  return result.deletedCount;
 }
 
 /** 撤销当前 Web 会话。 */

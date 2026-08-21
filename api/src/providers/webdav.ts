@@ -10,6 +10,7 @@ import {
   type ProviderEnumerationOptions,
   type ProviderEnumerationCheckpoint,
   type ProviderEnumerationWarning,
+  type ProviderFileAccess,
   type ProviderFileStreamAccess,
   type ProviderValidationResult,
   type ScanRoot,
@@ -100,7 +101,15 @@ export class WebDavProvider implements ProviderAdapter {
     displayName: "WebDAV",
     adapterVersion: "1.0.0",
     credentialSchemaVersion: 1,
-    capabilities: ["list", "readText", "rangeRead", "pathIdentity", "playbackLocator", "relayPlayback"],
+    capabilities: [
+      "list",
+      "readText",
+      "rangeRead",
+      "pathIdentity",
+      "playbackLocator",
+      "directDownload",
+      "relayPlayback",
+    ],
     recommendedScanSettings: createFlymbyRecommendedScanSettings(),
     connectionFields: [
       { name: "baseUrl", label: "WebDAV 地址", type: "url", required: true, secret: false },
@@ -320,11 +329,8 @@ export class WebDavProvider implements ProviderAdapter {
     }
   }
 
-  /**
-   * 生成仅供 FlyCloudHelper 中转使用的 WebDAV 上游请求。
-   * Authorization 只保留在服务端内存中，不能复用 APP 临时地址响应。
-   */
-  public async resolveFileStreamAccess(
+  /** 根据扫描 locator 生成 WebDAV 文件地址和必要认证请求头。 */
+  private async resolvePlaybackFileAccess(
     connection: Record<string, unknown>,
     locator: Record<string, unknown>,
   ): Promise<ProviderFileStreamAccess> {
@@ -346,6 +352,28 @@ export class WebDavProvider implements ProviderAdapter {
       headers: this.createAuthorizationHeaders(connection),
       expiresAt: null,
     };
+  }
+
+  /**
+   * 为已认证 APP 返回 WebDAV 直连地址和请求头。
+   * 返回内容只经过需要 Bearer Token 的文件访问接口，不能写入日志或公开页面。
+   */
+  public async resolveFileAccess(
+    connection: Record<string, unknown>,
+    locator: Record<string, unknown>,
+  ): Promise<ProviderFileAccess> {
+    return this.resolvePlaybackFileAccess(connection, locator);
+  }
+
+  /**
+   * 生成仅供 FlyCloudHelper 中转使用的 WebDAV 上游请求。
+   * Authorization 在中转模式下只保留于服务端内存。
+   */
+  public async resolveFileStreamAccess(
+    connection: Record<string, unknown>,
+    locator: Record<string, unknown>,
+  ): Promise<ProviderFileStreamAccess> {
+    return this.resolvePlaybackFileAccess(connection, locator);
   }
 
   /** 读取扫描发现的 NFO 等小型文本文件，内容上限避免异常文件占用过多内存。 */

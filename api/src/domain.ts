@@ -1,11 +1,33 @@
 export type UserRole = "user" | "super_admin";
 export type UserStatus = "active" | "disabled" | "pending_delete";
+export type NotificationCategory = "task" | "security" | "system";
+export type NotificationTone = "info" | "success" | "warning" | "danger";
 export type ServiceStatus = "active" | "scanning" | "reauthorization_required" | "disabled";
 export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "completed" | "failed" | "cancelled";
 export type JobStage = "queued" | "enumerating" | "classifying" | "scraping" | "persisting" | "completed";
 export type MediaType = "video" | "music" | "audiobook";
-export type CatalogSort = "created_desc" | "year_desc" | "premiere_date_desc" | "title_asc";
+export type CatalogSort =
+  | "created_desc"
+  | "created_asc"
+  | "updated_desc"
+  | "updated_asc"
+  | "year_desc"
+  | "year_asc"
+  | "premiere_date_desc"
+  | "premiere_date_asc"
+  | "title_asc"
+  | "title_desc";
 export type MatchState = "matched" | "needs_review" | "unmatched" | "processing";
+export type ServiceMigrationStatus =
+  | "preparing"
+  | "uploading"
+  | "queued"
+  | "validating"
+  | "importing"
+  | "finalizing"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 export interface PublicUserRecord {
   id: string;
@@ -14,6 +36,18 @@ export interface PublicUserRecord {
   status: UserStatus;
   createdAt: string;
   lastLoginAt: string | null;
+}
+
+/** 控制台右上角展示的持久化通知。 */
+export interface NotificationRecord {
+  id: string;
+  userId: string;
+  category: NotificationCategory;
+  tone: NotificationTone;
+  title: string;
+  message: string;
+  actionPath: string | null;
+  createdAt: string;
 }
 
 export interface AuthenticationRecord extends PublicUserRecord {
@@ -99,6 +133,36 @@ export interface ScanJobRecord {
   updatedAt: string;
 }
 
+/** APP 本地媒体库迁移到云助手的持久化状态。 */
+export interface ServiceMigrationRecord {
+  id: string;
+  userId: string;
+  serviceId: string;
+  libraryId: string;
+  requestId: string;
+  clientDeviceId: string;
+  clientServiceId: string;
+  providerType: string;
+  status: ServiceMigrationStatus;
+  stage: ServiceMigrationStatus;
+  progressPercent: number;
+  currentOperation: string;
+  processedCount: number;
+  totalCount: number;
+  uploadedBytes: number;
+  totalBytes: number;
+  uploadedChunkCount: number;
+  totalChunkCount: number;
+  activeDurationMs: number;
+  error: { code: string; message: string } | null;
+  retryable: boolean;
+  checkpoint: Record<string, unknown>;
+  result: Record<string, unknown> | null;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+}
+
 export interface SourceFileRecord {
   id: string;
   userId: string;
@@ -115,6 +179,8 @@ export interface SourceFileRecord {
   /** 文件所属的稳定扫描根键，用于只对完整根执行缺失对账。 */
   scanRootKey: string;
   generationId: string;
+  /** 最近一次成功生成当前媒体目录结果时使用的元数据配置修订。 */
+  metadataProfileRevision: number;
   locator: Record<string, unknown>;
 }
 
@@ -157,11 +223,19 @@ export interface ExportRecord {
   userId: string;
   libraryId: string;
   exportType: "binding" | "snapshot";
-  status: "completed" | "failed";
+  status: "queued" | "running" | "completed" | "failed";
+  stage: string;
+  progressPercent: number;
+  processedCount: number;
+  totalCount: number;
+  catalogVersion: number;
+  formatVersion: number;
   filePath: string | null;
   fileSize: number | null;
   errorMessage: string | null;
   createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
 }
 
 export interface PluginVersionRecord {

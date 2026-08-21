@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import knex, { type Knex } from "knex";
@@ -5,6 +6,9 @@ import type { ApiConfig } from "./config.js";
 import {
   type AuditRecord,
   type AuthenticationRecord,
+  type NotificationCategory,
+  type NotificationRecord,
+  type NotificationTone,
   type PublicUserRecord,
   type SystemStateRecord,
   type UserRole,
@@ -172,6 +176,20 @@ function mapPublicUser(row: UserRow): PublicUserRecord {
   };
 }
 
+/** 把数据库通知行转换为控制台公开结构。 */
+function mapNotification(row: Record<string, unknown>): NotificationRecord {
+  return {
+    id: String(row.id),
+    userId: String(row.user_id),
+    category: String(row.category) as NotificationCategory,
+    tone: String(row.tone) as NotificationTone,
+    title: String(row.title),
+    message: String(row.message),
+    actionPath: row.action_path ? String(row.action_path) : null,
+    createdAt: String(row.created_at),
+  };
+}
+
 /** 判断 SQLite、PostgreSQL 或 MySQL 异常是否为唯一约束冲突。 */
 function isUniqueConstraintError(error: unknown): boolean {
   if (!(error instanceof Error)) {
@@ -228,6 +246,124 @@ export class FlyCloudHelperDatabase {
   /** 关闭数据库连接池。 */
   public async close(): Promise<void> {
     await this.query.destroy();
+  }
+
+  /** 给指定用户写入一条通知；调用方不得在内容中放入账号密码或 Provider 凭据。 */
+  public async createNotification(input: {
+    userId: string;
+    category: NotificationCategory;
+    tone: NotificationTone;
+    title: string;
+    message: string;
+    actionPath?: string | null;
+  }): Promise<NotificationRecord> {
+    const row = {
+      id: randomUUID(),
+      user_id: input.userId,
+      category: input.category,
+      tone: input.tone,
+      title: input.title.slice(0, 255),
+      message: input.message.slice(0, 2_000),
+      action_path: input.actionPath?.slice(0, 500) ?? null,
+      created_at: new Date().toISOString(),
+    };
+    await this.query("user_notifications").insert(row);
+    return mapNotification(row);
+  }
+
+  /** 给全部启用中的超级管理员分别写入通知，确保每个管理员可以独立清除。 */
+  public async createNotificationsForSuperAdmins(input: {
+    category: NotificationCategory;
+    tone: NotificationTone;
+    title: string;
+    message: string;
+    actionPath?: string | null;
+    excludeUserId?: string;
+  }): Promise<number> {
+    const administrators = await this.query("user_accounts")
+      .select("id")
+      .where({ role: "super_admin", status: "active" });
+    const targetUserIds = administrators
+      .map((row) => String(row.id))
+      .filter((userId) => userId !== input.excludeUserId);
+    if (targetUserIds.length === 0) return 0;
+    const now = new Date().toISOString();
+    await this.query("user_notifications").insert(targetUserIds.map((userId) => ({
+      id: randomUUID(),
+      user_id: userId,
+      category: input.category,
+      tone: input.tone,
+      title: input.title.slice(0, 255),
+      message: input.message.slice(0, 2_000),
+      action_path: input.actionPath?.slice(0, 500) ?? null,
+      created_at: now,
+    })));
+    return targetUserIds.length;
+  }
+
+  /** 尽力写入用户通知，数据库异常只记录日志，不影响原业务结果。 */
+  public async createNotificationSafely(input: {
+    userId: string;
+    category: NotificationCategory;
+    tone: NotificationTone;
+    title: string;
+    message: string;
+    actionPath?: string | null;
+  }): Promise<void> {
+    try {
+      await this.createNotification(input);
+    } catch (error) {
+      this.bootstrapLogger("warn", {
+        日志关键字: "codex-flycloud-notification",
+        事件: "用户通知写入失败",
+        用户ID: input.userId,
+        通知标题: input.title,
+        错误信息: error instanceof Error ? error.message : "未知数据库错误",
+      });
+    }
+  }
+
+  /** 尽力给超级管理员广播通知，失败时不回滚账号、服务或后台任务主流程。 */
+  public async createSuperAdminNotificationsSafely(input: {
+    category: NotificationCategory;
+    tone: NotificationTone;
+    title: string;
+    message: string;
+    actionPath?: string | null;
+    excludeUserId?: string;
+  }): Promise<void> {
+    try {
+      await this.createNotificationsForSuperAdmins(input);
+    } catch (error) {
+      this.bootstrapLogger("warn", {
+        日志关键字: "codex-flycloud-notification",
+        事件: "管理员通知写入失败",
+        通知标题: input.title,
+        错误信息: error instanceof Error ? error.message : "未知数据库错误",
+      });
+    }
+  }
+
+  /** 按用户读取最近通知，禁止跨账号查看。 */
+  public async listNotifications(userId: string, limit = 30): Promise<NotificationRecord[]> {
+    const rows = await this.query("user_notifications")
+      .where({ user_id: userId })
+      .orderBy("created_at", "desc")
+      .orderBy("id", "desc")
+      .limit(Math.min(100, Math.max(1, limit)));
+    return rows.map((row) => mapNotification(row as Record<string, unknown>));
+  }
+
+  /** 清除当前用户的一条通知，返回是否真的删除。 */
+  public async deleteNotification(userId: string, notificationId: string): Promise<boolean> {
+    return Number(await this.query("user_notifications")
+      .where({ id: notificationId, user_id: userId })
+      .delete()) > 0;
+  }
+
+  /** 清除当前用户的全部通知，不影响其他账号。 */
+  public async clearNotifications(userId: string): Promise<number> {
+    return Number(await this.query("user_notifications").where({ user_id: userId }).delete());
   }
 
   /** 查询实例身份、schema 和首次初始化状态。 */
@@ -431,6 +567,82 @@ export class FlyCloudHelperDatabase {
       });
     } catch (error) {
       if (isUniqueConstraintError(error)) {
+        throw new ApiError(409, "username_conflict", "用户名已被使用");
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * 原子创建 APP 用户、密码和外部账号绑定。
+   * 当前华为身份摘要只用于同一实例内防重复注册，不代表服务端已经完成华为官方凭证验签。
+   */
+  public async createAppUserWithExternalIdentity(input: {
+    userId: string;
+    username: string;
+    usernameLookup: string;
+    passwordHash: string;
+    identityId: string;
+    identityProvider: "huawei";
+    identityHash: string;
+  }): Promise<PublicUserRecord> {
+    try {
+      return await this.query.transaction(async (transaction) => {
+        const state = await transaction("system_state").where({ singleton_id: 1 }).first();
+        if (!state?.initial_setup_completed_at) {
+          throw new ApiError(503, "setup_required", "实例尚未完成首次初始化");
+        }
+
+        const existingIdentity = await transaction("user_external_identities")
+          .where({
+            provider: input.identityProvider,
+            identity_hash: input.identityHash,
+          })
+          .first();
+        if (existingIdentity) {
+          throw new ApiError(
+            409,
+            "huawei_account_already_bound",
+            "当前华为账号已经注册过 Fly云助手账号，请登录已有账号",
+          );
+        }
+
+        const now = new Date().toISOString();
+        await this.insertUser(transaction, {
+          userId: input.userId,
+          username: input.username,
+          usernameLookup: input.usernameLookup,
+          passwordHash: input.passwordHash,
+          role: "user",
+          now,
+        });
+        await transaction("user_external_identities").insert({
+          id: input.identityId,
+          user_id: input.userId,
+          provider: input.identityProvider,
+          identity_hash: input.identityHash,
+          created_at: now,
+        });
+        return this.findPublicUserById(input.userId, transaction);
+      });
+    } catch (error) {
+      if (error instanceof ApiError) {
+        throw error;
+      }
+      if (isUniqueConstraintError(error)) {
+        const existingIdentity = await this.query("user_external_identities")
+          .where({
+            provider: input.identityProvider,
+            identity_hash: input.identityHash,
+          })
+          .first();
+        if (existingIdentity) {
+          throw new ApiError(
+            409,
+            "huawei_account_already_bound",
+            "当前华为账号已经注册过 Fly云助手账号，请登录已有账号",
+          );
+        }
         throw new ApiError(409, "username_conflict", "用户名已被使用");
       }
       throw error;

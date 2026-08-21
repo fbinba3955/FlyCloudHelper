@@ -41,9 +41,11 @@ ENV NODE_ENV=production \
     FLYCLOUDHELPER_SQLITE_PATH=/data/database/flycloud-helper.db \
     FLYCLOUDHELPER_COOKIE_SECURE=false \
     FLYCLOUDHELPER_ALLOW_INSECURE_HTTP=true \
+    FLYCLOUDHELPER_HUAWEI_BINDING_PROOF_SECRET= \
     FLYCLOUDHELPER_GENERATED_CREDENTIAL_KEY_PATH=/data/secrets/credential-master-key \
     FLYCLOUDHELPER_PLUGIN_DIR=/data/plugins \
     FLYCLOUDHELPER_EXPORT_DIR=/data/exports \
+    FLYCLOUDHELPER_MIGRATION_DIR=/data/migrations \
     FLYCLOUDHELPER_WEB_DIST_DIR=/app/web/dist
 
 WORKDIR /app
@@ -55,7 +57,7 @@ COPY --from=build --chown=node:node /app/api/package.json ./api/package.json
 COPY --from=build --chown=node:node /app/api/dist ./api/dist
 COPY --from=build --chown=node:node /app/web/dist ./web/dist
 
-RUN mkdir -p /data/database /data/secrets /data/plugins /data/exports && chown -R node:node /data
+RUN mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations && chown -R node:node /data
 
 USER node
 EXPOSE 9934

@@ -32,10 +32,15 @@ export interface ApiConfig {
   workerPollIntervalMs: number;
   pluginDirectory: string;
   exportDirectory: string;
+  migrationDirectory: string;
   webDistDirectory: string;
   allowInsecureProviderHttp: boolean;
   pluginMaxBytes: number;
   pluginMaxFiles: number;
+  migrationChunkMaxBytes: number;
+  migrationSnapshotMaxBytes: number;
+  /** 可选的华为账号绑定凭证验签密钥；配置后 APP 注册必须携带受信任签名。 */
+  huaweiBindingProofSecret: string | null;
 }
 
 /** FlyCloudHelper 项目根目录。 */
@@ -274,6 +279,10 @@ export function loadApiConfig(): ApiConfig {
     "FLYCLOUDHELPER_ACOUSTID_API_KEY",
     "FLYCLOUDHELPER_ACOUSTID_API_KEY_FILE",
   );
+  const huaweiBindingProofSecret = readSecret(
+    "FLYCLOUDHELPER_HUAWEI_BINDING_PROOF_SECRET",
+    "FLYCLOUDHELPER_HUAWEI_BINDING_PROOF_SECRET_FILE",
+  );
 
   return {
     host: readEnvironmentValue("FLYCLOUDHELPER_API_HOST") || "0.0.0.0",
@@ -311,9 +320,22 @@ export function loadApiConfig(): ApiConfig {
     workerPollIntervalMs: readPositiveInteger("FLYCLOUDHELPER_WORKER_POLL_INTERVAL_MS", 1000),
     pluginDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_PLUGIN_DIR"), "data/plugins"),
     exportDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_EXPORT_DIR"), "data/exports"),
+    migrationDirectory: resolveProjectPath(
+      readEnvironmentValue("FLYCLOUDHELPER_MIGRATION_DIR"),
+      "data/migrations",
+    ),
     webDistDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_WEB_DIST_DIR"), "web/dist"),
     allowInsecureProviderHttp: readBoolean("FLYCLOUDHELPER_ALLOW_INSECURE_HTTP", true),
     pluginMaxBytes: readPositiveInteger("FLYCLOUDHELPER_PLUGIN_MAX_BYTES", 10 * 1024 * 1024),
     pluginMaxFiles: readPositiveInteger("FLYCLOUDHELPER_PLUGIN_MAX_FILES", 100),
+    migrationChunkMaxBytes: readPositiveInteger(
+      "FLYCLOUDHELPER_MIGRATION_CHUNK_MAX_BYTES",
+      8 * 1024 * 1024,
+    ),
+    migrationSnapshotMaxBytes: readPositiveInteger(
+      "FLYCLOUDHELPER_MIGRATION_SNAPSHOT_MAX_BYTES",
+      2 * 1024 * 1024 * 1024,
+    ),
+    huaweiBindingProofSecret: huaweiBindingProofSecret.value,
   };
 }

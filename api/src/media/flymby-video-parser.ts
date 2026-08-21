@@ -45,7 +45,7 @@ const videoExtensionPattern = /^(?:mp4|mkv|iso|avi|mov|wmv|flv|m4v|ts|m2ts|webm|
 const categoryDirectoryPattern = /^(?:电影|影片|院线|华语电影|欧美电影|日韩电影|国产|国影|美影|国产剧|国剧|电视剧|连续剧|剧集|美剧|英剧|日剧|韩剧|港剧|台剧|泰剧|陆剧|短剧|网剧|综艺|纪录片|动漫网剧|动漫|动画|番剧|国产动漫|日韩动漫|欧美动漫|日漫|美漫|国漫|4k|1080p|高清|超清|超高清|合集|系列|专题|其他|未分类)$/iu;
 const seriesDirectoryHintPattern = /(?:电视剧|剧集|连续剧|国产剧|国剧|美剧|英剧|日剧|韩剧|港剧|台剧|泰剧|陆剧|短剧|网剧|番剧|动漫网剧|国产动漫|日韩动漫|欧美动漫|日漫|美漫|国漫|动漫|动画|动态漫画|动态漫|漫剧|漫画|综艺|tv\s*shows?|shows?|season|series|第\s*[0-9一二三四五六七八九十两]{1,3}\s*(?:季|部)|\d{1,4}\s*集全)/iu;
 const seasonDirectoryPattern = /^(?:(?:season|series|s)\s*0*(\d{1,2})|第\s*([0-9一二三四五六七八九十两]{1,3})\s*(?:季|部))(?:$|[\s._\-–—:：].*)/iu;
-const genericMovieFilePattern = /^(?:movie|movies|film|feature|video|videos|main|full|index|default|stream|sample|trailer|preview|part\s*\d+|cd\s*\d+|disc\s*\d+|disk\s*\d+|\d{3,4}p|\d{4}|正片|影片|电影|视频|样片|预告)$/iu;
+const genericMovieFilePattern = /^(?:movie|movies|film|feature|video|videos|main|full|index|default|stream|sample|trailer|preview|part\s*\d+|cd\s*\d+|disc\s*\d+|disk\s*\d+|\d{3,4}p|\d{1,4}|正片|影片|电影|视频|样片|预告)$/iu;
 const yearPattern = /(?:^|[^\d])((?:19|20)\d{2})(?!\s*[集话話])(?:[^\d]|$)/gu;
 const imdbPattern = /tt\d{6,10}/iu;
 const tmdbPattern = /(?:tmdbid|tmdb)\s*[-_:：=]?\s*(\d{2,10})/iu;
@@ -58,6 +58,33 @@ const trailingBackupTimestampPattern = /(?:^|[\s._\-–—])(?:19\d{2}|20\d{2})\
 const yearBracketPattern = /(?:[\[\(【（]\s*(?:19\d{2}|20\d{2})\s*[\]\)】）]|(?:^|[\s._\-–—:：])(?:19\d{2}|20\d{2})(?=$|[\s._\-–—:：]))/gu;
 const leadingSiteTagPattern = /^\s*(?:[\[\(【（〖『《「]?[^/\\\]\)】）〗』》」]{0,96}(?:www\.|hmxz|haimian|kkapi|海绵小站)[^/\\\]\)】）〗』》」]{0,96}[\]\)】）〗』》」]?[\s._\-–—:：]*)+/iu;
 const bracketedNoiseTagPattern = /[\[\(【（〖『《「][^\]\)】）〗』》」]{0,96}(?:www\.|hmxz|haimian|kkapi|海绵小站|日剧|美剧|韩剧|国产剧|英剧|港剧|台剧|泰剧|动漫|动画|电影|剧场版|特别篇|合集|系列|SRENIX|版|秒传|BDrip|WEB[-.\s]?DL|HEVC|x\s*\.?\s*26[45]|H\s*\.?\s*26[45]|FLAC|AAC|DTS|TrueHD|1080p|2160p|4K|HQ|60\s*fps|音轨|字幕|配音|水印|豆瓣|DIY)[^\]\)】）〗』》」]{0,96}[\]\)】）〗』》」]/giu;
+const bracketedCollectionRangePattern = /[\[\(【（]\s*\d{1,2}\s*(?:-|–|—|~|至|到)\s*\d{1,2}\s*季\s*(?:\+\s*SP)?\s*[\]\)】）]/giu;
+const bracketedTitlePrefixPattern = /^\s*[\[\(【〖『《「][A-Za-z0-9._+\-\s]{1,64}[\]\)】〗』》」]\s*/gu;
+const titleCategoryNoisePattern = /(?:^|[\s._+\-–—:：,，;；/\\|·•\[\]\(\){}【】（）〖〗『』《》「」]+)(?:动画电影|华语电影|欧美电影|日韩电影|国产剧|美剧|英剧|日剧|韩剧|港剧|台剧|泰剧|短剧|陆剧|电视剧|连续剧|剧集|番剧|动漫网剧|国产动漫|日韩动漫|欧美动漫|日漫|美漫|国漫|动漫|动画|综艺|纪录片|国影|电影|影片)(?=$|[\s._+\-–—:：,，;；/\\|·•\[\]\(\){}【】（）〖〗『』《》「」]+)/giu;
+const titleBracketPattern = /[\[\]\(\){}【】（）〖〗『』《》「」]/gu;
+const titleDotPattern = /[._+]+/gu;
+const titleSeparatorPattern = /[–—:：,，;；/\\|]/gu;
+const videoQualityPattern = /\b(?:(?:bd|hd|uhd|fhd)\s*)?(?:2160p|1080p|720p|480p)\b|\b(?:4k|8k|uhd|fhd|hdr10\+?|hdr|dv|dolby\s*vision|60\s*fps|120\s*fps|hq|raw|clean)\b/giu;
+const videoSourceCleanPattern = /\b(?:web[-.\s]?dl|web[-.\s]?rip|webrip|bluray|blu[-.\s]?ray|bdrip|hdtv|dvdrip|remux)\b/giu;
+const videoCodecPattern = /\b(?:x\s*\.?\s*26[45]|h\s*\.?\s*26[45]|hevc|avc|10\s*bit|8\s*bit)\b/giu;
+const videoAudioCleanPattern = /\b(?:DDP\s*5\s*1|DDP(?:\s*5(?:[.\s]?1)?)?|DD\+?|EAC3|E-AC3|DTS[-\s]*HD(?:[-\s]*MA)?|DTS\s*5\s*1|DTS|TrueHD\s*\d?\s*\d?|Atmos|AAC(?:\s*[25](?:[.\s]?1)?)?|FLAC(?:\s*[25](?:[.\s]?1)?)?|LPCM|PCM(?:\s*\d(?:[.\s]?0)?)?|AC3|AV3A\s*5\s*1|\d+\s*Audios?|\d+\s*Audio)\b/giu;
+const videoLanguagePairPattern = /(?:^|[\s._\-–—:：])(?:Mandarin|Cantonese)\s*(?:&|and)\s*(?:Mandarin|Cantonese)(?=$|[\s._\-–—:：])/giu;
+const videoEditionPattern = /\b(?:proper|repack|extended|uncut|director'?s\s*cut|multi|dual|chs|cht|subbed|v\d+)\b/giu;
+const videoPlatformPattern = /\b(?:nf|netflix|amzn|amazon|dsnp|disney|hulu|hmax|max|itunes|apple\s*tv|hami|wavve|fandango)\b/giu;
+const videoDimensionPattern = /\b\d{3,4}\s*[xX×]\s*\d{3,4}\b/gu;
+const videoFileSizePattern = /\b\d+(?:\.\d+)?\s*(?:GB|G|MB|M)\b/giu;
+const videoResourceCleanPattern = /(?:杜比视界|高码率|高码版|高码|码率|帧率版本|臻彩|内封简繁|内封|中文字幕|双语字幕|特效字幕|歌词字幕|繁英字幕|简英双语|简繁英字幕|简繁双语|中英字幕|英文字幕|纯净版|无水印|完整版|全集|特辑|国英多音轨|国粤英三语|国粤日三语|国粤日多音轨|国英双语|多音轨|音轨|配音|字幕|附全系列|附系列|附全集|国映\s*TV|大包不错集数|动态漫画|动态漫|片名水印|水印|单集\s*\d{1,4}\s*分钟|单集|豆瓣|DIY|共\s*\d{1,4}\s*集(?:全)?|全\s*\d{1,4}\s*集|\d{1,4}\s*集全|完结|已完结|更至\s*\d{1,4}\s*集|更新至\s*\d{1,4}\s*集|更新中|(?:^|[\s._\-–—:：])(?:简繁中字|简繁|繁中|简中|简英|繁英|中字|国语|国配|粤语|英语|日语|韩语|官中|国英|国粤英|国粤日|中英|Mandarin|Cantonese|Korean|Japanese|English|CHS|CHT|CHS-ENG|ENG)(?:$|[\s._\-–—:：]))/giu;
+const videoReleaseTagPattern = /\b(?:HiveWeb|HHWEB|HDSWEB|CMCT|CHD|FRDS|WiKi|NTb|BTN|PTer|PTerWEB|OurTV|ADWeb|BillionMeta|BlackTV|MOMOWEB|VARYG|CTRLWEB|EDITH|HONE|MTeam|PandaQT|QuickIO|DreamHD|ParkHD|ZeroTV|ColorTV|FROGWeb|MiniTV|MiniHD|MNHD|HDWinG|SONYHD|HQC|XLYS|Mp4Ba|Mp4Fan|QHstudIo|QHstudio|OFA|OPS|LGNB|oSpecialCN|HDSky|CHDBits|FGT|HDT|DHTCLUB|AngelaBaby|GY|CHN)\b/giu;
+const titleMetadataSuffixPattern = /^(.{2,80}?)[\s._\-–—:：]+(?:剧情|犯罪|悬疑|动作|爱情|科幻|奇幻|冒险|惊悚|恐怖|战争|历史|古装|喜剧|家庭|纪录片|真人秀|综艺|动画|动漫)(?:$|[\s._\-–—:：].*)/u;
+const leadingResourcePrefixPattern = /^\s*([A-Za-z]{1,3}|\d-\d)[-_]+(.+)$/u;
+const trailingRatingPattern = /(?:^|[\s._+\-–—:：,，;；/\\|·•])(?:豆瓣|imdb|国)\s*\d(?:\.\d)?\s*$/iu;
+const trailingNumericRangeTextPattern = /[\s._\-–—:：]+\d{1,2}\s*(?:-|–|—|~|至|到)\s*\d{1,2}$/iu;
+const titleSeasonRangeTextPattern = /(?:^|[\s._\-–—:：])(?:S\d{1,2}|Season\s*\d{1,2}|Series\s*\d{1,2}|EP\s*\d{1,4}\s*(?:-|–|—|~|至|到)\s*\d{1,4}|第\s*[0-9一二三四五六七八九十两]{1,3}\s*(?:-|–|—|~|至|到)\s*[0-9一二三四五六七八九十两]{1,3}\s*季|第\s*[0-9一二三四五六七八九十两]{1,3}\s*(?:季|部)|\d{1,2}\s*季全|\d{1,2}\s*(?:-|–|—|~|至|到)\s*\d{1,2})(?:$|[\s._\-–—:：])/giu;
+const trailingCollectionRangeTextPattern = /(?:^|[\s._\-–—:：])\d{1,2}\s*(?:(?:-|–|—|~|至|到)|\s+)\s*\d{1,2}\s*季\s*(?:\+?\s*SP)?$/iu;
+const trailingBracketlessVersionTagPattern = /[\s._\-–—:：]+SRENIX\s*版?$/iu;
+const trailingDashPattern = /\s+-\s+$/gu;
+const leadingPunctuationPattern = /^[\s.\-_]+/gu;
+const trailingPunctuationPattern = /[\s.\-_]+$/gu;
 const leadingSortNumberTitlePattern = /^\s*\d{1,3}\s*(?=[\u4e00-\u9fa5])/u;
 const genericYearBucketTitlePattern = /^\s*(?:(?:19|20)\d{2}\s*(?:-|–|—|~|至|到)\s*(?:(?:19|20)\d{2}|之前|以前|以后|之后)|(?:19|20)\d{2}\s*(?:年)?)\s*$/iu;
 /** APP 中明确表示电影标题的词，优先级高于宽松集号推断。 */
@@ -213,6 +240,8 @@ export function parseFlymbyVideoDirectory(
       const directoryYear = directoryContext.title
         ? extractMatchingMovieTitleYearFromPath(entry.path, directoryContext.title)
         : null;
+      // 关键变量：S00Exx 分段转回电影后恢复文件自身年份，不能保留节目解析阶段清空的年份。
+      const recoveredMovieFileYear = blockedFalseEpisode ? extractYear(parsed.baseName) : null;
       // 关键变量：仅当上级确实存在不属于当前影片的年份时，才记录“阻止年份覆盖”的诊断标记。
       const nearestPathYear = directoryContext.title ? extractNearestPathYear(entry.path) : null;
       const recoveredNumericMovieTitle = blockedFalseEpisode
@@ -232,7 +261,7 @@ export function parseFlymbyVideoDirectory(
           && nearestPathYear
           && parsed.year
           && nearestPathYear !== parsed.year),
-        year: directoryYear ?? parsed.year,
+        year: directoryYear ?? recoveredMovieFileYear ?? parsed.year,
         seasonNumber: 0,
         episodeNumber: 0,
         episodeNumbers: [],
@@ -342,7 +371,7 @@ function buildDirectoryVideoContext(
   if (nearestPathType === "movie" || (nearestPathType === "none" && isCollectionContainer)) {
     return {
       mediaType: "movie",
-      title: isCollectionContainer ? "" : pickDirectoryMovieTitle(rootPath, currentPath, videoEntries),
+      title: isCollectionContainer ? "" : pickMovieContainerDirectoryTitle(rootPath, currentPath, videoEntries),
       seasonNumber: 0,
     };
   }
@@ -577,10 +606,33 @@ function pickDirectoryMovieTitle(rootPath: string, currentPath: string, videoEnt
   }
   const shouldGroup = videoEntries.every((entry) => {
     const fileTitle = cleanMovieTitle(entry.name);
+    // 关键变量：S00Exx 等电影分段先按节目规则取得目录标题，再与电影容器标题比较。
+    const parsedTitle = hasExplicitEpisodeMarker(removeKnownVideoExtension(entry.name))
+      ? parseFlymbyVideoName(entry, rootPath).title
+      : fileTitle;
     return genericMovieFilePattern.test(FlymbyVideoTitleCleaner.normalizeSearchText(fileTitle))
-      || fileTitleMatchesDirectoryTitle(fileTitle, folderTitle);
+      || fileTitleMatchesDirectoryTitle(fileTitle, folderTitle)
+      || fileTitleMatchesDirectoryTitle(parsedTitle, folderTitle);
   });
   return shouldGroup ? folderTitle : "";
+}
+
+/**
+ * 从电影容器提取首选标题；当前目录只是 S00Exx 分段等弱文件容器时回退到上级片名。
+ * 该顺序与 Flymby APP 的 pickMovieContainerDirectoryTitle 保持一致。
+ */
+function pickMovieContainerDirectoryTitle(
+  rootPath: string,
+  currentPath: string,
+  videoEntries: ProviderEntry[],
+): string {
+  const currentTitle = pickDirectoryMovieTitle(rootPath, currentPath, videoEntries);
+  if (currentTitle) return currentTitle;
+  const normalizedCurrent = normalizeMediaPath(currentPath);
+  if (normalizedCurrent === normalizeMediaPath(rootPath)) return "";
+  const parentName = path.posix.basename(path.posix.dirname(normalizedCurrent));
+  const parentTitle = cleanMovieTitle(parentName); // 关键变量：当前目录无法成片时使用的近层上级电影标题。
+  return isUsableMovieDirectoryTitle(parentTitle) ? parentTitle : "";
 }
 
 /** 判断原始目录是否为电影系列/合集容器。 */
@@ -919,15 +971,119 @@ function cleanSeriesTitle(value: string): string {
 
 /** 对齐 APP 的目录和文件标题清洗主链，删除站点、ID、资源规格和发布组噪声。 */
 function cleanTitleSegment(value: string): string {
-  let text = String(value ?? "").replace(htmlAmpersandEntityPattern, "&");
+  const rawValue = String(value ?? "");
+  let text = rawValue.replace(htmlAmpersandEntityPattern, "&");
   text = removeKnownVideoExtension(text);
   text = text.replace(leadingSiteTagPattern, " ");
+  text = stripLeadingResourcePrefix(text);
   text = text.replace(explicitTmdbIdTextPattern, " ");
+  text = text.replace(bracketedCollectionRangePattern, " ");
   text = text.replace(bracketedNoiseTagPattern, " ");
+  text = removeTitleCategoryNoise(text);
   text = text.replace(trailingBackupTimestampPattern, " ");
+  text = text.replace(bracketedTitlePrefixPattern, " ");
   text = text.replace(leadingSortNumberTitlePattern, " ");
   text = text.replace(imdbIdGlobalPattern, " ");
-  return FlymbyVideoTitleCleaner.cleanTitle(text);
+  text = text.replace(trailingRatingPattern, " ");
+  text = text.replace(titleBracketPattern, " ");
+  text = text.replace(titleDotPattern, " ");
+  text = text.replace(trailingNumericRangeTextPattern, " ");
+  text = text.replace(titleSeparatorPattern, " ");
+  text = text.replace(videoQualityPattern, " ");
+  text = text.replace(videoDimensionPattern, " ");
+  text = text.replace(videoSourceCleanPattern, " ");
+  text = text.replace(videoCodecPattern, " ");
+  text = text.replace(videoAudioCleanPattern, " ");
+  text = text.replace(videoLanguagePairPattern, " ");
+  text = text.replace(videoEditionPattern, " ");
+  text = text.replace(videoPlatformPattern, " ");
+  text = text.replace(videoFileSizePattern, " ");
+  text = text.replace(videoResourceCleanPattern, " ");
+  text = removeTrailingMetadataResidue(text);
+  text = text.replace(videoReleaseTagPattern, " ");
+  text = text.replace(titleSeasonRangeTextPattern, " ");
+  text = text.replace(trailingCollectionRangeTextPattern, " ");
+  text = text.replace(trailingBracketlessVersionTagPattern, " ");
+  text = truncateTitleAtMetadataSuffix(text);
+  text = removeTrailingNoiseNumber(text, rawValue);
+  text = text.replace(trailingDashPattern, " ");
+  text = text.replace(leadingPunctuationPattern, " ");
+  text = text.replace(trailingPunctuationPattern, " ");
+  text = text.replace(trailingCollectionRangeTextPattern, " ");
+  return FlymbyVideoTitleCleaner.cleanTitle(collapseTitleSpaces(text));
+}
+
+/** 移除 APP 支持的资源短前缀，例如“BD-片名”和“1-1_片名”。 */
+function stripLeadingResourcePrefix(value: string): string {
+  const match = leadingResourcePrefixPattern.exec(value);
+  if (!match) return value;
+  const prefix = match[1] ?? ""; // 关键变量：前缀必须是短英文资源标记或“数字-数字”。
+  const rest = String(match[2] ?? "").trim();
+  if (!rest) return value;
+  return prefix.includes("-") || prefix.length > 1 || /^[\u4e00-\u9fa5]/u.test(rest) ? rest : value;
+}
+
+/** 循环清理连续出现的电影、节目和动漫分类词。 */
+function removeTitleCategoryNoise(value: string): string {
+  let text = String(value ?? "");
+  let previousText = ""; // 关键变量：连续分类词需要多轮替换，直到结果稳定。
+  while (previousText !== text) {
+    previousText = text;
+    text = text.replace(titleCategoryNoisePattern, " ");
+  }
+  return text;
+}
+
+/** 清理资源标签被拆分后遗留在标题末尾的独立短词。 */
+function removeTrailingMetadataResidue(value: string): string {
+  let text = String(value ?? "");
+  let previousText = ""; // 关键变量：同一标题可能连续遗留多个短词。
+  while (previousText !== text) {
+    previousText = text;
+    text = text.replace(/(?:^|\s)(?:简英|繁英|单集|共|附全系列|附系列|附全集)\s*$/u, " ");
+  }
+  return text;
+}
+
+/** 在明确类型元数据开始处截断标题，避免剧情、动作等标签参与 TMDB 查询。 */
+function truncateTitleAtMetadataSuffix(value: string): string {
+  const text = collapseTitleSpaces(value);
+  const match = titleMetadataSuffixPattern.exec(text);
+  const title = String(match?.[1] ?? "").trim();
+  if (!title || title.length < 2 || isWeakFlymbyScrapeTitle(title)) return value;
+  return title;
+}
+
+/** 资源规格清理后若遗留独立尾部数字，则按 APP 规则继续删除。 */
+function removeTrailingNoiseNumber(value: string, rawValue: string): string {
+  let text = collapseTitleSpaces(value);
+  if (!/[A-Za-z\u4e00-\u9fa5]/u.test(text)) return value;
+  // 关键变量：只有原始名称确实包含资源或发布信息时，尾部数字才视为清洗残留。
+  const hasResourceContext = testGlobalPattern(videoFileSizePattern, rawValue)
+    || testGlobalPattern(videoResourceCleanPattern, rawValue)
+    || testGlobalPattern(videoReleaseTagPattern, rawValue)
+    || testGlobalPattern(videoAudioCleanPattern, rawValue)
+    || testGlobalPattern(videoSourceCleanPattern, rawValue);
+  if (!hasResourceContext) return value;
+  let match = /^(.*\S)\s+\d{1,4}$/u.exec(text);
+  while (match?.[1] && /[A-Za-z\u4e00-\u9fa5]/u.test(match[1])) {
+    text = match[1];
+    match = /^(.*\S)\s+\d{1,4}$/u.exec(text);
+  }
+  return text;
+}
+
+/** 安全执行带全局标记的正则，避免 lastIndex 污染后续解析。 */
+function testGlobalPattern(pattern: RegExp, value: string): boolean {
+  pattern.lastIndex = 0;
+  const matched = pattern.test(value);
+  pattern.lastIndex = 0;
+  return matched;
+}
+
+/** 折叠标题中的连续空白。 */
+function collapseTitleSpaces(value: string): string {
+  return String(value ?? "").replace(/\s+/gu, " ").trim();
 }
 
 /** 判断清理后的标题是否可用于刮削。 */

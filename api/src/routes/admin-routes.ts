@@ -16,6 +16,7 @@ import {
   clearManualVideoMatch,
   searchManualVideoMatches,
 } from "../media/manual-video-match.js";
+import { hydrateRealtimeVideoDetails } from "../media/realtime-video-details.js";
 import type { ApiRuntime } from "../runtime.js";
 import { tmdbKeySettingName, validateTmdbKeyList } from "../system-settings.js";
 import { streamJobEvents } from "./event-stream.js";
@@ -151,6 +152,26 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     return { tmdb: await getTmdbConfigurationStatus(runtime) };
   });
 
+  server.delete<{ Body: Record<string, unknown> }>("/api/v1/admin/config/tmdb-cache", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    requireConfirmation(request.body, "tmdb-cache");
+    const result = await runtime.tmdbCache.clearAll();
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-tmdb-cache",
+      事件: "管理员清空TMDB共享缓存",
+      用户ID: operator.id,
+      数据库删除数量: result.deletedCount,
+      丢弃待写入数量: result.discardedPendingCount,
+      清空内存数量: result.clearedMemoryCount,
+    });
+    await audit(runtime, operator, "clear_tmdb_cache", "system_configuration", "tmdb_metadata_cache", {
+      数据库删除数量: result.deletedCount,
+      丢弃待写入数量: result.discardedPendingCount,
+      清空内存数量: result.clearedMemoryCount,
+    });
+    return result;
+  });
+
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/users", async (request) => {
     await requireSuperAdmin(request, runtime.database);
     return runtime.database.listUsers({
@@ -174,6 +195,13 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       role: "user",
     });
     await audit(runtime, operator, "create_user", "user", user.id);
+    await runtime.database.createSuperAdminNotificationsSafely({
+      category: "security",
+      tone: "warning",
+      title: "管理员创建账号",
+      message: `超级管理员“${operator.username}”创建了账号“${user.username}”。`,
+      actionPath: "/admin/users",
+    });
     return reply.status(201).send({ user: toUserDto(user) });
   });
 
@@ -190,10 +218,27 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
 
   server.post<{ Params: { userId: string }; Body: Record<string, unknown> }>("/api/v1/admin/users/:userId/password-reset", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
+    const targetUser = await runtime.database.findPublicUserById(request.params.userId);
     const password = validatePassword(request.body.password);
     validatePasswordConfirmation(password, request.body.passwordConfirmation);
     await runtime.database.resetUserPassword(request.params.userId, await hashPassword(password));
     await audit(runtime, operator, "reset_user_password", "user", request.params.userId);
+    await runtime.database.createNotificationSafely({
+      userId: targetUser.id,
+      category: "security",
+      tone: "danger",
+      title: "账号密码已重置",
+      message: `超级管理员“${operator.username}”重置了你的账号密码。`,
+      actionPath: null,
+    });
+    await runtime.database.createSuperAdminNotificationsSafely({
+      category: "security",
+      tone: "danger",
+      title: "管理员重置用户密码",
+      message: `超级管理员“${operator.username}”重置了账号“${targetUser.username}”的密码。`,
+      actionPath: "/admin/users",
+      excludeUserId: targetUser.id,
+    });
     return reply.status(204).send();
   });
 
@@ -207,6 +252,22 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     }
     const user = await runtime.database.updateUserRole(request.params.userId, role);
     await audit(runtime, operator, "update_user_role", "user", user.id, { 新角色: role });
+    await runtime.database.createNotificationSafely({
+      userId: user.id,
+      category: "security",
+      tone: "warning",
+      title: "账号角色已修改",
+      message: `超级管理员“${operator.username}”将你的账号角色修改为${role === "super_admin" ? "超级管理员" : "普通用户"}。`,
+      actionPath: null,
+    });
+    await runtime.database.createSuperAdminNotificationsSafely({
+      category: "security",
+      tone: "warning",
+      title: "管理员修改用户角色",
+      message: `超级管理员“${operator.username}”修改了账号“${user.username}”的角色。`,
+      actionPath: "/admin/users",
+      excludeUserId: user.id,
+    });
     return { user: toUserDto(user) };
   });
 
@@ -224,12 +285,28 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       用户ID: operator.id,
       目标用户ID: user.id,
     });
+    await runtime.database.createNotificationSafely({
+      userId: user.id,
+      category: "security",
+      tone: "warning",
+      title: status === "active" ? "账号已启用" : "账号已停用",
+      message: `超级管理员“${operator.username}”${status === "active" ? "启用" : "停用"}了你的账号。`,
+      actionPath: null,
+    });
+    await runtime.database.createSuperAdminNotificationsSafely({
+      category: "security",
+      tone: "warning",
+      title: status === "active" ? "管理员启用用户" : "管理员停用用户",
+      message: `超级管理员“${operator.username}”${status === "active" ? "启用" : "停用"}了账号“${user.username}”。`,
+      actionPath: "/admin/users",
+      excludeUserId: user.id,
+    });
     return { user: toUserDto(user) };
   });
 
   server.post<{ Params: { userId: string } }>("/api/v1/admin/users/:userId/sessions/revoke", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
-    await runtime.database.findPublicUserById(request.params.userId);
+    const targetUser = await runtime.database.findPublicUserById(request.params.userId);
     await runtime.database.revokeAllUserSessions(request.params.userId);
     await audit(runtime, operator, "revoke_user_sessions", "user", request.params.userId);
     runtime.logBusinessEvent("info", {
@@ -237,6 +314,22 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       事件: "撤销用户全部会话",
       用户ID: operator.id,
       目标用户ID: request.params.userId,
+    });
+    await runtime.database.createNotificationSafely({
+      userId: targetUser.id,
+      category: "security",
+      tone: "danger",
+      title: "全部登录会话已撤销",
+      message: `超级管理员“${operator.username}”撤销了你的全部登录会话。`,
+      actionPath: null,
+    });
+    await runtime.database.createSuperAdminNotificationsSafely({
+      category: "security",
+      tone: "danger",
+      title: "管理员撤销用户会话",
+      message: `超级管理员“${operator.username}”撤销了账号“${targetUser.username}”的全部登录会话。`,
+      actionPath: "/admin/users",
+      excludeUserId: targetUser.id,
     });
     return reply.status(204).send();
   });
@@ -247,8 +340,25 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     if (request.params.userId === operator.id) {
       throw new ApiError(409, "cannot_delete_current_user", "不能删除当前登录的超级管理员");
     }
+    const targetUser = await runtime.database.findPublicUserById(request.params.userId);
     await runtime.database.updateUserStatus(request.params.userId, "pending_delete");
     await audit(runtime, operator, "schedule_user_delete", "user", request.params.userId);
+    await runtime.database.createNotificationSafely({
+      userId: targetUser.id,
+      category: "security",
+      tone: "danger",
+      title: "账号已进入删除状态",
+      message: `超级管理员“${operator.username}”已将你的账号标记为待删除。`,
+      actionPath: null,
+    });
+    await runtime.database.createSuperAdminNotificationsSafely({
+      category: "security",
+      tone: "danger",
+      title: "管理员删除用户",
+      message: `超级管理员“${operator.username}”将账号“${targetUser.username}”标记为待删除。`,
+      actionPath: "/admin/users",
+      excludeUserId: targetUser.id,
+    });
     return reply.status(202).send({ status: "pending_delete" });
   });
 
@@ -343,6 +453,72 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
     return { service: await attachConnectionAuthMode(runtime, service) };
   });
+
+  server.get<{
+    Params: { serviceId: string };
+    Querystring: Record<string, unknown>;
+  }>("/api/v1/admin/services/:serviceId/exports", async (request) => {
+    await requireSuperAdmin(request, runtime.database);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(String(request.query.limit ?? "20"), 10) || 20));
+    const records = await runtime.exports.listExports(service.userId, service.libraryId, limit);
+    return { exports: records.map((record) => ({ ...record, filePath: undefined })) };
+  });
+
+  server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/admin/services/:serviceId/exports",
+    async (request, reply) => {
+      const operator = await requireSuperAdmin(request, runtime.database);
+      const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+      const exportType = request.body.exportType ?? "snapshot";
+      if (exportType !== "snapshot") {
+        throw new ApiError(422, "export_type_not_supported", "当前只支持完整目录 snapshot 导出");
+      }
+      const record = await runtime.exports.createSnapshotTask(service.userId, service.libraryId);
+      await audit(runtime, operator, "create_library_snapshot", "library_export", record.id, {
+        媒体库ID: service.libraryId,
+        所属用户ID: service.userId,
+        服务ID: service.id,
+      });
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-snapshot-task",
+        事件: "管理员从网页创建云端快照",
+        管理员ID: operator.id,
+        所属用户ID: service.userId,
+        服务ID: service.id,
+        导出ID: record.id,
+      });
+      return reply.status(202).send({ export: { ...record, filePath: undefined } });
+    },
+  );
+
+  server.delete<{ Params: { exportId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/admin/exports/:exportId",
+    async (request, reply) => {
+      const operator = await requireSuperAdmin(request, runtime.database);
+      requireConfirmation(request.body, request.params.exportId);
+      try {
+        const record = await runtime.exports.deleteExport(request.params.exportId);
+        await audit(runtime, operator, "delete_library_snapshot", "library_export", record.id, {
+          媒体库ID: record.libraryId,
+          所属用户ID: record.userId,
+          快照状态: record.status,
+        });
+      } catch (error) {
+        runtime.logBusinessEvent("warn", {
+          日志关键字: "codex-flycloud-snapshot-delete",
+          事件: "管理员删除云端快照失败",
+          管理员ID: operator.id,
+          导出ID: request.params.exportId,
+          错误码: error && typeof error === "object" && "code" in error
+            ? String((error as { code?: string }).code)
+            : "snapshot_delete_failed",
+        });
+        throw error;
+      }
+      return reply.status(204).send();
+    },
+  );
 
   server.get<{ Params: { serviceId: string }; Querystring: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/directories", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
@@ -618,14 +794,58 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.delete<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, request.params.serviceId);
-    await runtime.repository.deleteService(request.params.serviceId);
+    // 关键变量：删除后无法再读取服务归属，先保存通知需要的用户和服务名称。
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-service-delete",
+      事件: "管理员开始删除云端服务",
+      管理员ID: operator.id,
+      服务ID: request.params.serviceId,
+    });
+    try {
+      await runtime.repository.deleteService(request.params.serviceId);
+    } catch (error) {
+      runtime.logBusinessEvent("warn", {
+        日志关键字: "codex-flycloud-helper-service-delete",
+        事件: "管理员删除云端服务失败",
+        管理员ID: operator.id,
+        服务ID: request.params.serviceId,
+        错误码: error && typeof error === "object" && "code" in error
+          ? String((error as { code?: string }).code)
+          : "service_delete_failed",
+      });
+      throw error;
+    }
     await audit(runtime, operator, "delete_service", "service", request.params.serviceId);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-service-delete",
+      事件: "管理员删除云端服务成功",
+      管理员ID: operator.id,
+      服务ID: request.params.serviceId,
+    });
+    await runtime.database.createNotificationSafely({
+      userId: service.userId,
+      category: "security",
+      tone: "warning",
+      title: "服务已被管理员删除",
+      message: `云端服务“${service.displayName}”已由超级管理员“${operator.username}”删除。`,
+      actionPath: "/app/services",
+    });
+    await runtime.database.createSuperAdminNotificationsSafely({
+      category: "security",
+      tone: "warning",
+      title: "管理员删除服务",
+      message: `超级管理员“${operator.username}”删除了账号“${service.ownerUsername}”的服务“${service.displayName}”。`,
+      actionPath: "/admin/services",
+      excludeUserId: service.userId,
+    });
     return reply.status(204).send();
   });
 
   server.delete<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/catalog", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, request.params.serviceId);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
     const clearStartedAtMs = Date.now();
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-catalog-clear",
@@ -646,6 +866,22 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       服务ID: request.params.serviceId,
       清空媒体条目数: cleared.mediaItemCount,
       清空源文件数: cleared.sourceFileCount,
+    });
+    await runtime.database.createNotificationSafely({
+      userId: service.userId,
+      category: "security",
+      tone: "warning",
+      title: "媒体库数据已被管理员清空",
+      message: `服务“${service.displayName}”的媒体库数据已由超级管理员“${operator.username}”清空。`,
+      actionPath: `/app/services/${service.id}`,
+    });
+    await runtime.database.createSuperAdminNotificationsSafely({
+      category: "security",
+      tone: "warning",
+      title: "管理员清空媒体库",
+      message: `超级管理员“${operator.username}”清空了账号“${service.ownerUsername}”的服务“${service.displayName}”。`,
+      actionPath: `/admin/services/${service.id}`,
+      excludeUserId: service.userId,
     });
     return cleared;
   });
@@ -805,7 +1041,8 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
 
   server.get<{ Params: { itemId: string } }>("/api/v1/admin/catalog/items/:itemId", async (request) => {
     await requireSuperAdmin(request, runtime.database);
-    return { item: await runtime.repository.getCatalogItem(request.params.itemId) };
+    const item = await runtime.repository.getCatalogItem(request.params.itemId);
+    return { item: await hydrateRealtimeVideoDetails(runtime, item) };
   });
 
   server.get<{ Params: { itemId: string } }>("/api/v1/admin/catalog/items/:itemId/children", async (request) => {

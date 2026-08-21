@@ -335,6 +335,9 @@ export function validateMetadataProfile(
   if (metadataSettings.useNfo !== undefined && typeof metadataSettings.useNfo !== "boolean") {
     throw validationError(`metadata.profiles.${serviceDataType}.useNfo`, "本地 NFO 开关必须是布尔值");
   }
+  if (metadataSettings.syncDetails !== undefined && typeof metadataSettings.syncDetails !== "boolean") {
+    throw validationError(`metadata.profiles.${serviceDataType}.syncDetails`, "同步刮削详情开关必须是布尔值");
+  }
   return profile;
 }
 
@@ -354,6 +357,7 @@ export function readVideoMetadataLogFields(profile: Record<string, unknown>): Re
     元数据语言: typeof videoProfile.language === "string" ? videoProfile.language : "zh-CN",
     内容地区: typeof videoProfile.region === "string" ? videoProfile.region : "CN",
     使用本地NFO: videoProfile.useNfo !== false,
+    同步刮削详情: videoProfile.syncDetails === true,
   };
 }
 
@@ -378,6 +382,16 @@ export async function validateProviderAccess(
 function readEventSequence(headers: Record<string, unknown>, query: Record<string, unknown>): number {
   const value = headers["last-event-id"] ?? query.afterSequence ?? 0;
   return Math.max(0, Number.parseInt(String(value), 10) || 0);
+}
+
+/** 读取 APP 多端条件更新使用的期望配置修订号。 */
+function readExpectedRevision(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const revision = Number(value);
+  if (!Number.isInteger(revision) || revision <= 0) {
+    throw validationError("expectedRevision", "期望配置修订号必须是正整数");
+  }
+  return revision;
 }
 
 /** 注册普通用户作用域的服务、任务、连接和配置接口。 */
@@ -501,6 +515,22 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     return { service: await attachConnectionAuthMode(runtime, service) };
   });
 
+  server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    const displayName = requireString(request.body, "displayName", "服务名称", 100);
+    const expectedUpdatedAt = request.body.expectedUpdatedAt === undefined
+      ? undefined
+      : requireString(request.body, "expectedUpdatedAt", "服务更新时间", 40);
+    return {
+      service: await runtime.repository.updateServiceName(
+        request.params.serviceId,
+        user.id,
+        displayName,
+        expectedUpdatedAt,
+      ),
+    };
+  });
+
   server.get<{ Params: { serviceId: string }; Querystring: Record<string, unknown> }>("/api/v1/services/:serviceId/directories", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
@@ -582,6 +612,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       userId: user.id,
       encryptedConnection: runtime.vault.encrypt(connection),
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
+      expectedRevision: readExpectedRevision(request.body.expectedRevision),
     });
     consumeProviderAuthorization(runtime, user.id, resolvedConnection.authorizationSessionId);
     if (service.providerType === "guangya" && connection.authMode === "official_api") {
@@ -681,7 +712,12 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
         });
       },
     });
-    const updatedService = await runtime.repository.updateScanProfile(request.params.serviceId, user.id, profile);
+    const updatedService = await runtime.repository.updateScanProfile(
+      request.params.serviceId,
+      user.id,
+      profile,
+      readExpectedRevision(request.body.expectedRevision),
+    );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-scan-path",
       事件: "更新服务扫描路径",
@@ -702,7 +738,12 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       requireObject(request.body, "metadata", "元数据配置"),
       service.dataType,
     );
-    const updatedService = await runtime.repository.updateMetadataProfile(request.params.serviceId, user.id, profile);
+    const updatedService = await runtime.repository.updateMetadataProfile(
+      request.params.serviceId,
+      user.id,
+      profile,
+      readExpectedRevision(request.body.expectedRevision),
+    );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-metadata-profile",
       事件: "更新影视元数据配置",
@@ -750,14 +791,57 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.delete<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, request.params.serviceId);
-    await runtime.repository.deleteService(request.params.serviceId, user.id);
-    runtime.logBusinessEvent("info", { 事件: "删除云端服务", 用户ID: user.id, 服务ID: request.params.serviceId });
+    // 关键变量：删除后服务记录不可再读取，先保存通知所需的脱敏名称与归属。
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-service-delete",
+      事件: "用户开始删除云端服务",
+      用户ID: user.id,
+      服务ID: request.params.serviceId,
+    });
+    try {
+      await runtime.repository.deleteService(request.params.serviceId, user.id);
+    } catch (error) {
+      runtime.logBusinessEvent("warn", {
+        日志关键字: "codex-flycloud-helper-service-delete",
+        事件: "用户删除云端服务失败",
+        用户ID: user.id,
+        服务ID: request.params.serviceId,
+        错误码: error && typeof error === "object" && "code" in error
+          ? String((error as { code?: string }).code)
+          : "service_delete_failed",
+      });
+      throw error;
+    }
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-service-delete",
+      事件: "用户删除云端服务成功",
+      用户ID: user.id,
+      服务ID: request.params.serviceId,
+    });
+    await runtime.database.createNotificationSafely({
+      userId: user.id,
+      category: "security",
+      tone: "warning",
+      title: "服务已删除",
+      message: `云端服务“${service.displayName}”及其媒体库数据已删除。`,
+      actionPath: "/app/services",
+    });
+    await runtime.database.createSuperAdminNotificationsSafely({
+      category: "security",
+      tone: "warning",
+      title: "用户删除服务",
+      message: `账号“${user.username}”删除了云端服务“${service.displayName}”。`,
+      actionPath: "/admin/services",
+      excludeUserId: user.id,
+    });
     return reply.status(204).send();
   });
 
   server.delete<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/catalog", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, request.params.serviceId);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
     const clearStartedAtMs = Date.now();
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-catalog-clear",
@@ -784,6 +868,22 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       清空媒体条目数: cleared.mediaItemCount,
       清空源文件数: cleared.sourceFileCount,
       清空耗时毫秒: Date.now() - clearStartedAtMs,
+    });
+    await runtime.database.createNotificationSafely({
+      userId: user.id,
+      category: "security",
+      tone: "warning",
+      title: "媒体库数据已清空",
+      message: `服务“${service.displayName}”的 ${cleared.mediaItemCount} 个媒体条目和 ${cleared.sourceFileCount} 个源文件索引已清空。`,
+      actionPath: `/app/services/${service.id}`,
+    });
+    await runtime.database.createSuperAdminNotificationsSafely({
+      category: "security",
+      tone: "warning",
+      title: "用户清空媒体库",
+      message: `账号“${user.username}”清空了服务“${service.displayName}”的媒体库数据。`,
+      actionPath: "/admin/services",
+      excludeUserId: user.id,
     });
     return cleared;
   });

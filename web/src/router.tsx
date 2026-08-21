@@ -14,12 +14,16 @@ import { SetupPage, LoginPage, RegisterPage } from "@/pages/AuthPages";
 import { OverviewPage } from "@/pages/OverviewPage";
 import {
   AdminServiceCatalogPage,
+  AdminServiceConnectionPage,
   AdminServiceCreatePage,
   AdminServiceDetailPage,
+  AdminServiceSnapshotPage,
   AdminServicesPage,
   ServiceCreatePage,
   UserServiceCatalogPage,
+  UserServiceConnectionPage,
   UserServiceDetailPage,
+  UserServiceSnapshotPage,
   UserServicesPage,
 } from "@/pages/ServicePages";
 import {
@@ -164,6 +168,18 @@ function UserServiceCatalogRouteComponent() {
   return <UserServiceCatalogPage serviceId={serviceId} />;
 }
 
+/** 处理普通用户服务连接管理路由参数。 */
+function UserServiceConnectionRouteComponent() {
+  const { serviceId } = userServiceConnectionRoute.useParams();
+  return <UserServiceConnectionPage serviceId={serviceId} />;
+}
+
+/** 处理普通用户服务快照管理路由参数。 */
+function UserServiceSnapshotRouteComponent() {
+  const { serviceId } = userServiceSnapshotRoute.useParams();
+  return <UserServiceSnapshotPage serviceId={serviceId} />;
+}
+
 /** 处理管理员服务详情路由参数。 */
 function AdminServiceDetailRouteComponent() {
   const { serviceId } = adminServiceDetailRoute.useParams();
@@ -174,6 +190,18 @@ function AdminServiceDetailRouteComponent() {
 function AdminServiceCatalogRouteComponent() {
   const { serviceId } = adminServiceCatalogRoute.useParams();
   return <AdminServiceCatalogPage serviceId={serviceId} />;
+}
+
+/** 处理管理员服务连接管理路由参数。 */
+function AdminServiceConnectionRouteComponent() {
+  const { serviceId } = adminServiceConnectionRoute.useParams();
+  return <AdminServiceConnectionPage serviceId={serviceId} />;
+}
+
+/** 处理管理员服务快照管理路由参数。 */
+function AdminServiceSnapshotRouteComponent() {
+  const { serviceId } = adminServiceSnapshotRoute.useParams();
+  return <AdminServiceSnapshotPage serviceId={serviceId} />;
 }
 
 /** 全局 404 页面。 */
@@ -266,6 +294,18 @@ const userServiceCatalogRoute = createRoute({
   component: UserServiceCatalogRouteComponent,
 });
 
+const userServiceConnectionRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "services/$serviceId/connection",
+  component: UserServiceConnectionRouteComponent,
+});
+
+const userServiceSnapshotRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "services/$serviceId/snapshots",
+  component: UserServiceSnapshotRouteComponent,
+});
+
 const userJobsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "jobs",
@@ -320,6 +360,18 @@ const adminServiceCatalogRoute = createRoute({
   component: AdminServiceCatalogRouteComponent,
 });
 
+const adminServiceConnectionRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "services/$serviceId/connection",
+  component: AdminServiceConnectionRouteComponent,
+});
+
+const adminServiceSnapshotRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "services/$serviceId/snapshots",
+  component: AdminServiceSnapshotRouteComponent,
+});
+
 const adminJobsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "jobs",
@@ -363,6 +415,8 @@ const appRouteTree = appRoute.addChildren([
   userServiceCreateRoute,
   userServiceDetailRoute,
   userServiceCatalogRoute,
+  userServiceConnectionRoute,
+  userServiceSnapshotRoute,
   userJobsRoute,
   userCatalogRoute,
 ]);
@@ -375,6 +429,8 @@ const adminRouteTree = adminRoute.addChildren([
   adminServiceCreateRoute,
   adminServiceDetailRoute,
   adminServiceCatalogRoute,
+  adminServiceConnectionRoute,
+  adminServiceSnapshotRoute,
   adminJobsRoute,
   adminCatalogRoute,
   adminPluginsRoute,
