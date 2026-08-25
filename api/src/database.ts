@@ -956,6 +956,126 @@ export class FlyCloudHelperDatabase {
     return this.findPublicUserById(userId);
   }
 
+  /** 校验待删除用户当前没有仍会写入其数据的后台任务。 */
+  public async assertUserCanBePurged(userId: string): Promise<PublicUserRecord> {
+    return this.query.transaction(async (transaction) => {
+      return this.requireUserCanBePurged(userId, transaction);
+    });
+  }
+
+  /**
+   * 彻底删除待删除用户及其全部业务数据。
+   * 文件目录由路由在调用本方法前清理，数据库数据在同一个事务中完成删除。
+   */
+  public async purgePendingUser(userId: string): Promise<void> {
+    await this.query.transaction(async (transaction) => {
+      await this.requireUserCanBePurged(userId, transaction);
+
+      // 关键变量：先解除其他用户任务中的管理员请求人标识，避免保留已经删除的用户 ID。
+      await transaction("scan_jobs")
+        .where({ requested_by_user_id: userId })
+        .whereNot({ user_id: userId })
+        .update({ requested_by_user_id: transaction.ref("user_id") });
+      await transaction("media_probe_jobs")
+        .where({ requested_by_user_id: userId })
+        .whereNot({ user_id: userId })
+        .update({ requested_by_user_id: transaction.ref("user_id") });
+      await transaction("system_secret_settings").where({ updated_by_user_id: userId }).update({ updated_by_user_id: null });
+      await transaction("system_settings").where({ updated_by_user_id: userId }).update({ updated_by_user_id: null });
+      await transaction("audit_log_entries").where({ operator_user_id: userId }).update({
+        operator_user_id: null,
+        operator_username: null,
+      });
+      await transaction("audit_log_entries").where({ target_type: "user", target_id: userId }).update({ target_id: null });
+
+      const scanJobRows = await transaction("scan_jobs").select("id").where({ user_id: userId });
+      const scanJobIds = scanJobRows.map((row) => String(row.id));
+      if (scanJobIds.length > 0) {
+        await transaction("scan_job_events").whereIn("job_id", scanJobIds).delete();
+        await transaction("scan_job_checkpoints").whereIn("job_id", scanJobIds).delete();
+        await transaction("scan_root_runs").whereIn("job_id", scanJobIds).delete();
+      }
+
+      const migrationRows = await transaction("service_migrations").select("id").where({ user_id: userId });
+      const migrationIds = migrationRows.map((row) => String(row.id));
+      if (migrationIds.length > 0) {
+        await transaction("service_migration_chunks").whereIn("migration_id", migrationIds).delete();
+      }
+
+      const serviceRows = await transaction("cloud_services").select("id").where({ user_id: userId });
+      const serviceIds = serviceRows.map((row) => String(row.id));
+      if (serviceIds.length > 0) {
+        await transaction("service_playback_progress").whereIn("service_id", serviceIds).delete();
+        await transaction("service_playback_sessions").whereIn("service_id", serviceIds).delete();
+        await transaction("service_playback_history").whereIn("service_id", serviceIds).delete();
+        await transaction("service_protocol_sessions").whereIn("service_id", serviceIds).delete();
+        await transaction("service_access_accounts").whereIn("service_id", serviceIds).delete();
+      }
+
+      await transaction("library_exports").where({ user_id: userId }).delete();
+      await transaction("catalog_changes").where({ user_id: userId }).delete();
+      await transaction("file_links").where({ user_id: userId }).delete();
+      await transaction("media_relations").where({ user_id: userId }).delete();
+      await transaction("media_file_probes").where({ user_id: userId }).delete();
+      await transaction("media_probe_jobs").where({ user_id: userId }).delete();
+      await transaction("scan_jobs").where({ user_id: userId }).delete();
+      await transaction("service_migrations").where({ user_id: userId }).delete();
+      await transaction("source_files").where({ user_id: userId }).delete();
+      await transaction("media_items").where({ user_id: userId }).delete();
+      await transaction("client_service_links").where({ user_id: userId }).delete();
+      await transaction("service_metadata_profiles").where({ user_id: userId }).delete();
+      await transaction("service_scan_profiles").where({ user_id: userId }).delete();
+      await transaction("service_credentials").where({ user_id: userId }).delete();
+      await transaction("media_libraries").where({ user_id: userId }).delete();
+      await transaction("cloud_services").where({ user_id: userId }).delete();
+      const deleted = await transaction("user_accounts").where({ id: userId }).delete();
+      if (deleted !== 1) {
+        throw new ApiError(404, "user_not_found", "用户不存在");
+      }
+    });
+  }
+
+  /** 在事务内锁定并校验一个可以被彻底删除的待删除用户。 */
+  private async requireUserCanBePurged(
+    userId: string,
+    transaction: Knex | Knex.Transaction,
+  ): Promise<PublicUserRecord> {
+    let userQuery = transaction("user_accounts").where({ id: userId });
+    if (this.databaseType !== "sqlite") userQuery = userQuery.forUpdate();
+    const row = await userQuery.first();
+    if (!row) {
+      throw new ApiError(404, "user_not_found", "用户不存在");
+    }
+    const user = mapPublicUser(row as UserRow);
+    if (user.status !== "pending_delete") {
+      throw new ApiError(409, "user_not_pending_delete", "只有待删除用户可以彻底删除");
+    }
+    if (user.role === "super_admin") {
+      const activeAdministrator = await transaction("user_accounts")
+        .where({ role: "super_admin", status: "active" })
+        .whereNot({ id: userId })
+        .first();
+      if (!activeAdministrator) {
+        throw new ApiError(409, "last_super_admin", "不能删除最后一个有效超级管理员");
+      }
+    }
+
+    const activeJobStatuses = ["queued", "running", "retry_waiting", "paused"];
+    const [scanJob, mediaProbeJob, migration, libraryExport] = await Promise.all([
+      transaction("scan_jobs").where({ user_id: userId }).whereIn("status", activeJobStatuses).first(),
+      transaction("media_probe_jobs").where({ user_id: userId }).whereIn("status", activeJobStatuses).first(),
+      transaction("service_migrations")
+        .where({ user_id: userId })
+        .whereIn("status", ["preparing", "uploading", "queued", "validating", "importing", "finalizing"])
+        .first(),
+      transaction("library_exports").where({ user_id: userId }).whereIn("status", ["queued", "running"]).first(),
+    ]);
+    if (scanJob || mediaProbeJob || migration || libraryExport) {
+      throw new ApiError(409, "user_has_active_background_job", "该用户仍有未结束后台任务，请先终止后再彻底删除");
+    }
+    return user;
+  }
+
   /** 写入不含敏感值的管理审计记录。 */
   public async addAudit(input: {
     id: string;

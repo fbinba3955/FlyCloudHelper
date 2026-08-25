@@ -31,6 +31,7 @@ FROM node:20-bookworm-slim AS runtime
 ENV NODE_ENV=production \
     FLYCLOUDHELPER_API_HOST=0.0.0.0 \
     FLYCLOUDHELPER_API_PORT=9934 \
+    FLYCLOUDHELPER_PUBLIC_BASE_URL= \
     FLYCLOUDHELPER_DATABASE_TYPE=sqlite \
     FLYCLOUDHELPER_DATABASE_HOST= \
     FLYCLOUDHELPER_DATABASE_PORT= \
@@ -46,7 +47,9 @@ ENV NODE_ENV=production \
     FLYCLOUDHELPER_PLUGIN_DIR=/data/plugins \
     FLYCLOUDHELPER_EXPORT_DIR=/data/exports \
     FLYCLOUDHELPER_MIGRATION_DIR=/data/migrations \
-    FLYCLOUDHELPER_WEB_DIST_DIR=/app/web/dist
+    FLYCLOUDHELPER_WEB_DIST_DIR=/app/web/dist \
+    FLYCLOUDHELPER_FFPROBE_PATH=/usr/bin/ffprobe \
+    FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY=1
 
 WORKDIR /app
 
@@ -57,7 +60,12 @@ COPY --from=build --chown=node:node /app/api/package.json ./api/package.json
 COPY --from=build --chown=node:node /app/api/dist ./api/dist
 COPY --from=build --chown=node:node /app/web/dist ./web/dist
 
-RUN mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations && chown -R node:node /data
+# Debian 的 ffmpeg 软件包同时提供原生 amd64/arm64 ffprobe，镜像启动后无需宿主机安装或挂载。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations \
+    && chown -R node:node /data
 
 USER node
 EXPOSE 9934

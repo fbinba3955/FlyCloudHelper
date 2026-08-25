@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 24;
+export const currentSchemaVersion = 28;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -171,6 +171,7 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("status", 32).notNullable();
       table.string("connection_status", 64).notNullable();
       table.integer("relay_playback_enabled").notNullable().defaultTo(0);
+      table.integer("jellyfin_enabled").notNullable().defaultTo(0);
       table.integer("credential_revision").notNullable();
       table.integer("scan_profile_revision").notNullable();
       table.integer("metadata_profile_revision").notNullable();
@@ -186,6 +187,9 @@ async function createServiceTables(database: Knex): Promise<void> {
     });
     await addColumnIfMissing(database, "cloud_services", "relay_playback_enabled", (table) => {
       table.integer("relay_playback_enabled").notNullable().defaultTo(0);
+    });
+    await addColumnIfMissing(database, "cloud_services", "jellyfin_enabled", (table) => {
+      table.integer("jellyfin_enabled").notNullable().defaultTo(0);
     });
   }
 
@@ -308,6 +312,102 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("created_at", 40).notNullable();
       table.unique(["migration_id", "chunk_index"], { indexName: "uq_service_migration_chunks_index" });
       table.index(["migration_id"], "idx_service_migration_chunks_migration");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_access_accounts"))) {
+    await database.schema.createTable("service_access_accounts", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().unique().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("username", 255).notNullable();
+      table.string("username_lookup", 255).notNullable();
+      table.text("password_hash").notNullable();
+      table.integer("password_required").notNullable().defaultTo(1);
+      table.integer("credential_revision").notNullable().defaultTo(1);
+      table.string("status", 32).notNullable().defaultTo("active");
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["service_id", "username_lookup"], { indexName: "uq_service_access_username" });
+    });
+  }
+  await addColumnIfMissing(database, "service_access_accounts", "password_required", (table) => {
+    // 关键变量：历史服务默认继续要求密码，只有用户明确保存空密码后才切换为免密码登录。
+    table.integer("password_required").notNullable().defaultTo(1);
+  });
+
+  if (!(await database.schema.hasTable("service_protocol_sessions"))) {
+    await database.schema.createTable("service_protocol_sessions", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_access_accounts").onDelete("CASCADE");
+      table.string("protocol", 32).notNullable();
+      table.string("token_hash", 64).notNullable().unique();
+      table.integer("credential_revision").notNullable();
+      table.string("device_id", 255).nullable();
+      table.string("device_name", 255).nullable();
+      table.string("client_name", 255).nullable();
+      table.string("expires_at", 40).notNullable();
+      table.string("last_seen_at", 40).notNullable();
+      table.string("revoked_at", 40).nullable();
+      table.string("created_at", 40).notNullable();
+      table.index(["service_id", "protocol", "revoked_at"], "idx_protocol_sessions_service");
+      table.index(["account_id", "expires_at"], "idx_protocol_sessions_account");
+    });
+  }
+}
+
+/** 在媒体目录表之后创建服务级播放数据表，确保 PostgreSQL 外键目标已经存在。 */
+async function createPlaybackTables(database: Knex): Promise<void> {
+  if (!(await database.schema.hasTable("service_playback_progress"))) {
+    await database.schema.createTable("service_playback_progress", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_access_accounts").onDelete("CASCADE");
+      table.string("item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
+      table.string("media_source_id", 128).nullable();
+      table.bigInteger("position_ticks").notNullable().defaultTo(0);
+      table.integer("played").notNullable().defaultTo(0);
+      table.integer("hidden_from_resume").notNullable().defaultTo(0);
+      table.integer("play_count").notNullable().defaultTo(0);
+      table.string("last_played_at", 40).nullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["service_id", "account_id", "item_id"], { indexName: "uq_service_playback_progress" });
+      table.index(["service_id", "account_id", "updated_at"], "idx_service_progress_resume");
+    });
+  }
+  await addColumnIfMissing(database, "service_playback_progress", "media_source_id", (table) => {
+    table.string("media_source_id", 128).nullable();
+  });
+
+  if (!(await database.schema.hasTable("service_playback_sessions"))) {
+    await database.schema.createTable("service_playback_sessions", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_access_accounts").onDelete("CASCADE");
+      table.string("item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
+      table.string("media_source_id", 128).nullable();
+      table.string("status", 32).notNullable();
+      table.bigInteger("position_ticks").notNullable().defaultTo(0);
+      table.integer("paused").notNullable().defaultTo(0);
+      table.string("started_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.string("stopped_at", 40).nullable();
+      table.index(["service_id", "account_id", "status"], "idx_service_play_sessions_active");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_playback_history"))) {
+    await database.schema.createTable("service_playback_history", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_access_accounts").onDelete("CASCADE");
+      table.string("item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
+      table.string("play_session_id", 64).notNullable().unique();
+      table.bigInteger("position_ticks").notNullable().defaultTo(0);
+      table.integer("completed").notNullable().defaultTo(0);
+      table.string("started_at", 40).notNullable();
+      table.string("stopped_at", 40).notNullable();
+      table.index(["service_id", "account_id", "stopped_at"], "idx_service_play_history_recent");
     });
   }
 }
@@ -487,6 +587,72 @@ async function createCatalogTables(database: Knex): Promise<void> {
   });
   await addColumnIfMissing(database, "source_files", "metadata_profile_revision", (table) => {
     table.integer("metadata_profile_revision").notNullable().defaultTo(0);
+  });
+
+  if (!(await database.schema.hasTable("media_probe_jobs"))) {
+    await database.schema.createTable("media_probe_jobs", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.string("requested_by_user_id", 64).notNullable();
+      table.string("trigger_type", 32).notNullable();
+      table.string("status", 32).notNullable();
+      table.string("stage", 32).notNullable();
+      table.bigInteger("processed_count").notNullable().defaultTo(0);
+      table.bigInteger("total_count").notNullable().defaultTo(0);
+      table.bigInteger("error_count").notNullable().defaultTo(0);
+      table.text("current_file_name").nullable();
+      table.string("error_code", 100).nullable();
+      table.text("error_message").nullable();
+      table.string("next_retry_at", 40).nullable();
+      table.string("control_action", 32).notNullable().defaultTo("none");
+      table.text("snapshot_json").notNullable();
+      table.string("created_at", 40).notNullable();
+      table.string("started_at", 40).nullable();
+      table.string("finished_at", 40).nullable();
+      table.bigInteger("active_duration_ms").notNullable().defaultTo(0);
+      table.string("active_started_at", 40).nullable();
+      table.string("updated_at", 40).notNullable();
+      table.index(["user_id", "status", "created_at"], "idx_media_probe_jobs_user_status");
+      table.index(["service_id", "status"], "idx_media_probe_jobs_service_status");
+    });
+  }
+  await addColumnIfMissing(database, "media_probe_jobs", "error_code", (table) => {
+    table.string("error_code", 100).nullable();
+  });
+  await addColumnIfMissing(database, "media_probe_jobs", "error_message", (table) => {
+    table.text("error_message").nullable();
+  });
+
+  if (!(await database.schema.hasTable("media_file_probes"))) {
+    await database.schema.createTable("media_file_probes", (table) => {
+      // 关键变量：一个源文件只保存一份当前指纹对应的规格结果，文件变化时原位重新排队。
+      table.string("source_file_id", 64).primary().references("id").inTable("source_files").onDelete("CASCADE");
+      table.string("user_id", 64).notNullable();
+      table.string("service_id", 64).notNullable();
+      table.string("library_id", 64).notNullable();
+      table.string("probe_job_id", 64).nullable();
+      table.string("fingerprint", 64).notNullable();
+      table.string("status", 32).notNullable();
+      table.integer("attempt_count").notNullable().defaultTo(0);
+      table.text("result_json").nullable();
+      table.string("error_code", 100).nullable();
+      table.text("error_message").nullable();
+      table.string("next_retry_at", 40).nullable();
+      table.string("started_at", 40).nullable();
+      table.string("finished_at", 40).nullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.index(["status", "next_retry_at", "created_at"], "idx_media_file_probes_queue");
+      table.index(["service_id", "status"], "idx_media_file_probes_service_status");
+      table.index(["library_id"], "idx_media_file_probes_library");
+      table.index(["probe_job_id", "status"], "idx_media_file_probes_job_status");
+    });
+  }
+  await addColumnIfMissing(database, "media_file_probes", "probe_job_id", (table) => {
+    table.string("probe_job_id", 64).nullable();
+    table.index(["probe_job_id", "status"], "idx_media_file_probes_job_status");
   });
 
   if (!(await database.schema.hasTable("media_items"))) {
@@ -709,6 +875,16 @@ async function createOperationTables(database: Knex): Promise<void> {
       table.string("updated_at", 40).notNullable();
     });
   }
+  if (!(await database.schema.hasTable("system_settings"))) {
+    await database.schema.createTable("system_settings", (table) => {
+      table.string("setting_key", 100).primary();
+      table.text("setting_value").notNullable();
+      table.integer("revision").notNullable().defaultTo(1);
+      table.string("updated_by_user_id", 64).nullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+    });
+  }
 
   if (!(await database.schema.hasTable("library_exports"))) {
     await database.schema.createTable("library_exports", (table) => {
@@ -821,6 +997,7 @@ export async function migrateDatabase(database: Knex): Promise<void> {
   await createIdentityTables(database);
   await createServiceTables(database);
   await createCatalogTables(database);
+  await createPlaybackTables(database);
   await createOperationTables(database);
 
   const now = new Date().toISOString();

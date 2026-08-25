@@ -159,6 +159,11 @@ export interface AdminConfigStatus {
     effectiveConcurrency: number;
     revision: string;
   };
+  publicAccess: {
+    publicBaseUrl: string | null;
+    source: "environment" | "database" | "missing";
+    editable: boolean;
+  };
   music: {
     musicBrainz: { status: string };
     acoustId: { status: string; configured: boolean; reasonCode: string };
@@ -179,7 +184,10 @@ export interface CloudService {
   dataType: MediaType;
   status: ServiceStatus;
   connectionStatus: string;
+  /** 光鸭服务的登录类型；列表接口不返回任何授权凭据。 */
+  connectionAuthMode?: "official_api" | "web_qr" | "web_sms" | null;
   relayPlaybackEnabled: boolean;
+  jellyfinEnabled: boolean;
   credentialRevision: number;
   scanProfileRevision: number;
   metadataProfileRevision: number;
@@ -203,8 +211,31 @@ export interface CreateCloudServiceInput {
   userId?: string;
 }
 
+export interface ServiceAccessSettings {
+  jellyfinEnabled: boolean;
+  jellyfinUrl: string | null;
+  jellyfinPath: string;
+  account: {
+    id: string;
+    serviceId: string;
+    username: string;
+    hasPassword: boolean;
+    credentialRevision: number;
+    status: "active" | "disabled";
+    createdAt: string;
+    updatedAt: string;
+  };
+}
+
+export interface CreateCloudServiceResult {
+  service: ServiceDetail;
+  serviceAccessCredentials: { username: string; password: string };
+}
+
 export interface ScanJob {
   id: string;
+  /** 后台任务类型；scan 为扫描刮削，media_probe 为视频规格分析。 */
+  jobType: "scan" | "media_probe";
   userId: string;
   serviceId: string;
   libraryId: string;
@@ -235,6 +266,14 @@ export interface ScanJob {
   finishedAt: string | null;
   elapsedMs: number;
   updatedAt: string;
+}
+
+/** 视频规格后台任务详情中的失败文件。 */
+export interface MediaProbeFailure {
+  sourceFileId: string;
+  fileName: string;
+  errorCode: string;
+  errorMessage: string;
 }
 
 /** 网页服务详情展示的云端媒体库快照任务。 */
@@ -292,10 +331,40 @@ export interface MediaItem {
   externalIds: Record<string, string>;
   metadata: Record<string, unknown>;
   fileCount: number;
+  /** 当前条目及其剧集已完成的 ffprobe 规格汇总。 */
+  mediaProbeSummary: MediaProbeSummary | null;
   ownerUsername: string;
   serviceName: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** 海报卡片和媒体详情使用的视频规格汇总。 */
+export interface MediaProbeSummary {
+  analyzedFileCount: number;
+  durationMs: number;
+  container: string;
+  bitRate: number;
+  videoCodec: string;
+  width: number;
+  height: number;
+  videoRange: string;
+  videoRangeType: string;
+  audioCodec: string;
+  audioChannels: number;
+  audioChannelLayout: string;
+  audioStreamCount: number;
+  subtitleStreamCount: number;
+}
+
+/** 单个源文件已经完成的 ffprobe 结果。 */
+export interface MediaProbeResult {
+  probeVersion: number;
+  container: string;
+  runTimeTicks: number;
+  bitRate: number;
+  size: number;
+  mediaStreams: Array<Record<string, unknown>>;
 }
 
 export interface MediaPathItem {
@@ -307,6 +376,8 @@ export interface MediaPathItem {
   name: string;
   size: number;
   modifiedAt: string | null;
+  /** 当前源文件已经完成的 ffprobe 结果；未分析时为空。 */
+  mediaProbe: MediaProbeResult | null;
 }
 
 export type ManualVideoMatchType = "movie" | "tv";
@@ -584,12 +655,11 @@ export function pollGuangyaAuthorization(
 export async function createService(
   input: CreateCloudServiceInput,
   admin = false,
-): Promise<ServiceDetail> {
-  const result = await requestJson<{ service: ServiceDetail }>(admin ? "/api/v1/admin/services" : "/api/v1/services", {
+): Promise<CreateCloudServiceResult> {
+  return requestJson<CreateCloudServiceResult>(admin ? "/api/v1/admin/services" : "/api/v1/services", {
     method: "POST",
     body: JSON.stringify(input),
   });
-  return result.service;
 }
 
 /** 创建扫描任务；Web 控制台使用稳定设备标识和随机请求 ID。 */
@@ -764,6 +834,19 @@ export async function updateServiceMetadataProfile(
   return result.service;
 }
 
+/** 手动为已有但缺少规格的视频创建独立后台任务。 */
+export function backfillExistingMediaProbes(
+  serviceId: string,
+  admin = false,
+): Promise<{ job: ScanJob | null; queuedCount: number }> {
+  return requestJson(
+    admin
+      ? `/api/v1/admin/services/${serviceId}/media-probes/backfill`
+      : `/api/v1/services/${serviceId}/media-probes/backfill`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+}
+
 /** 启用或停用云端服务。 */
 export async function updateServiceStatus(
   serviceId: string,
@@ -792,9 +875,44 @@ export async function updateServiceRelayPlayback(
   return result.service;
 }
 
+/** 读取当前服务的协议账号和 Jellyfin 地址。 */
+export async function getServiceAccessSettings(serviceId: string, admin = false): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/access-account` : `/api/v1/services/${serviceId}/access-account`);
+  return result.settings;
+}
+
+/** 修改服务协议用户名或密码。 */
+export async function updateServiceAccessCredentials(serviceId: string, input: { username?: string; password?: string }, admin = false): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/access-account` : `/api/v1/services/${serviceId}/access-account`, { method: "PATCH", body: JSON.stringify(input) });
+  return result.settings;
+}
+
+/** 重置服务协议密码，明文只在本次响应返回。 */
+export function resetServiceAccessPassword(serviceId: string, admin = false): Promise<{ settings: ServiceAccessSettings; password: string }> {
+  return requestJson(admin ? `/api/v1/admin/services/${serviceId}/access-account/reset-password` : `/api/v1/services/${serviceId}/access-account/reset-password`, { method: "POST", body: "{}" });
+}
+
+/** 撤销当前服务的全部 Jellyfin/Emby 兼容会话。 */
+export function revokeServiceAccessSessions(serviceId: string, admin = false): Promise<{ revokedCount: number }> {
+  return requestJson(admin ? `/api/v1/admin/services/${serviceId}/access-account/revoke-sessions` : `/api/v1/services/${serviceId}/access-account/revoke-sessions`, { method: "POST", body: "{}" });
+}
+
+/** 启用或关闭单个服务的 Jellyfin 协议。 */
+export async function updateServiceJellyfinSettings(serviceId: string, jellyfinEnabled: boolean, admin = false): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/jellyfin-settings` : `/api/v1/services/${serviceId}/jellyfin-settings`, { method: "PATCH", body: JSON.stringify({ jellyfinEnabled }) });
+  return result.settings;
+}
+
 /** 读取用户或管理员作用域扫描任务。 */
 export function listJobs(admin = false): Promise<{ items: ScanJob[]; total: number }> {
   return requestJson(admin ? "/api/v1/admin/jobs?limit=200" : "/api/v1/scan-jobs?limit=200");
+}
+
+/** 读取视频规格后台任务最终失败的文件列表。 */
+export function listMediaProbeJobFailures(jobId: string, admin = false): Promise<{ items: MediaProbeFailure[] }> {
+  return requestJson(admin
+    ? `/api/v1/admin/jobs/${jobId}/media-probe-failures`
+    : `/api/v1/scan-jobs/${jobId}/media-probe-failures`);
 }
 
 /** 读取单个媒体库的海报墙条目。 */
@@ -945,6 +1063,22 @@ export async function updateAdminUserStatus(userId: string, status: "active" | "
   })).user;
 }
 
+/** 将指定的其他用户标记为待删除，并立即撤销其全部会话。 */
+export async function deleteAdminUser(userId: string): Promise<void> {
+  await requestJson<{ status: "pending_delete" }>(`/api/v1/admin/users/${userId}`, {
+    method: "DELETE",
+    body: JSON.stringify({ confirmation: userId }),
+  });
+}
+
+/** 彻底删除一个已经进入待删除状态的其他用户。 */
+export async function purgeAdminUser(userId: string): Promise<void> {
+  await requestJson<void>(`/api/v1/admin/users/${userId}/purge`, {
+    method: "DELETE",
+    body: JSON.stringify({ confirmation: userId }),
+  });
+}
+
 /** 撤销指定用户的全部 Web 和 APP 会话。 */
 export async function revokeAdminUserSessions(userId: string): Promise<void> {
   await requestJson<void>(`/api/v1/admin/users/${userId}/sessions/revoke`, { method: "POST", body: "{}" });
@@ -967,6 +1101,12 @@ export async function updateAdminTmdbKeys(keys: string[]): Promise<AdminConfigSt
     body: JSON.stringify({ keys }),
   });
   return result.tmdb;
+}
+
+/** 保存实例对外公开根地址；环境变量配置时服务端会拒绝修改。 */
+export async function updateAdminPublicBaseUrl(publicBaseUrl: string): Promise<AdminConfigStatus["publicAccess"]> {
+  const result = await requestJson<{ publicAccess: AdminConfigStatus["publicAccess"] }>("/api/v1/admin/config/public-access", { method: "PUT", body: JSON.stringify({ publicBaseUrl }) });
+  return result.publicAccess;
 }
 
 /** 清空数据库、待写入队列和进程内的部署级 TMDB 共享缓存。 */

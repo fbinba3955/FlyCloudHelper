@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import type { FlyCloudHelperDatabase } from "./database.js";
 import {
@@ -9,6 +9,8 @@ import {
   type JobStatus,
   type MatchState,
   type MediaItemRecord,
+  type MediaProbeFailureRecord,
+  type MediaProbeSummaryRecord,
   type MediaType,
   type ScanJobRecord,
   type ServiceDetailRecord,
@@ -21,7 +23,9 @@ import { ApiError, toSafeErrorMessage } from "./errors.js";
 import { isFlymbyExcludedPath } from "./media/flymby-scan-exclusions.js";
 import { createStableId } from "./media/filename.js";
 import { parseFlymbyVideoName } from "./media/flymby-video-parser.js";
+import { parseMediaProbeResult, type MediaProbeResult } from "./media/media-probe.js";
 import type { TmdbVideoMetadata } from "./metadata/tmdb.js";
+import { ServiceAccessService, type GeneratedServiceAccessCredentials } from "./service-access.js";
 
 interface ServiceRow {
   id: string;
@@ -34,6 +38,7 @@ interface ServiceRow {
   status: ServiceStatus;
   connection_status: string;
   relay_playback_enabled: number | string | boolean;
+  jellyfin_enabled: number | string | boolean;
   credential_revision: number | string;
   scan_profile_revision: number | string;
   metadata_profile_revision: number | string;
@@ -72,6 +77,32 @@ interface JobRow {
   snapshot_json: string;
   control_action: "none" | "pause" | "cancel";
   checkpoint_updated_at: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  active_duration_ms: number | string;
+  active_started_at: string | null;
+  updated_at: string;
+}
+
+interface MediaProbeJobRow {
+  id: string;
+  user_id: string;
+  service_id: string;
+  library_id: string;
+  owner_username: string;
+  service_name: string;
+  status: JobStatus;
+  stage: "queued" | "probing" | "completed";
+  processed_count: number | string;
+  total_count: number | string;
+  error_count: number | string;
+  current_file_name: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  next_retry_at: string | null;
+  control_action: "none" | "pause" | "cancel";
+  snapshot_json: string;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -150,6 +181,7 @@ function mapService(row: ServiceRow): CloudServiceRecord {
     status: row.status,
     connectionStatus: row.connection_status,
     relayPlaybackEnabled: Number(row.relay_playback_enabled) === 1 || row.relay_playback_enabled === true,
+    jellyfinEnabled: Number(row.jellyfin_enabled) === 1 || row.jellyfin_enabled === true,
     credentialRevision: Number(row.credential_revision),
     scanProfileRevision: Number(row.scan_profile_revision),
     metadataProfileRevision: Number(row.metadata_profile_revision),
@@ -181,6 +213,7 @@ function calculateActiveDurationMs(row: ActiveDurationRow, nowMs = Date.now()): 
 function mapJob(row: JobRow): ScanJobRecord {
   return {
     id: row.id,
+    jobType: "scan",
     userId: row.user_id,
     serviceId: row.service_id,
     libraryId: row.library_id,
@@ -217,6 +250,47 @@ function mapJob(row: JobRow): ScanJobRecord {
   };
 }
 
+/** 把媒体规格汇总任务转换为现有后台任务 DTO。 */
+function mapMediaProbeJob(row: MediaProbeJobRow): ScanJobRecord {
+  const totalCount = Number(row.total_count ?? 0);
+  return {
+    id: row.id,
+    jobType: "media_probe",
+    userId: row.user_id,
+    serviceId: row.service_id,
+    libraryId: row.library_id,
+    ownerUsername: row.owner_username,
+    serviceName: row.service_name,
+    dataType: "video",
+    requestId: "",
+    clientDeviceId: "server",
+    scanMode: "incremental",
+    status: row.status,
+    stage: row.stage,
+    processedCount: Number(row.processed_count ?? 0),
+    totalCount,
+    discoveredCount: totalCount,
+    skippedCount: 0,
+    matchedCount: null,
+    unmatchedCount: null,
+    errorCount: Number(row.error_count ?? 0),
+    currentPath: row.current_file_name,
+    errorCode: row.error_code,
+    errorMessage: row.error_message ? toSafeErrorMessage(row.error_message, "视频规格分析失败") : null,
+    nextRetryAt: row.next_retry_at,
+    retryCount: 0,
+    snapshot: parseJsonObject(row.snapshot_json),
+    controlAction: row.control_action,
+    checkpointUpdatedAt: null,
+    resumeSupported: row.status === "paused",
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    elapsedMs: calculateActiveDurationMs(row),
+    updatedAt: row.updated_at,
+  };
+}
+
 /** 把大 ID 列表切成数据库方言都能安全处理的小批次。 */
 function chunkStrings(values: string[], size = 400): string[][] {
   const chunks: string[][] = [];
@@ -224,6 +298,16 @@ function chunkStrings(values: string[], size = 400): string[][] {
     chunks.push(values.slice(index, index + size));
   }
   return chunks;
+}
+
+/** 用不包含路径的源文件属性生成媒体规格缓存指纹。 */
+function createMediaProbeFingerprint(sourceFile: SourceFileRecord): string {
+  return createHash("sha256").update(JSON.stringify({
+    资源ID: sourceFile.providerResourceId,
+    文件大小: sourceFile.size,
+    修改时间: sourceFile.modifiedAt,
+    ETag: sourceFile.etag,
+  })).digest("hex");
 }
 
 /** 安全解析只允许字符串的 JSON 数组。 */
@@ -291,6 +375,7 @@ interface CatalogPathRow {
   name: string;
   size: number;
   modifiedAt: string | null;
+  mediaProbe: MediaProbeResult | null;
 }
 
 interface LinkedSourceRow extends Record<string, unknown> {
@@ -304,6 +389,59 @@ interface LinkedSourceRow extends Record<string, unknown> {
   modified_at: string | null;
   locator_json: string;
   source_locator_json?: string;
+  media_probe_status?: string | null;
+  media_probe_result_json?: string | null;
+}
+
+/** 读取 ffprobe 媒体流中的安全字符串字段。 */
+function readProbeStreamString(stream: Record<string, unknown> | undefined, key: string): string {
+  return typeof stream?.[key] === "string" ? String(stream[key]) : "";
+}
+
+/** 读取 ffprobe 媒体流中的安全非负整数。 */
+function readProbeStreamNumber(stream: Record<string, unknown> | undefined, key: string): number {
+  const value = Number(stream?.[key] ?? 0);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+/** 从一个条目的已完成文件分析中生成适合海报墙展示的代表规格。 */
+function buildMediaProbeSummary(probes: MediaProbeResult[]): MediaProbeSummaryRecord | null {
+  if (probes.length === 0) return null;
+  let primaryProbe = probes[0]!;
+  let primaryVideo: Record<string, unknown> | undefined;
+  let primaryPixelCount = 0;
+  for (const probe of probes) {
+    for (const stream of probe.mediaStreams) {
+      if (stream.Type !== "Video") continue;
+      const pixelCount = readProbeStreamNumber(stream, "Width") * readProbeStreamNumber(stream, "Height");
+      if (!primaryVideo || pixelCount > primaryPixelCount) {
+        primaryProbe = probe;
+        primaryVideo = stream;
+        primaryPixelCount = pixelCount;
+      }
+    }
+  }
+  const primaryAudio = primaryProbe.mediaStreams.find((stream) => stream.Type === "Audio" && stream.IsDefault === true)
+    ?? primaryProbe.mediaStreams.find((stream) => stream.Type === "Audio");
+  // 关键变量：节目可能包含大量单集，音轨和字幕数量展示代表文件的数量，不能把全部单集累加。
+  const audioStreamCount = primaryProbe.mediaStreams.filter((stream) => stream.Type === "Audio").length;
+  const subtitleStreamCount = primaryProbe.mediaStreams.filter((stream) => stream.Type === "Subtitle").length;
+  return {
+    analyzedFileCount: probes.length,
+    durationMs: Math.floor(Math.max(...probes.map((probe) => probe.runTimeTicks), 0) / 10_000),
+    container: primaryProbe.container,
+    bitRate: primaryProbe.bitRate,
+    videoCodec: readProbeStreamString(primaryVideo, "Codec"),
+    width: readProbeStreamNumber(primaryVideo, "Width"),
+    height: readProbeStreamNumber(primaryVideo, "Height"),
+    videoRange: readProbeStreamString(primaryVideo, "VideoRange"),
+    videoRangeType: readProbeStreamString(primaryVideo, "VideoRangeType"),
+    audioCodec: readProbeStreamString(primaryAudio, "Codec"),
+    audioChannels: readProbeStreamNumber(primaryAudio, "Channels"),
+    audioChannelLayout: readProbeStreamString(primaryAudio, "ChannelLayout"),
+    audioStreamCount,
+    subtitleStreamCount,
+  };
 }
 
 interface ManualMatchSnapshot {
@@ -401,6 +539,7 @@ export class ServiceRepository {
         "s.status",
         "s.connection_status",
         "s.relay_playback_enabled",
+        "s.jellyfin_enabled",
         "s.credential_revision",
         "s.scan_profile_revision",
         "s.metadata_profile_revision",
@@ -422,6 +561,7 @@ export class ServiceRepository {
         "s.status",
         "s.connection_status",
         "s.relay_playback_enabled",
+        "s.jellyfin_enabled",
         "s.credential_revision",
         "s.scan_profile_revision",
         "s.metadata_profile_revision",
@@ -446,8 +586,9 @@ export class ServiceRepository {
     metadataProfile: Record<string, unknown>;
     binding?: { id: string; clientDeviceId: string; clientServiceId: string };
     initialStatus?: "active" | "disabled";
-  }): Promise<ServiceDetailRecord> {
+  }): Promise<{ service: ServiceDetailRecord; accessCredentials: GeneratedServiceAccessCredentials }> {
     const now = new Date().toISOString();
+    let accessCredentials: GeneratedServiceAccessCredentials | null = null;
     await this.database.query.transaction(async (transaction) => {
       await transaction("cloud_services").insert({
         id: input.serviceId,
@@ -459,6 +600,7 @@ export class ServiceRepository {
         status: input.initialStatus ?? "active",
         connection_status: "valid",
         relay_playback_enabled: 0,
+        jellyfin_enabled: 0,
         credential_revision: 1,
         scan_profile_revision: 1,
         metadata_profile_revision: 1,
@@ -504,6 +646,7 @@ export class ServiceRepository {
         configuration_json: JSON.stringify(input.metadataProfile),
         created_at: now,
       });
+      accessCredentials = await new ServiceAccessService(this.database).createForService(input.serviceId, transaction);
       if (input.binding) {
         await transaction("client_service_links").insert({
           id: input.binding.id,
@@ -517,7 +660,8 @@ export class ServiceRepository {
         });
       }
     });
-    return this.getServiceDetail(input.serviceId, input.userId);
+    if (!accessCredentials) throw new ApiError(500, "service_access_account_create_failed", "服务访问账号创建失败");
+    return { service: await this.getServiceDetail(input.serviceId, input.userId), accessCredentials };
   }
 
   /** 列出当前用户或管理端指定范围内的服务。 */
@@ -691,6 +835,8 @@ export class ServiceRepository {
         updated_at: now,
       });
     });
+    // 连接重新配置成功后，自动把因鉴权失效而停止的规格文件放入新的后台任务。
+    await this.recoverMediaProbesAfterReauthorization(input.serviceId, input.userId, input.userId);
     return this.getServiceDetail(input.serviceId, input.userId);
   }
 
@@ -713,6 +859,9 @@ export class ServiceRepository {
       status: nextStatus,
       updated_at: now,
     });
+    if (nextStatus === "active") {
+      await this.recoverMediaProbesAfterReauthorization(serviceId, String(service.user_id), String(service.user_id));
+    }
     return this.getServiceDetail(serviceId, userId);
   }
 
@@ -984,6 +1133,18 @@ export class ServiceRepository {
       );
   }
 
+  /** 构造视频规格后台任务摘要查询。 */
+  private mediaProbeJobSummaryQuery(transaction: Knex | Knex.Transaction = this.database.query) {
+    return transaction("media_probe_jobs as j")
+      .join("cloud_services as s", "s.id", "j.service_id")
+      .join("user_accounts as u", "u.id", "s.user_id")
+      .select(
+        "j.*",
+        "s.display_name as service_name",
+        "u.username as owner_username",
+      );
+  }
+
   /** 查询单个任务并按需校验用户归属。 */
   public async getJob(
     jobId: string,
@@ -995,10 +1156,12 @@ export class ServiceRepository {
       query.where("j.user_id", userId);
     }
     const row = await query.first() as JobRow | undefined;
-    if (!row) {
-      throw new ApiError(404, "scan_job_not_found", "扫描任务不存在");
-    }
-    return mapJob(row);
+    if (row) return mapJob(row);
+    const mediaProbeQuery = this.mediaProbeJobSummaryQuery(transaction).where("j.id", jobId);
+    if (userId) mediaProbeQuery.where("j.user_id", userId);
+    const mediaProbeRow = await mediaProbeQuery.first() as MediaProbeJobRow | undefined;
+    if (mediaProbeRow) return mapMediaProbeJob(mediaProbeRow);
+    throw new ApiError(404, "background_job_not_found", "后台任务不存在");
   }
 
   /** 读取任务检查点；没有保存过时返回 null。 */
@@ -1182,24 +1345,42 @@ export class ServiceRepository {
     offset: number;
   }): Promise<{ items: ScanJobRecord[]; total: number }> {
     const query = this.jobSummaryQuery();
+    const mediaProbeQuery = this.mediaProbeJobSummaryQuery();
     const countQuery = this.database.query("scan_jobs as j").join("cloud_services as s", "s.id", "j.service_id");
+    const mediaProbeCountQuery = this.database.query("media_probe_jobs as j").join("cloud_services as s", "s.id", "j.service_id");
     if (filters.userId) {
       query.where("j.user_id", filters.userId);
+      mediaProbeQuery.where("j.user_id", filters.userId);
       countQuery.where("j.user_id", filters.userId);
+      mediaProbeCountQuery.where("j.user_id", filters.userId);
     }
     if (filters.serviceId) {
       query.where("j.service_id", filters.serviceId);
+      mediaProbeQuery.where("j.service_id", filters.serviceId);
       countQuery.where("j.service_id", filters.serviceId);
+      mediaProbeCountQuery.where("j.service_id", filters.serviceId);
     }
     if (filters.status) {
       query.where("j.status", filters.status);
+      mediaProbeQuery.where("j.status", filters.status);
       countQuery.where("j.status", filters.status);
+      mediaProbeCountQuery.where("j.status", filters.status);
     }
-    const [rows, countRow] = await Promise.all([
-      query.orderBy("j.created_at", "desc").limit(filters.limit).offset(filters.offset) as unknown as Promise<JobRow[]>,
+    // 关键变量：两个物理任务表分别读取同一候选窗口，再统一按创建时间分页，保持旧接口兼容。
+    const candidateLimit = filters.offset + filters.limit;
+    const [rows, mediaProbeRows, countRow, mediaProbeCountRow] = await Promise.all([
+      query.orderBy("j.created_at", "desc").limit(candidateLimit) as unknown as Promise<JobRow[]>,
+      mediaProbeQuery.orderBy("j.created_at", "desc").limit(candidateLimit) as unknown as Promise<MediaProbeJobRow[]>,
       countQuery.count<{ count: string | number }[]>({ count: "j.id" }).first(),
+      mediaProbeCountQuery.count<{ count: string | number }[]>({ count: "j.id" }).first(),
     ]);
-    return { items: rows.map(mapJob), total: Number(countRow?.count ?? 0) };
+    const items = [...rows.map(mapJob), ...mediaProbeRows.map(mapMediaProbeJob)]
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(filters.offset, filters.offset + filters.limit);
+    return {
+      items,
+      total: Number(countRow?.count ?? 0) + Number(mediaProbeCountRow?.count ?? 0),
+    };
   }
 
   /** 领取一个排队任务，避免同一进程重复执行。 */
@@ -1474,6 +1655,7 @@ export class ServiceRepository {
   /** 写入任务控制请求，Worker 在安全检查点执行。 */
   public async requestJobControl(jobId: string, userId: string | undefined, action: "pause" | "cancel"): Promise<ScanJobRecord> {
     const job = await this.getJob(jobId, userId);
+    if (job.jobType === "media_probe") return this.requestMediaProbeJobControl(job, action);
     if (!(["queued", "running", "retry_waiting", "paused"] as JobStatus[]).includes(job.status)) {
       throw new ApiError(409, "job_not_controllable", "当前任务状态不能执行该操作");
     }
@@ -1503,11 +1685,88 @@ export class ServiceRepository {
     return this.getJob(job.id);
   }
 
-  /** 删除已经进入终态的扫描任务及其事件；运行中任务必须先取消。 */
+  /** 对视频规格后台任务提交暂停或终止操作。 */
+  private async requestMediaProbeJobControl(job: ScanJobRecord, action: "pause" | "cancel"): Promise<ScanJobRecord> {
+    if (!(["queued", "running", "retry_waiting", "paused"] as JobStatus[]).includes(job.status)) {
+      throw new ApiError(409, "job_not_controllable", "当前后台任务状态不能执行该操作");
+    }
+    if (job.controlAction !== "none") {
+      throw new ApiError(409, "job_operation_in_progress", "后台任务正在处理暂停或终止操作，请等待状态刷新后再试");
+    }
+    if (job.status === "paused" && action === "pause") throw new ApiError(409, "job_already_paused", "后台任务已经暂停");
+    const now = new Date().toISOString();
+    if (job.status !== "running") {
+      await this.database.query.transaction(async (transaction) => {
+        if (action === "cancel") {
+          await transaction("media_file_probes")
+            .where({ probe_job_id: job.id })
+            .whereIn("status", ["pending", "retry_waiting"])
+            .update({ status: "cancelled", next_retry_at: null, finished_at: now, updated_at: now });
+        }
+        await transaction("media_probe_jobs").where({ id: job.id, status: job.status }).update({
+          status: action === "cancel" ? "cancelled" : "paused",
+          control_action: "none",
+          next_retry_at: null,
+          finished_at: action === "cancel" ? now : null,
+          active_started_at: null,
+          updated_at: now,
+        });
+      });
+      return this.getJob(job.id, job.userId);
+    }
+    const changed = await this.database.query("media_probe_jobs").where({
+      id: job.id,
+      status: "running",
+      control_action: "none",
+    }).update({ control_action: action, updated_at: now });
+    if (changed !== 1) throw new ApiError(409, "job_operation_in_progress", "后台任务正在处理其他操作，请等待状态刷新后再试");
+    return this.getJob(job.id, job.userId);
+  }
+
+  /** Worker 中断当前 ffprobe 后，将整个规格后台任务稳定落到暂停或取消状态。 */
+  public async applyMediaProbeJobControl(jobId: string, action: "pause" | "cancel"): Promise<ScanJobRecord> {
+    const now = new Date().toISOString();
+    await this.database.query.transaction(async (transaction) => {
+      const row = await transaction("media_probe_jobs").where({ id: jobId }).first() as MediaProbeJobRow | undefined;
+      if (!row) throw new ApiError(404, "background_job_not_found", "后台任务不存在");
+      const nextProbeStatus = action === "cancel" ? "cancelled" : "pending";
+      const probePatch: Record<string, unknown> = {
+        status: nextProbeStatus,
+        next_retry_at: null,
+        updated_at: now,
+      };
+      if (action === "cancel") probePatch.finished_at = now;
+      await transaction("media_file_probes")
+        .where({ probe_job_id: jobId })
+        .whereIn("status", action === "cancel" ? ["pending", "running", "retry_waiting"] : ["running"])
+        .update(probePatch);
+      await transaction("media_probe_jobs").where({ id: jobId }).update({
+        status: action === "cancel" ? "cancelled" : "paused",
+        control_action: "none",
+        current_file_name: null,
+        next_retry_at: null,
+        finished_at: action === "cancel" ? now : null,
+        active_duration_ms: calculateActiveDurationMs(row, Date.parse(now)),
+        active_started_at: null,
+        updated_at: now,
+      });
+    });
+    return this.getJob(jobId);
+  }
+
+  /** 删除已经进入终态的后台任务及其关联记录；运行中任务必须先取消。 */
   public async deleteScanJob(jobId: string, userId?: string): Promise<void> {
     const job = await this.getJob(jobId, userId);
     if ((["queued", "running", "retry_waiting", "paused"] as JobStatus[]).includes(job.status)) {
-      throw new ApiError(409, "scan_job_active", "请先终止扫描任务，再删除任务记录");
+      throw new ApiError(409, "scan_job_active", "请先终止后台任务，再删除任务记录");
+    }
+    if (job.jobType === "media_probe") {
+      await this.database.query.transaction(async (transaction) => {
+        await transaction("media_file_probes").where({ probe_job_id: job.id }).update({ probe_job_id: null });
+        const deleted = await transaction("media_probe_jobs").where({ id: job.id }).delete();
+        if (deleted !== 1) throw new ApiError(404, "background_job_not_found", "后台任务不存在");
+      });
+      return;
     }
     await this.database.query.transaction(async (transaction) => {
       await transaction("scan_job_events").where({ job_id: job.id }).delete();
@@ -1521,6 +1780,21 @@ export class ServiceRepository {
     const job = await this.getJob(jobId, userId);
     if (job.status !== "paused") {
       throw new ApiError(409, "job_not_paused", "只有暂停任务可以继续");
+    }
+    if (job.jobType === "media_probe") {
+      const changed = await this.database.query("media_probe_jobs").where({
+        id: job.id,
+        status: "paused",
+        control_action: "none",
+      }).update({
+        status: "queued",
+        stage: "queued",
+        next_retry_at: null,
+        current_file_name: null,
+        updated_at: new Date().toISOString(),
+      });
+      if (changed !== 1) throw new ApiError(409, "job_operation_in_progress", "后台任务正在处理其他操作，请等待状态刷新后再试");
+      return this.getJob(job.id, job.userId);
     }
     const checkpoint = await this.getScanJobCheckpoint(job.id);
     const progress = checkpoint?.progress;
@@ -1566,7 +1840,9 @@ export class ServiceRepository {
   /** 查询 Worker 当前需要执行的控制动作。 */
   public async getJobControl(jobId: string): Promise<"none" | "pause" | "cancel"> {
     const row = await this.database.query("scan_jobs").select("control_action").where({ id: jobId }).first();
-    return (row?.control_action as "none" | "pause" | "cancel" | undefined) ?? "cancel";
+    if (row) return (row.control_action as "none" | "pause" | "cancel" | undefined) ?? "cancel";
+    const mediaProbeRow = await this.database.query("media_probe_jobs").select("control_action").where({ id: jobId }).first();
+    return (mediaProbeRow?.control_action as "none" | "pause" | "cancel" | undefined) ?? "cancel";
   }
 
   /** 在现有事务内插入任务事件。 */
@@ -1610,11 +1886,11 @@ export class ServiceRepository {
   /** 更新服务启停状态。 */
   public async updateServiceStatus(serviceId: string, userId: string | undefined, status: "active" | "disabled"): Promise<ServiceDetailRecord> {
     if (status === "disabled") {
-      const activeJob = await this.database.query("scan_jobs")
-        .where({ service_id: serviceId })
-        .whereIn("status", ["queued", "running", "retry_waiting", "paused"])
-        .first();
-      if (activeJob) throw new ApiError(409, "service_has_active_job", "服务仍有未结束任务，不能停用");
+      const [activeScanJob, activeMediaProbeJob] = await Promise.all([
+        this.database.query("scan_jobs").where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+        this.database.query("media_probe_jobs").where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+      ]);
+      if (activeScanJob || activeMediaProbeJob) throw new ApiError(409, "service_has_active_job", "服务仍有未结束后台任务，不能停用");
     }
     const query = this.database.query("cloud_services").where({ id: serviceId }).whereNull("deleted_at");
     if (userId) query.where({ user_id: userId });
@@ -1646,8 +1922,11 @@ export class ServiceRepository {
       if (userId) serviceQuery.where({ user_id: userId });
       const service = await serviceQuery.first();
       if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
-      const running = await transaction("scan_jobs").where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first();
-      if (running) throw new ApiError(409, "service_has_active_job", "服务仍有未结束任务");
+      const [runningScanJob, runningMediaProbeJob] = await Promise.all([
+        transaction("scan_jobs").where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+        transaction("media_probe_jobs").where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+      ]);
+      if (runningScanJob || runningMediaProbeJob) throw new ApiError(409, "service_has_active_job", "服务仍有未结束后台任务");
       const now = new Date().toISOString();
       await transaction("media_items").where({ service_id: serviceId }).whereNull("deleted_at").update({ deleted_at: now, updated_at: now });
       await transaction("source_files").where({ service_id: serviceId }).update({ status: "missing", updated_at: now });
@@ -1684,11 +1963,11 @@ export class ServiceRepository {
         if (this.database.databaseType !== "sqlite") serviceQuery = serviceQuery.forUpdate();
         const service = await serviceQuery.first();
         if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
-        const activeJob = await transaction("scan_jobs")
-          .where({ service_id: serviceId })
-          .whereIn("status", ["queued", "running", "retry_waiting", "paused"])
-          .first();
-        if (activeJob) throw new ApiError(409, "service_has_active_job", "请先终止该服务的扫描任务，再清空媒体库");
+        const [activeScanJob, activeMediaProbeJob] = await Promise.all([
+          transaction("scan_jobs").where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+          transaction("media_probe_jobs").where({ service_id: serviceId }).whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+        ]);
+        if (activeScanJob || activeMediaProbeJob) throw new ApiError(409, "service_has_active_job", "请先终止该服务的后台任务，再清空媒体库");
 
         const libraryId = String(service.library_id);
         const mediaItemCountRow = await transaction("media_items")
@@ -1792,6 +2071,15 @@ export class ServiceRepository {
           && String(existing!.modified_at ?? "") === String(input.modifiedAt ?? "")
           && String(existing!.etag ?? "") === String(input.etag ?? "")
           && String(existing!.locator_json) === locatorJson);
+      }
+
+      // 关键变量：文件发生变化时立即删除旧规格，开关关闭期间也不能向 Jellyfin 返回过期时长和编码信息。
+      const changedExistingSourceIds = uniqueInputs
+        .filter((input) => existingByResourceId.has(input.providerResourceId)
+          && fingerprintUnchangedByResourceId.get(input.providerResourceId) !== true)
+        .map((input) => String(existingByResourceId.get(input.providerResourceId)!.id));
+      for (const sourceFileIdBatch of chunkStrings(changedExistingSourceIds, 200)) {
+        await transaction("media_file_probes").whereIn("source_file_id", sourceFileIdBatch).delete();
       }
 
       // 关键变量：只有源文件未变化、已有活动文件关联、已匹配且元数据修订一致时才能复用目录结果。
@@ -1924,6 +2212,416 @@ export class ServiceRepository {
         updated_at: new Date().toISOString(),
       });
     }
+  }
+
+  /**
+   * 把源文件写入独立媒体规格队列；相同指纹不会重复分析，文件变化后才重新排队。
+   * forceFailed 只在用户重新开启开关时使用，允许主动重试历史最终失败项。
+   */
+  public async enqueueMediaProbes(sourceFiles: SourceFileRecord[], forceFailed = false, options: {
+    requestedByUserId?: string;
+    triggerType?: "manual_backfill" | "scan_completed" | "retry" | "recovered" | "reauthorized";
+    sourceScanJobId?: string;
+  } = {}): Promise<{ queuedCount: number; jobId: string | null }> {
+    const uniqueSourceFiles = [...new Map(sourceFiles.map((sourceFile) => [sourceFile.id, sourceFile])).values()];
+    if (uniqueSourceFiles.length === 0) return { queuedCount: 0, jobId: null };
+    const firstSourceFile = uniqueSourceFiles[0]!;
+    if (uniqueSourceFiles.some((sourceFile) => sourceFile.serviceId !== firstSourceFile.serviceId)) {
+      throw new Error("媒体规格后台任务不能混入不同服务的源文件");
+    }
+    return this.database.query.transaction(async (transaction) => {
+      const probeJobId = randomUUID();
+      const now = new Date().toISOString();
+      let queuedCount = 0;
+      for (let offset = 0; offset < uniqueSourceFiles.length; offset += 200) {
+        const sourceFileBatch = uniqueSourceFiles.slice(offset, offset + 200);
+        const existingRows = await transaction("media_file_probes")
+          .select("source_file_id", "fingerprint", "status")
+          .whereIn("source_file_id", sourceFileBatch.map((sourceFile) => sourceFile.id));
+        const existingById = new Map(existingRows.map((row) => [String(row.source_file_id), row]));
+        const rows = sourceFileBatch.flatMap((sourceFile) => {
+          const fingerprint = createMediaProbeFingerprint(sourceFile);
+          const existing = existingById.get(sourceFile.id);
+          const sameFingerprint = String(existing?.fingerprint ?? "") === fingerprint;
+          const shouldRetryFailed = forceFailed && sameFingerprint && ["failed", "cancelled"].includes(String(existing?.status ?? ""));
+          if (sameFingerprint && !shouldRetryFailed) return [];
+          return [{
+            source_file_id: sourceFile.id,
+            user_id: sourceFile.userId,
+            service_id: sourceFile.serviceId,
+            library_id: sourceFile.libraryId,
+            probe_job_id: probeJobId,
+            fingerprint,
+            status: "pending",
+            attempt_count: 0,
+            result_json: null,
+            error_code: null,
+            error_message: null,
+            next_retry_at: null,
+            started_at: null,
+            finished_at: null,
+            created_at: existing ? undefined : now,
+            updated_at: now,
+          }];
+        });
+        queuedCount += rows.length;
+        if (rows.length === 0) continue;
+        // 关键变量：批量更新列不包含 created_at，历史规格记录重新入队时保留首次创建时间。
+        const mediaProbeUpdateColumns = [
+          "user_id", "service_id", "library_id", "probe_job_id", "fingerprint", "status",
+          "attempt_count", "result_json", "error_code", "error_message", "next_retry_at",
+          "started_at", "finished_at", "updated_at",
+        ];
+        // 一批只执行一条 UPSERT，避免已有视频较多时逐条更新导致接口长时间不返回、父任务不可见。
+        await transaction("media_file_probes")
+          .insert(rows.map((row) => ({ ...row, created_at: row.created_at ?? now })))
+          .onConflict("source_file_id")
+          .merge(mediaProbeUpdateColumns);
+      }
+      if (queuedCount === 0) return { queuedCount: 0, jobId: null };
+      const triggerType = options.triggerType ?? "scan_completed";
+      await transaction("media_probe_jobs").insert({
+        id: probeJobId,
+        user_id: firstSourceFile.userId,
+        service_id: firstSourceFile.serviceId,
+        library_id: firstSourceFile.libraryId,
+        requested_by_user_id: options.requestedByUserId ?? firstSourceFile.userId,
+        trigger_type: triggerType,
+        status: "queued",
+        stage: "queued",
+        processed_count: 0,
+        total_count: queuedCount,
+        error_count: 0,
+        current_file_name: null,
+        error_code: null,
+        error_message: null,
+        next_retry_at: null,
+        control_action: "none",
+        snapshot_json: JSON.stringify({
+          triggerType,
+          sourceScanJobId: options.sourceScanJobId ?? null,
+          retryFailedFiles: forceFailed,
+        }),
+        created_at: now,
+        started_at: null,
+        finished_at: null,
+        active_duration_ms: 0,
+        active_started_at: null,
+        updated_at: now,
+      });
+      return { queuedCount, jobId: probeJobId };
+    });
+  }
+
+  /** 用户手动触发时，为该服务已有但缺少规格的活动视频建立独立后台任务。 */
+  public async enqueueExistingServiceMediaProbes(
+    serviceId: string,
+    userId: string,
+    requestedByUserId = userId,
+  ): Promise<{ queuedCount: number; jobId: string | null }> {
+    const rows = await this.database.query("source_files")
+      .where({ service_id: serviceId, user_id: userId, status: "active" })
+      .orderBy("created_at", "asc");
+    const sourceFiles = rows.map((row): SourceFileRecord => ({
+      id: String(row.id),
+      userId: String(row.user_id),
+      serviceId: String(row.service_id),
+      libraryId: String(row.library_id),
+      providerResourceId: String(row.provider_resource_id),
+      parentResourceId: row.parent_resource_id ? String(row.parent_resource_id) : null,
+      path: String(row.path),
+      name: String(row.name),
+      extension: String(row.extension ?? ""),
+      size: Number(row.size ?? 0),
+      modifiedAt: row.modified_at ? String(row.modified_at) : null,
+      etag: row.etag ? String(row.etag) : null,
+      scanRootKey: String(row.scan_root_key ?? ""),
+      generationId: String(row.generation_id),
+      metadataProfileRevision: Number(row.metadata_profile_revision ?? 0),
+      locator: parseJsonObject(row.locator_json),
+    }));
+    return this.enqueueMediaProbes(sourceFiles, true, { requestedByUserId, triggerType: "manual_backfill" });
+  }
+
+  /**
+   * Provider 重新授权成功后，把此前因服务级鉴权失效而中止的文件归入新的规格后台任务。
+   * 已成功的规格不会重复分析；该恢复动作沿用失败前的显式任务，不受扫描期间规格开关影响。
+   */
+  public async recoverMediaProbesAfterReauthorization(
+    serviceId: string,
+    userId: string,
+    requestedByUserId: string,
+  ): Promise<{ queuedCount: number; jobId: string | null }> {
+    const service = await this.getServiceDetail(serviceId, userId);
+    if (service.status !== "active") return { queuedCount: 0, jobId: null };
+    const rows = await this.database.query("media_file_probes as p")
+      .join("source_files as f", "f.id", "p.source_file_id")
+      .select("f.*")
+      .where({
+        "p.service_id": serviceId,
+        "p.user_id": userId,
+        "p.error_code": "provider_authentication_failed",
+        "f.status": "active",
+      })
+      .whereIn("p.status", ["failed", "cancelled"])
+      .orderBy("p.updated_at", "asc");
+    const sourceFiles = rows.map((row): SourceFileRecord => ({
+      id: String(row.id),
+      userId: String(row.user_id),
+      serviceId: String(row.service_id),
+      libraryId: String(row.library_id),
+      providerResourceId: String(row.provider_resource_id),
+      parentResourceId: row.parent_resource_id ? String(row.parent_resource_id) : null,
+      path: String(row.path),
+      name: String(row.name),
+      extension: String(row.extension ?? ""),
+      size: Number(row.size ?? 0),
+      modifiedAt: row.modified_at ? String(row.modified_at) : null,
+      etag: row.etag ? String(row.etag) : null,
+      scanRootKey: String(row.scan_root_key ?? ""),
+      generationId: String(row.generation_id),
+      metadataProfileRevision: Number(row.metadata_profile_revision ?? 0),
+      locator: parseJsonObject(row.locator_json),
+    }));
+    return this.enqueueMediaProbes(sourceFiles, true, {
+      requestedByUserId,
+      triggerType: "reauthorized",
+    });
+  }
+
+  /** 把已创建的手动规格任务置为等待重新授权，保留全部待处理文件供授权成功后自动领取。 */
+  public async waitMediaProbeJobForReauthorization(jobId: string, userId?: string): Promise<ScanJobRecord> {
+    const job = await this.getJob(jobId, userId);
+    if (job.jobType !== "media_probe") throw new ApiError(409, "background_job_type_mismatch", "当前任务不是视频规格任务");
+    await this.database.query("media_probe_jobs").where({ id: job.id, status: "queued" }).update({
+      status: "retry_waiting",
+      error_code: "provider_authentication_failed",
+      error_message: "Provider 登录已失效，等待 APP 同步有效登录信息后自动继续",
+      next_retry_at: null,
+      updated_at: new Date().toISOString(),
+    });
+    return this.getJob(job.id, userId);
+  }
+
+  /**
+   * 服务级鉴权失效时一次性停止该服务的全部规格任务，避免对每个视频重复请求已经失效的 Token。
+   * 文件保留为可恢复状态，APP 同步有效凭据后会自动建立新的规格后台任务。
+   */
+  public async failMediaProbeJobsForAuthentication(serviceId: string, userId: string): Promise<string[]> {
+    const now = new Date().toISOString();
+    return this.database.query.transaction(async (transaction) => {
+      const jobRows = await transaction("media_probe_jobs")
+        .where({ service_id: serviceId, user_id: userId })
+        .whereIn("status", ["queued", "running", "retry_waiting"])
+        .select("id", "status", "active_duration_ms", "active_started_at") as Array<ActiveDurationRow & { id: string }>;
+      const jobIds = jobRows.map((row) => String(row.id));
+      if (jobIds.length > 0) {
+        await transaction("media_file_probes")
+          .whereIn("probe_job_id", jobIds)
+          .whereIn("status", ["pending", "running", "retry_waiting"])
+          .update({
+            status: "cancelled",
+            error_code: "provider_authentication_failed",
+            error_message: "Provider 登录已失效，等待重新授权后恢复",
+            next_retry_at: null,
+            finished_at: now,
+            updated_at: now,
+          });
+        for (const jobRow of jobRows) {
+          await transaction("media_probe_jobs").where({ id: jobRow.id }).update({
+            status: "failed",
+            error_code: "provider_authentication_failed",
+            error_message: "Provider 登录已失效，请重新授权；授权成功后会自动恢复未完成文件",
+            current_file_name: null,
+            next_retry_at: null,
+            control_action: "none",
+            finished_at: now,
+            active_duration_ms: calculateActiveDurationMs(jobRow, Date.parse(now)),
+            active_started_at: null,
+            updated_at: now,
+          });
+        }
+      }
+      await transaction("cloud_services").where({ id: serviceId, user_id: userId }).update({
+        status: "reauthorization_required",
+        connection_status: "reauthorization_required",
+        updated_at: now,
+      });
+      return jobIds;
+    });
+  }
+
+  /** 启动恢复时识别上次已经确认的鉴权失败，立即阻止服务继续逐文件重试失效凭据。 */
+  public async restoreMediaProbeAuthenticationFailures(): Promise<number> {
+    const serviceRows = await this.database.query("media_file_probes as p")
+      .join("cloud_services as s", "s.id", "p.service_id")
+      .distinct("p.service_id", "p.user_id")
+      .where({ "p.error_code": "provider_authentication_failed" })
+      .whereIn("p.status", ["failed", "retry_waiting"])
+      // 已经等待重新授权的服务可能包含用户后来手动创建的等待任务，重启时不能把它再次改成失败。
+      .whereNot("s.status", "reauthorization_required");
+    for (const serviceRow of serviceRows) {
+      await this.failMediaProbeJobsForAuthentication(String(serviceRow.service_id), String(serviceRow.user_id));
+    }
+    return serviceRows.length;
+  }
+
+  /** 将升级前没有父任务的待处理规格记录归入服务级恢复任务。 */
+  public async adoptUnassignedMediaProbeJobs(): Promise<number> {
+    const serviceRows = await this.database.query("media_file_probes")
+      .distinct("service_id", "user_id", "library_id")
+      .whereNull("probe_job_id")
+      .whereIn("status", ["pending", "running", "retry_waiting"]);
+    let createdJobCount = 0;
+    for (const serviceRow of serviceRows) {
+      await this.database.query.transaction(async (transaction) => {
+        const now = new Date().toISOString();
+        const probeJobId = randomUUID();
+        const probeRows = await transaction("media_file_probes")
+          .select("source_file_id")
+          .where({ service_id: serviceRow.service_id })
+          .whereNull("probe_job_id")
+          .whereIn("status", ["pending", "running", "retry_waiting"]);
+        if (probeRows.length === 0) return;
+        await transaction("media_probe_jobs").insert({
+          id: probeJobId,
+          user_id: serviceRow.user_id,
+          service_id: serviceRow.service_id,
+          library_id: serviceRow.library_id,
+          requested_by_user_id: serviceRow.user_id,
+          trigger_type: "recovered",
+          status: "queued",
+          stage: "queued",
+          processed_count: 0,
+          total_count: probeRows.length,
+          error_count: 0,
+          current_file_name: null,
+          error_code: null,
+          error_message: null,
+          next_retry_at: null,
+          control_action: "none",
+          snapshot_json: JSON.stringify({ triggerType: "recovered", sourceScanJobId: null, retryFailedFiles: false }),
+          created_at: now,
+          started_at: null,
+          finished_at: null,
+          active_duration_ms: 0,
+          active_started_at: null,
+          updated_at: now,
+        });
+        await transaction("media_file_probes")
+          .whereIn("source_file_id", probeRows.map((row) => String(row.source_file_id)))
+          .update({ probe_job_id: probeJobId, status: "pending", next_retry_at: null, updated_at: now });
+        createdJobCount += 1;
+      });
+    }
+    return createdJobCount;
+  }
+
+  /** 汇总单个规格后台任务的文件状态，并推进父任务进度或终态。 */
+  public async synchronizeMediaProbeJob(jobId: string, currentFileName: string | null = null): Promise<ScanJobRecord | null> {
+    const jobRow = await this.database.query("media_probe_jobs").where({ id: jobId }).first() as MediaProbeJobRow | undefined;
+    if (!jobRow) return null;
+    const statusRows = await this.database.query("media_file_probes")
+      .select("status")
+      .count<{ status: string; count: string | number }[]>({ count: "source_file_id" })
+      .where({ probe_job_id: jobId })
+      .groupBy("status");
+    const counts = new Map(statusRows.map((row) => [String(row.status), Number(row.count ?? 0)]));
+    const completedCount = counts.get("completed") ?? 0;
+    const failedCount = counts.get("failed") ?? 0;
+    const cancelledCount = counts.get("cancelled") ?? 0;
+    const pendingCount = counts.get("pending") ?? 0;
+    const runningCount = counts.get("running") ?? 0;
+    const retryWaitingCount = counts.get("retry_waiting") ?? 0;
+    const processedCount = completedCount + failedCount;
+    const totalCount = Number(jobRow.total_count ?? 0);
+    const now = new Date().toISOString();
+    const patch: Record<string, unknown> = {
+      processed_count: processedCount,
+      error_count: failedCount,
+      current_file_name: currentFileName,
+      updated_at: now,
+    };
+    if (jobRow.status !== "paused" && jobRow.status !== "cancelled" && jobRow.status !== "failed") {
+      const remainingCount = pendingCount + runningCount + retryWaitingCount;
+      if (remainingCount === 0 && processedCount + cancelledCount >= totalCount) {
+        patch.status = cancelledCount > 0 && processedCount === 0 ? "cancelled" : "completed";
+        patch.stage = "completed";
+        patch.finished_at = now;
+        patch.current_file_name = null;
+        patch.next_retry_at = null;
+        patch.active_duration_ms = calculateActiveDurationMs(jobRow, Date.parse(now));
+        patch.active_started_at = null;
+      } else if (runningCount > 0 || pendingCount > 0) {
+        patch.status = "running";
+        patch.stage = "probing";
+        patch.started_at = jobRow.started_at ?? now;
+        patch.active_started_at = jobRow.active_started_at ?? now;
+        patch.next_retry_at = null;
+      } else if (retryWaitingCount > 0) {
+        const nextRetryRow = await this.database.query("media_file_probes")
+          .min<{ next_retry_at: string | null }[]>({ next_retry_at: "next_retry_at" })
+          .where({ probe_job_id: jobId, status: "retry_waiting" })
+          .first();
+        patch.status = "retry_waiting";
+        patch.stage = "probing";
+        patch.next_retry_at = nextRetryRow?.next_retry_at ?? null;
+        patch.active_duration_ms = calculateActiveDurationMs(jobRow, Date.parse(now));
+        patch.active_started_at = null;
+      }
+    }
+    await this.database.query("media_probe_jobs").where({ id: jobId }).update(patch);
+    const updated = await this.mediaProbeJobSummaryQuery().where("j.id", jobId).first() as MediaProbeJobRow | undefined;
+    return updated ? mapMediaProbeJob(updated) : null;
+  }
+
+  /** 返回规格后台任务的失败文件，用于任务详情定位 Provider 或媒体异常。 */
+  public async listMediaProbeJobFailures(jobId: string, userId?: string): Promise<MediaProbeFailureRecord[]> {
+    const job = await this.getJob(jobId, userId);
+    if (job.jobType !== "media_probe") return [];
+    const rows = await this.database.query("media_file_probes as p")
+      .join("source_files as f", "f.id", "p.source_file_id")
+      .select("p.source_file_id", "f.name", "p.error_code", "p.error_message")
+      .where({ "p.probe_job_id": job.id, "p.status": "failed" })
+      .orderBy("p.updated_at", "desc")
+      .limit(500);
+    return rows.map((row) => ({
+      sourceFileId: String(row.source_file_id),
+      fileName: String(row.name ?? "未知文件"),
+      errorCode: String(row.error_code ?? "media_probe_failed"),
+      errorMessage: String(row.error_code ?? "") === "provider_authentication_failed"
+        ? "Provider 登录已失效，请重新授权；授权成功后会自动恢复"
+        : String(row.error_message ?? "媒体规格分析失败"),
+    }));
+  }
+
+  /** 为失败或已取消的规格后台任务重新建立一个只包含未成功文件的新任务。 */
+  public async retryMediaProbeJob(jobId: string, userId: string | undefined, requestedByUserId: string): Promise<ScanJobRecord> {
+    const job = await this.getJob(jobId, userId);
+    if (job.jobType !== "media_probe" || !(["completed", "failed", "cancelled"] as JobStatus[]).includes(job.status)) {
+      throw new ApiError(409, "background_job_not_retryable", "当前后台任务不能重试");
+    }
+    const rows = await this.database.query("media_file_probes as p")
+      .join("source_files as f", "f.id", "p.source_file_id")
+      .select("f.*")
+      .where("p.probe_job_id", job.id)
+      .whereIn("p.status", ["failed", "cancelled"])
+      .where("f.status", "active");
+    const sourceFiles = rows.map((row): SourceFileRecord => ({
+      id: String(row.id), userId: String(row.user_id), serviceId: String(row.service_id), libraryId: String(row.library_id),
+      providerResourceId: String(row.provider_resource_id), parentResourceId: row.parent_resource_id ? String(row.parent_resource_id) : null,
+      path: String(row.path), name: String(row.name), extension: String(row.extension ?? ""), size: Number(row.size ?? 0),
+      modifiedAt: row.modified_at ? String(row.modified_at) : null, etag: row.etag ? String(row.etag) : null,
+      scanRootKey: String(row.scan_root_key ?? ""), generationId: String(row.generation_id),
+      metadataProfileRevision: Number(row.metadata_profile_revision ?? 0), locator: parseJsonObject(row.locator_json),
+    }));
+    const result = await this.enqueueMediaProbes(sourceFiles, true, {
+      requestedByUserId,
+      triggerType: "retry",
+      sourceScanJobId: job.id,
+    });
+    if (!result.jobId) throw new ApiError(409, "background_job_has_no_failed_files", "当前后台任务没有可重试的失败文件");
+    return this.getJob(result.jobId, job.userId);
   }
 
   /** upsert 扫描发现的源文件并返回稳定记录。 */
@@ -2494,6 +3192,7 @@ export class ServiceRepository {
     matchState?: MatchState;
     categoryKey?: string;
     genre?: string;
+    genres?: string[];
     search?: string;
     sort: CatalogSort;
     limit: number;
@@ -2519,6 +3218,12 @@ export class ServiceRepository {
     if (filters.matchState) base.where("m.match_state", filters.matchState);
     if (filters.categoryKey === "unrecognized") base.whereNot("m.match_state", "matched");
     if (filters.genre) base.whereLike("m.metadata_json", `%${filters.genre}%`);
+    if (filters.genres && filters.genres.length > 0) {
+      // 关键变量：Jellyfin GenreIds 多选按“任一分类命中”处理，保持分类列表和条目筛选一致。
+      base.where((builder) => {
+        filters.genres?.forEach((genre) => builder.orWhereLike("m.metadata_json", `%${genre}%`));
+      });
+    }
     if (filters.categoryKey && filters.categoryKey !== "unrecognized") {
       // 关键变量：分类筛选始终排除未匹配条目，避免普通分类页混入待更正内容。
       base.where("m.match_state", "matched");
@@ -2572,13 +3277,15 @@ export class ServiceRepository {
     }
     // 关键变量：排序和分页必须全部追加后再执行，不能先 await 成数组。
     const rows = await rowsQuery.limit(filters.limit).offset(filters.offset);
-    const fileCounts = filters.includeFileCounts === false
-      ? new Map<string, number>()
-      : await this.loadCatalogFileCounts(rows);
+    const [fileCounts, mediaProbeSummaries] = await Promise.all([
+      filters.includeFileCounts === false ? Promise.resolve(new Map<string, number>()) : this.loadCatalogFileCounts(rows),
+      this.loadCatalogMediaProbeSummaries(rows),
+    ]);
     return {
       items: rows.map((row) => this.mapMediaItem({
         ...row,
         file_count: fileCounts.get(String(row.id)) ?? 0,
+        media_probe_summary: mediaProbeSummaries.get(String(row.id)) ?? null,
       })),
       total: Number(countRow?.count ?? 0),
     };
@@ -2596,8 +3303,15 @@ export class ServiceRepository {
     if (userId) query.where("m.user_id", userId);
     const row = await query.first();
     if (!row) throw new ApiError(404, "media_item_not_found", "媒体条目不存在");
-    const fileCounts = await this.loadCatalogFileCounts([row]);
-    return this.mapMediaItem({ ...row, file_count: fileCounts.get(String(row.id)) ?? 0 });
+    const [fileCounts, mediaProbeSummaries] = await Promise.all([
+      this.loadCatalogFileCounts([row]),
+      this.loadCatalogMediaProbeSummaries([row]),
+    ]);
+    return this.mapMediaItem({
+      ...row,
+      file_count: fileCounts.get(String(row.id)) ?? 0,
+      media_probe_summary: mediaProbeSummaries.get(String(row.id)) ?? null,
+    });
   }
 
   /** 批量统计条目自身及其子项关联的源文件数，避免相关子查询反复扫描完整关联表。 */
@@ -2639,6 +3353,58 @@ export class ServiceRepository {
     return new Map([...fileIdsByItem].map(([itemId, fileIds]) => [itemId, fileIds.size]));
   }
 
+  /** 批量汇总条目自身及直接子项已经完成的媒体规格，避免海报墙逐条查询。 */
+  private async loadCatalogMediaProbeSummaries(rows: Record<string, unknown>[]): Promise<Map<string, MediaProbeSummaryRecord>> {
+    const probeResultsByItem = new Map<string, Map<string, MediaProbeResult>>();
+    // 关键变量：保持与文件数量相同的父子归属口径，节目海报才能汇总其全部单集的分析进度。
+    const itemIdsByUser = new Map<string, string[]>();
+    rows.forEach((row) => {
+      const userId = String(row.user_id);
+      const itemId = String(row.id);
+      const itemIds = itemIdsByUser.get(userId) ?? [];
+      itemIds.push(itemId);
+      itemIdsByUser.set(userId, itemIds);
+      probeResultsByItem.set(itemId, new Map<string, MediaProbeResult>());
+    });
+    for (const [userId, itemIds] of itemIdsByUser) {
+      for (const itemIdChunk of chunkStrings(itemIds)) {
+        const [directRows, childRows] = await Promise.all([
+          this.database.query("file_links as fl")
+            .join("source_files as f", "f.id", "fl.source_file_id")
+            .join("media_file_probes as p", "p.source_file_id", "f.id")
+            .select("fl.item_id as item_id", "fl.source_file_id", "p.result_json")
+            .where("fl.user_id", userId)
+            .where("f.status", "active")
+            .where("p.status", "completed")
+            .whereIn("fl.item_id", itemIdChunk),
+          this.database.query("media_relations as mr")
+            .join("file_links as fl", function joinChildProbeFileLinks() {
+              this.on("fl.user_id", "=", "mr.user_id")
+                .andOn("fl.item_id", "=", "mr.child_item_id");
+            })
+            .join("source_files as f", "f.id", "fl.source_file_id")
+            .join("media_file_probes as p", "p.source_file_id", "f.id")
+            .select("mr.parent_item_id as item_id", "fl.source_file_id", "p.result_json")
+            .where("mr.user_id", userId)
+            .where("f.status", "active")
+            .where("p.status", "completed")
+            .whereIn("mr.parent_item_id", itemIdChunk),
+        ]);
+        [...directRows, ...childRows].forEach((probeRow) => {
+          const result = parseMediaProbeResult(probeRow.result_json);
+          if (!result) return;
+          probeResultsByItem.get(String(probeRow.item_id))?.set(String(probeRow.source_file_id), result);
+        });
+      }
+    }
+    const summaries = new Map<string, MediaProbeSummaryRecord>();
+    probeResultsByItem.forEach((probeResults, itemId) => {
+      const summary = buildMediaProbeSummary([...probeResults.values()]);
+      if (summary) summaries.set(itemId, summary);
+    });
+    return summaries;
+  }
+
   /** 映射数据库媒体行。 */
   private mapMediaItem(row: Record<string, unknown>): MediaItemRecord {
     return {
@@ -2660,6 +3426,9 @@ export class ServiceRepository {
       externalIds: Object.fromEntries(Object.entries(parseJsonObject(row.external_ids_json)).map(([key, value]) => [key, String(value)])),
       metadata: parseJsonObject(row.metadata_json),
       fileCount: Number(row.file_count ?? 0),
+      mediaProbeSummary: row.media_probe_summary && typeof row.media_probe_summary === "object"
+        ? row.media_probe_summary as MediaProbeSummaryRecord
+        : null,
       ownerUsername: String(row.owner_username),
       serviceName: String(row.service_name),
       createdAt: String(row.created_at),
@@ -2669,9 +3438,32 @@ export class ServiceRepository {
 
   /** 查询媒体条目子项关系。 */
   public async listCatalogChildren(itemId: string, userId?: string): Promise<MediaItemRecord[]> {
-    await this.getCatalogItem(itemId, userId);
+    const parent = await this.getCatalogItem(itemId, userId);
     const relationRows = await this.database.query("media_relations").select("child_item_id").where({ parent_item_id: itemId }).orderBy("sort_order", "asc");
-    return Promise.all(relationRows.map((row) => this.getCatalogItem(String(row.child_item_id), userId)));
+    const childIds = relationRows.map((row) => String(row.child_item_id));
+    if (childIds.length === 0) return [];
+    const childRows = await this.database.query("media_items as m")
+      .join("cloud_services as s", "s.id", "m.service_id")
+      .join("user_accounts as u", "u.id", "s.user_id")
+      .select("m.*", "u.username as owner_username", "s.display_name as service_name")
+      .where("m.user_id", parent.userId)
+      .whereIn("m.id", childIds)
+      .whereNull("m.deleted_at")
+      .whereNull("s.deleted_at");
+    const [fileCounts, mediaProbeSummaries] = await Promise.all([
+      this.loadCatalogFileCounts(childRows),
+      this.loadCatalogMediaProbeSummaries(childRows),
+    ]);
+    const childrenById = new Map(childRows.map((row) => [String(row.id), this.mapMediaItem({
+      ...row,
+      file_count: fileCounts.get(String(row.id)) ?? 0,
+      media_probe_summary: mediaProbeSummaries.get(String(row.id)) ?? null,
+    })]));
+    // 关键变量：数据库批量查询不保证 IN 条件顺序，返回时恢复媒体关系中的季集排序。
+    return childIds.flatMap((childId) => {
+      const child = childrenById.get(childId);
+      return child ? [child] : [];
+    });
   }
 
   /** 读取当前条目及其直接子项关联的源文件，返回值不包含播放定位和凭据。 */
@@ -2690,6 +3482,7 @@ export class ServiceRepository {
         name: row.name,
         size: Number(row.size ?? 0),
         modifiedAt: row.modified_at ? String(row.modified_at) : null,
+        mediaProbe: parseMediaProbeResult(row.media_probe_result_json),
       });
     }
     return [...uniqueRows.values()];
@@ -2886,8 +3679,11 @@ export class ServiceRepository {
         "f.name",
         "f.size",
         "f.modified_at",
+        "p.status as media_probe_status",
+        "p.result_json as media_probe_result_json",
         "linked.title as linked_item_title",
       )
+      .leftJoin("media_file_probes as p", "p.source_file_id", "f.id")
       .where("fl.user_id", userId)
       .whereIn("fl.item_id", itemIds)
       .where("f.status", "active")
@@ -3160,6 +3956,8 @@ export class ServiceRepository {
         name: row.name,
         size: Number(row.size),
         modifiedAt: row.modified_at,
+        mediaProbeStatus: row.media_probe_status,
+        mediaProbeResult: row.media_probe_result_json,
         sourceLocator,
         playbackLocator: {
           ...linkLocator,
@@ -3206,23 +4004,27 @@ export class ServiceRepository {
       // 概览与海报墙使用相同口径：节目单集只计入父节目，不重复计入媒体总数。
       .whereNot("m.item_type", "video.episode");
     const jobs = this.database.query("scan_jobs");
+    const mediaProbeJobs = this.database.query("media_probe_jobs");
     if (userId) {
       services.where("user_id", userId);
       media.where("m.user_id", userId);
       jobs.where("user_id", userId);
+      mediaProbeJobs.where("user_id", userId);
     }
-    const [serviceCount, mediaCount, runningCount, failedCount, reviewCount] = await Promise.all([
+    const [serviceCount, mediaCount, runningCount, mediaProbeRunningCount, failedCount, mediaProbeFailedCount, reviewCount] = await Promise.all([
       services.clone().count<{ count: string | number }[]>({ count: "id" }).first(),
       media.clone().count<{ count: string | number }[]>({ count: "m.id" }).first(),
       jobs.clone().whereIn("status", ["queued", "running", "retry_waiting", "paused"]).count<{ count: string | number }[]>({ count: "id" }).first(),
+      mediaProbeJobs.clone().whereIn("status", ["queued", "running", "retry_waiting", "paused"]).count<{ count: string | number }[]>({ count: "id" }).first(),
       jobs.clone().where("status", "failed").count<{ count: string | number }[]>({ count: "id" }).first(),
+      mediaProbeJobs.clone().where((builder) => builder.where("status", "failed").orWhere("error_count", ">", 0)).count<{ count: string | number }[]>({ count: "id" }).first(),
       media.clone().where("m.match_state", "needs_review").count<{ count: string | number }[]>({ count: "m.id" }).first(),
     ]);
     return {
       serviceCount: Number(serviceCount?.count ?? 0),
       mediaCount: Number(mediaCount?.count ?? 0),
-      activeJobCount: Number(runningCount?.count ?? 0),
-      failedJobCount: Number(failedCount?.count ?? 0),
+      activeJobCount: Number(runningCount?.count ?? 0) + Number(mediaProbeRunningCount?.count ?? 0),
+      failedJobCount: Number(failedCount?.count ?? 0) + Number(mediaProbeFailedCount?.count ?? 0),
       needsReviewCount: Number(reviewCount?.count ?? 0),
     };
   }

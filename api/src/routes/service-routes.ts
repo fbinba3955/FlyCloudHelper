@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import type { JobStatus, MediaType, ServiceDetailRecord, ServiceStatus } from "../domain.js";
+import type { CloudServiceRecord, JobStatus, MediaType, ServiceDetailRecord, ServiceStatus } from "../domain.js";
 import { ApiError, validationError } from "../errors.js";
 import {
   readPagination,
@@ -76,6 +76,28 @@ function resolveGuangyaOfficialApiConnection(connectionInput: Record<string, unk
   };
 }
 
+/** 从已经裁剪的 Provider 连接中读取非空文本，避免比较时把未知值转换成有效身份。 */
+function readConnectionIdentityText(connection: Record<string, unknown>, fieldName: string): string {
+  const value = connection[fieldName];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/** 确认 APP 重新同步的仍是当前服务原来的光鸭官方 API 账号。 */
+function requireSameGuangyaOfficialApiAccount(
+  currentConnection: Record<string, unknown>,
+  nextConnection: Record<string, unknown>,
+): void {
+  if (readConnectionIdentityText(currentConnection, "authMode") !== "official_api") {
+    throw new ApiError(409, "guangya_auth_mode_conflict", "当前服务不是光鸭官方 API 登录，不能从 APP 覆盖登录信息");
+  }
+  const currentUserId = readConnectionIdentityText(currentConnection, "userId");
+  const nextUserId = readConnectionIdentityText(nextConnection, "userId");
+  // 关键变量：历史连接可能没有 userId；已有 userId 时必须严格匹配，防止把服务静默切换到另一个光鸭账号。
+  if (currentUserId && (!nextUserId || currentUserId !== nextUserId)) {
+    throw new ApiError(409, "guangya_account_mismatch", "APP 当前光鸭账号与云助手服务账号不一致，请检查后重试");
+  }
+}
+
 /**
  * 将光鸭网页一次性授权会话或 APP 官方 API 同步数据解析成服务端连接。
  * 返回的网页授权会话 ID 仅在连接成功落库后消费，验证失败时允许用户直接重试。
@@ -118,19 +140,32 @@ export function consumeProviderAuthorization(
   }
 }
 
-/** 为服务详情追加不含任何凭据的光鸭登录类型。 */
-export async function attachConnectionAuthMode(
+/** 为服务摘要或详情追加不含任何凭据的光鸭登录类型。 */
+export async function attachConnectionAuthMode<T extends CloudServiceRecord>(
   runtime: ApiRuntime,
-  service: ServiceDetailRecord,
-): Promise<ServiceDetailRecord & { connectionAuthMode: "official_api" | "web_qr" | "web_sms" | null }> {
+  service: T,
+): Promise<T & { connectionAuthMode: "official_api" | "web_qr" | "web_sms" | null }> {
   if (service.providerType !== "guangya") return { ...service, connectionAuthMode: null };
-  const encryptedConnection = await runtime.repository.getActiveEncryptedConnection(service.id, service.userId);
-  const connection = runtime.vault.decrypt(encryptedConnection);
-  const rawAuthMode = typeof connection.authMode === "string" ? connection.authMode.trim() : "";
-  const connectionAuthMode = rawAuthMode === "official_api" || rawAuthMode === "web_sms"
-    ? rawAuthMode
-    : "web_qr";
-  return { ...service, connectionAuthMode };
+  try {
+    const encryptedConnection = await runtime.repository.getActiveEncryptedConnection(service.id, service.userId);
+    const connection = runtime.vault.decrypt(encryptedConnection);
+    const rawAuthMode = typeof connection.authMode === "string" ? connection.authMode.trim() : "";
+    // 关键变量：历史网页连接没有 authMode 时仍按扫码登录处理，保持已有服务名称稳定。
+    const connectionAuthMode = rawAuthMode === "official_api" || rawAuthMode === "web_sms"
+      ? rawAuthMode
+      : "web_qr";
+    return { ...service, connectionAuthMode };
+  } catch (error) {
+    // 列表展示名称不能因为单个服务凭据异常而阻断，详情和重连接口仍会返回真实错误。
+    runtime.logBusinessEvent("warn", {
+      日志关键字: "codex-guangya-auth-mode-display",
+      事件: "读取光鸭登录类型失败",
+      服务ID: service.id,
+      用户ID: service.userId,
+      错误类型: error instanceof Error ? error.name : typeof error,
+    });
+    return { ...service, connectionAuthMode: null };
+  }
 }
 
 /** 校验单个扫描根并移除未声明字段。 */
@@ -338,6 +373,9 @@ export function validateMetadataProfile(
   if (metadataSettings.syncDetails !== undefined && typeof metadataSettings.syncDetails !== "boolean") {
     throw validationError(`metadata.profiles.${serviceDataType}.syncDetails`, "同步刮削详情开关必须是布尔值");
   }
+  if (metadataSettings.analyzeMediaSpecs !== undefined && typeof metadataSettings.analyzeMediaSpecs !== "boolean") {
+    throw validationError(`metadata.profiles.${serviceDataType}.analyzeMediaSpecs`, "媒体规格分析开关必须是布尔值");
+  }
   return profile;
 }
 
@@ -358,6 +396,7 @@ export function readVideoMetadataLogFields(profile: Record<string, unknown>): Re
     内容地区: typeof videoProfile.region === "string" ? videoProfile.region : "CN",
     使用本地NFO: videoProfile.useNfo !== false,
     同步刮削详情: videoProfile.syncDetails === true,
+    分析媒体规格: videoProfile.analyzeMediaSpecs === true,
   };
 }
 
@@ -425,13 +464,16 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const user = await requireRequestUser(request, runtime.database);
     const pagination = readPagination(request.query);
     const status = typeof request.query.status === "string" ? request.query.status as ServiceStatus : undefined;
-    return runtime.repository.listServices({
+    const result = await runtime.repository.listServices({
       userId: user.id,
       providerType: typeof request.query.providerType === "string" ? request.query.providerType : undefined,
       status,
       keyword: typeof request.query.search === "string" ? request.query.search : undefined,
       ...pagination,
     });
+    // 关键变量：列表中的登录类型只用于区分官方光鸭与三方光鸭，不返回任何授权凭据。
+    const items = await Promise.all(result.items.map((service) => attachConnectionAuthMode(runtime, service)));
+    return { ...result, items };
   });
 
   server.post<{ Body: Record<string, unknown> }>("/api/v1/services", async (request, reply) => {
@@ -464,7 +506,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     await validateProviderAccess(adapter, connection, scanProfile);
     const clientDeviceId = typeof request.body.clientDeviceId === "string" ? request.body.clientDeviceId.trim() : "";
     const clientServiceId = typeof request.body.clientServiceId === "string" ? request.body.clientServiceId.trim() : "";
-    const service = await runtime.repository.createService({
+    const creation = await runtime.repository.createService({
       serviceId: randomUUID(),
       libraryId: randomUUID(),
       userId: user.id,
@@ -479,6 +521,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
         ? { id: randomUUID(), clientDeviceId, clientServiceId }
         : undefined,
     });
+    const service = creation.service;
     consumeProviderAuthorization(runtime, user.id, resolvedConnection.authorizationSessionId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-service-data-type",
@@ -506,7 +549,13 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
         网盘类型: providerType,
       });
     }
-    return reply.status(201).send({ service });
+    return reply.status(201).send({
+      service,
+      serviceAccessCredentials: {
+        username: creation.accessCredentials.account.username,
+        password: creation.accessCredentials.password,
+      },
+    });
   });
 
   server.get<{ Params: { serviceId: string } }>("/api/v1/services/:serviceId", async (request) => {
@@ -635,6 +684,69 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     return { service: updated };
   });
 
+  /** 使用 APP 当前有效的光鸭官方 API 登录信息原地刷新服务凭据，不创建新的配置修订。 */
+  server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/services/:serviceId/connection/guangya-official-api",
+    async (request) => {
+      const user = await requireRequestUser(request, runtime.database);
+      const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+      try {
+        if (service.providerType !== "guangya") {
+          throw new ApiError(409, "provider_type_mismatch", "只有光鸭服务可以同步官方 API 登录信息");
+        }
+        const expectedRevision = readExpectedRevision(request.body.expectedRevision);
+        if (expectedRevision !== undefined && expectedRevision !== service.credentialRevision) {
+          throw new ApiError(409, "configuration_revision_conflict", "服务连接已在其他设备更新，请刷新服务列表后重试");
+        }
+        const currentConnection = runtime.vault.decrypt(
+          await runtime.repository.getActiveEncryptedConnection(service.id, user.id),
+        );
+        const nextConnection = resolveGuangyaOfficialApiConnection(
+          requireObject(request.body, "connection", "光鸭官方 API 登录信息"),
+        );
+        requireSameGuangyaOfficialApiAccount(currentConnection, nextConnection);
+        const adapter = runtime.providers.get("guangya");
+        // 关键变量：验证期间若光鸭再次轮换 Token，只更新待保存对象，验证通过后一次性加密落库。
+        const providerContext: ProviderConnectionContext = {
+          persistConnection: async (refreshedConnection) => {
+            Object.assign(nextConnection, refreshedConnection);
+          },
+        };
+        const validation = await adapter.validateConnection(nextConnection, undefined, providerContext);
+        if (!validation.valid || !validation.rootAccessible) {
+          throw new ApiError(422, "provider_connection_invalid", "APP 当前光鸭登录信息不可用");
+        }
+        await runtime.repository.refreshActiveEncryptedConnection({
+          serviceId: service.id,
+          userId: user.id,
+          credentialRevision: service.credentialRevision,
+          encryptedConnection: runtime.vault.encrypt(nextConnection),
+        });
+        const updated = await runtime.repository.restoreServiceConnection(service.id, user.id);
+        runtime.logBusinessEvent("info", {
+          日志关键字: "codex-guangya-official-resync",
+          事件: "APP重新同步光鸭官方API登录信息成功",
+          用户ID: user.id,
+          服务ID: service.id,
+          凭据修订: service.credentialRevision,
+        });
+        return { service: await attachConnectionAuthMode(runtime, updated) };
+      } catch (error) {
+        runtime.logBusinessEvent("warn", {
+          日志关键字: "codex-guangya-official-resync",
+          事件: "APP重新同步光鸭官方API登录信息失败",
+          用户ID: user.id,
+          服务ID: service.id,
+          凭据修订: service.credentialRevision,
+          错误码: error && typeof error === "object" && "code" in error
+            ? String((error as { code?: string }).code)
+            : "guangya_official_resync_failed",
+        });
+        throw error;
+      }
+    },
+  );
+
   server.post<{ Params: { serviceId: string } }>("/api/v1/services/:serviceId/connection/reconnect", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
@@ -752,6 +864,38 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       ...readVideoMetadataLogFields(profile),
     });
     return { service: updatedService };
+  });
+
+  /** 手动为已有但缺少规格的活动视频建立独立后台任务，不改变扫描期间规格开关。 */
+  server.post<{ Params: { serviceId: string } }>("/api/v1/services/:serviceId/media-probes/backfill", async (request, reply) => {
+    const user = await requireRequestUser(request, runtime.database);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+    if (service.dataType !== "video") throw new ApiError(409, "media_probe_video_only", "只有影视服务可以分析视频规格");
+    if (service.status !== "active" && service.status !== "reauthorization_required") {
+      throw new ApiError(409, "service_not_active", "请先启用服务，再分析已有视频规格");
+    }
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-media-ffprobe-backfill",
+      事件: "开始创建已有视频规格后台任务",
+      用户ID: user.id,
+      服务ID: service.id,
+    });
+    const result = await runtime.repository.enqueueExistingServiceMediaProbes(service.id, user.id, user.id);
+    const job = result.jobId
+      ? service.status === "reauthorization_required"
+        ? await runtime.repository.waitMediaProbeJobForReauthorization(result.jobId, user.id)
+        : await runtime.repository.getJob(result.jobId, user.id)
+      : null;
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-media-ffprobe-backfill",
+      事件: "用户触发已有视频规格分析",
+      用户ID: user.id,
+      服务ID: service.id,
+      后台任务ID: result.jobId,
+      入队文件数量: result.queuedCount,
+      是否等待重新授权: service.status === "reauthorization_required",
+    });
+    return reply.status(result.jobId ? 202 : 200).send({ job, queuedCount: result.queuedCount });
   });
 
   server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/playback-settings", async (request) => {
@@ -945,16 +1089,23 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     server.post<{ Params: { jobId: string } }>(`/api/v1/scan-jobs/:jobId/${action}`, async (request) => {
       const user = await requireRequestUser(request, runtime.database);
       const job = await runtime.repository.requestJobControl(request.params.jobId, user.id, action);
-      const interrupted = runtime.worker.interruptJobControl(job.id, action);
+      const interrupted = job.jobType === "media_probe"
+        ? runtime.mediaProbeWorker.interruptJobControl(job.id, action)
+        : runtime.worker.interruptJobControl(job.id, action);
+      // 规格分析任务可能正处于两个文件之间；没有 ffprobe 可中断时由接口直接完成状态切换。
+      const updatedJob = job.jobType === "media_probe" && !interrupted && job.status === "running"
+        ? await runtime.repository.applyMediaProbeJobControl(job.id, action)
+        : job;
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-job-control",
-        事件: action === "cancel" ? "用户终止扫描任务" : "用户暂停扫描任务",
+        事件: action === "cancel" ? "用户终止后台任务" : "用户暂停后台任务",
         用户ID: user.id,
         任务ID: job.id,
+        后台任务类型: job.jobType,
         控制动作: action,
         是否中断运行请求: interrupted,
       });
-      return { job };
+      return { job: updatedJob };
     });
   }
 
@@ -963,10 +1114,10 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     requireConfirmation(request.body, request.params.jobId);
     const job = await runtime.repository.getJob(request.params.jobId, user.id);
     await runtime.repository.deleteScanJob(request.params.jobId, user.id);
-    await runtime.failureReports.remove(job);
+    if (job.jobType === "scan") await runtime.failureReports.remove(job);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-delete",
-      事件: "用户删除扫描任务",
+      事件: "用户删除后台任务",
       用户ID: user.id,
       任务ID: request.params.jobId,
     });
@@ -978,7 +1129,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const job = await runtime.repository.resumeJob(request.params.jobId, user.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-control",
-      事件: "用户继续扫描任务",
+      事件: "用户继续后台任务",
       用户ID: user.id,
       任务ID: job.id,
       控制动作: "resume",
@@ -989,6 +1140,17 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.post<{ Params: { jobId: string }; Body: Record<string, unknown> }>("/api/v1/scan-jobs/:jobId/retry", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     const sourceJob = await runtime.repository.getJob(request.params.jobId, user.id);
+    if (sourceJob.jobType === "media_probe") {
+      const job = await runtime.repository.retryMediaProbeJob(sourceJob.id, user.id, user.id);
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-media-ffprobe",
+        事件: "用户重试规格后台任务",
+        用户ID: user.id,
+        原任务ID: sourceJob.id,
+        新任务ID: job.id,
+      });
+      return reply.status(202).send({ job });
+    }
     if (sourceJob.status !== "failed" && sourceJob.status !== "cancelled") {
       throw new ApiError(409, "job_not_retryable", "只有失败或已取消任务可以重试");
     }
@@ -1016,5 +1178,10 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       服务ID: job.serviceId,
     });
     return reply.status(202).send({ job });
+  });
+
+  server.get<{ Params: { jobId: string } }>("/api/v1/scan-jobs/:jobId/media-probe-failures", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    return { items: await runtime.repository.listMediaProbeJobFailures(request.params.jobId, user.id) };
   });
 }

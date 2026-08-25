@@ -4,15 +4,18 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCatalogView";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { GuangyaAuthorizationPanel } from "@/components/GuangyaAuthorizationPanel";
+import { ProviderConnectionGuide } from "@/components/ProviderConnectionGuide";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
 import { ServiceSnapshotPanel } from "@/components/ServiceSnapshotPanel";
 import { Panel, StatCard, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   ApiClientError,
+  backfillExistingMediaProbes,
   clearServiceCatalog,
   createScanJob,
   createService,
   deleteCloudService,
+  getServiceAccessSettings,
   getService,
   listAdminServiceItems,
   listAdminUsers,
@@ -20,9 +23,13 @@ import {
   listProviders,
   listServices,
   reconnectServiceConnection,
+  resetServiceAccessPassword,
+  revokeServiceAccessSessions,
+  updateServiceAccessCredentials,
   updateServiceConnection,
   updateServiceMetadataProfile,
   updateServiceRelayPlayback,
+  updateServiceJellyfinSettings,
   updateServiceScanProfile,
   updateServiceStatus,
   type CloudService,
@@ -34,6 +41,22 @@ import {
   type ProviderDescriptor,
   type ServiceStatus,
 } from "@/lib/api";
+
+/** 复制服务地址或一次性密码，并兼容不开放 Clipboard API 的浏览器环境。 */
+async function copyServiceAccessText(value: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    const temporaryInput = document.createElement("textarea");
+    temporaryInput.value = value;
+    temporaryInput.style.position = "fixed";
+    temporaryInput.style.opacity = "0";
+    document.body.appendChild(temporaryInput);
+    temporaryInput.select();
+    document.execCommand("copy");
+    temporaryInput.remove();
+  }
+}
 import { useApiResource } from "@/lib/use-api-resource";
 
 const serviceStatusLabels: Record<ServiceStatus, string> = {
@@ -50,10 +73,18 @@ const dataTypeLabels: Record<MediaType, string> = {
 };
 
 const guangyaLoginModeLabels: Record<"official_api" | "web_qr" | "web_sms", string> = {
-  official_api: "光鸭官方 API 登录",
-  web_qr: "光鸭网页二维码登录",
-  web_sms: "光鸭网页验证码登录",
+  official_api: "官方光鸭",
+  web_qr: "三方光鸭（扫码登录）",
+  web_sms: "三方光鸭（验证码登录）",
 };
+
+/** 根据 Provider 和授权方式返回服务列表使用的中文名称。 */
+function getServiceProviderLabel(service: CloudService): string {
+  if (service.providerType !== "guangya") return service.providerType;
+  if (service.connectionAuthMode === "official_api") return "官方光鸭";
+  if (service.connectionAuthMode === "web_qr" || service.connectionAuthMode === "web_sms") return "三方光鸭";
+  return "光鸭";
+}
 
 // 关键变量：服务详情最近任务卡片只展示中文状态，不修改接口返回的原始状态值。
 const jobStatusLabels: Record<JobStatus, string> = {
@@ -72,6 +103,7 @@ const jobStageLabels: Record<string, string> = {
   classifying: "识别媒体",
   scraping: "扫描刮削",
   persisting: "写入目录",
+  probing: "分析视频规格",
   completed: "已完成",
 };
 
@@ -110,6 +142,8 @@ interface VideoMetadataSettings {
   useNfo: boolean;
   /** 扫描时是否同步读取 TMDB 详情、演职人员和节目单集信息。 */
   syncDetails: boolean;
+  /** 是否在扫描结束后异步使用 ffprobe 分析实际媒体规格。 */
+  analyzeMediaSpecs: boolean;
 }
 
 interface ScanConcurrencySettings {
@@ -159,6 +193,8 @@ function readVideoMetadataSettings(profile: Record<string, unknown>): VideoMetad
     useNfo: videoProfile.useNfo !== false,
     // 关键变量：旧服务缺少该字段时必须保持关闭，扫描行为才能与 APP 一致。
     syncDetails: videoProfile.syncDetails === true,
+    // 关键变量：旧服务默认不读取视频字节，只有用户明确开启后才进入独立队列。
+    analyzeMediaSpecs: videoProfile.analyzeMediaSpecs === true,
   };
 }
 
@@ -185,6 +221,7 @@ function buildVideoMetadataProfile(
         region: settings.region,
         useNfo: settings.useNfo,
         syncDetails: settings.syncDetails,
+        analyzeMediaSpecs: settings.analyzeMediaSpecs,
       },
     },
   };
@@ -248,7 +285,7 @@ function ServiceCard({ service, admin, onScanned }: { service: CloudService; adm
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{service.displayName}</h2>
-            <p className="truncate font-mono text-[11px] text-muted-foreground">{service.providerType} · {service.id}{admin ? ` · ${service.ownerUsername}` : ""}</p>
+            <p className="truncate font-mono text-[11px] text-muted-foreground">{getServiceProviderLabel(service)} · {service.id}{admin ? ` · ${service.ownerUsername}` : ""}</p>
           </div>
         </div>
         <StatusPill tone={getServiceTone(service.status)}>{serviceStatusLabels[service.status]}</StatusPill>
@@ -329,7 +366,7 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
     const connection: Record<string, string> = {};
     if (descriptor.authenticationMode === "web_qr") {
       if (guangyaAuthorization?.status !== "authorized") {
-        setMessage("请先完成光鸭网页二维码或网页验证码登录，再创建服务");
+        setMessage("请先完成三方光鸭扫码或验证码登录，再创建服务");
         return;
       }
       connection.authorizationSessionId = guangyaAuthorization.authorizationSessionId;
@@ -359,6 +396,7 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
             region: "CN",
             useNfo: true,
             syncDetails: false,
+            analyzeMediaSpecs: false,
           },
         },
       },
@@ -366,8 +404,10 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
     if (admin) input.userId = adminTargetUserId;
     setMessage("正在验证连接并创建服务，不会自动开始扫描…");
     try {
-      const service = await createService(input, admin);
-      await navigate({ to: admin ? "/admin/services/$serviceId" : "/app/services/$serviceId", params: { serviceId: service.id } });
+      const creation = await createService(input, admin);
+      // 关键变量：初始明文密码只在当前浏览器会话中暂存一次，刷新详情页后不再显示。
+      sessionStorage.setItem(`flycloud-service-access:${creation.service.id}`, JSON.stringify(creation.serviceAccessCredentials));
+      await navigate({ to: admin ? "/admin/services/$serviceId" : "/app/services/$serviceId", params: { serviceId: creation.service.id } });
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "服务创建失败");
     }
@@ -393,6 +433,7 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
             ? <GuangyaAuthorizationPanel admin={admin} targetUserId={adminTargetUserId || undefined} resetKey={`${selectedProvider.type}:${adminTargetUserId}`} onAuthorizationChange={setGuangyaAuthorization} />
             : selectedProvider?.connectionFields.map((field) => <label key={field.name} className="block"><span className="text-xs text-muted-foreground">{field.label}</span><input name={`connection.${field.name}`} type={field.type === "password" ? "password" : field.type} required={field.required} autoComplete="off" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>)}
           {selectedProvider && <div className="rounded-xl border border-border bg-secondary/35 p-4 lg:col-span-2"><p className="text-sm font-medium">默认任务并发</p><p className="mt-2 text-xs text-muted-foreground">扫描任务 {selectedProvider.recommendedScanSettings.scanDirectoryConcurrency.default}，刮削任务 {selectedProvider.recommendedScanSettings.scrapeTaskConcurrency.default}。创建后可以在服务详情中修改。</p></div>}
+          {selectedProvider && <ProviderConnectionGuide providerType={selectedProvider.type} />}
           <div className="lg:col-span-2 flex items-center justify-between gap-4"><p className="text-xs text-muted-foreground">创建成功后不会自动扫描或刮削，需要先在服务详情中设置扫描路径。</p><PrimaryButton type="submit" disabled={selectedProvider?.authenticationMode === "web_qr" && guangyaAuthorization?.status !== "authorized"}>验证连接并创建服务</PrimaryButton></div>
           {message && <p className="lg:col-span-2 text-sm text-muted-foreground">{message}</p>}
         </form>
@@ -444,13 +485,13 @@ export function ServiceConnectionPage({ serviceId, admin = false }: { serviceId:
   /** 光鸭网页授权成功后，用一次性授权会话替换当前服务连接。 */
   async function saveGuangyaConnection(authorization: GuangyaAuthorizationStatus | null): Promise<void> {
     if (!service || authorization?.status !== "authorized") return;
-    const loginMethod = authorization.authMethod === "sms" ? "网页验证码" : "网页二维码";
-    setMessage(`光鸭${loginMethod}登录成功，正在验证并保存连接…`);
+    const loginMethod = authorization.authMethod === "sms" ? "验证码登录" : "扫码登录";
+    setMessage(`三方光鸭${loginMethod}成功，正在验证并保存连接…`);
     try {
       await updateServiceConnection(serviceId, {
         authorizationSessionId: authorization.authorizationSessionId,
       }, admin);
-      setMessage("光鸭连接已更新，后续访问令牌将由服务端自动刷新");
+      setMessage("三方光鸭连接已更新，后续访问令牌将由服务端自动刷新");
       await resource.refresh();
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "光鸭连接保存失败";
@@ -513,7 +554,7 @@ export function ServiceConnectionPage({ serviceId, admin = false }: { serviceId:
             </SecondaryButton>
           </div>
         </Panel>
-        <Panel title="替换连接" description={providerDescriptor?.authenticationMode === "web_qr" ? "可使用网页二维码或网页验证码重新登录；官方 API 连接由 Flymby APP 同步。" : "Secret 不回显，保存时必须提交一套完整新连接。"}>
+        <Panel title="替换连接" description={providerDescriptor?.authenticationMode === "web_qr" ? "三方光鸭可使用扫码或验证码重新登录；官方光鸭由 Flymby APP 同步。" : "Secret 不回显，保存时必须提交一套完整新连接。"}>
           {providers.loading && <p className="text-sm text-muted-foreground">正在读取网盘连接配置…</p>}
           {providerDescriptor?.authenticationMode === "web_qr" ? (
             <GuangyaAuthorizationPanel admin={admin} targetUserId={admin ? service.userId : undefined} resetKey={`${service.id}:${service.credentialRevision}`} initialLoginMode={service.connectionAuthMode ?? "web_qr"} onAuthorizationChange={(authorization) => void saveGuangyaConnection(authorization)} />
@@ -553,12 +594,17 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   const navigate = useNavigate();
   const resource = useApiResource(() => getService(serviceId, admin), [serviceId, admin]);
   const providers = useApiResource(() => listProviders(), []);
+  const accessResource = useApiResource(() => getServiceAccessSettings(serviceId, admin), [serviceId, admin]);
   const [message, setMessage] = useState<string | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState(false);
   const updatingStatusRef = useRef(false);
   const [updatingRelayPlayback, setUpdatingRelayPlayback] = useState(false);
   // 关键变量：同步占用播放开关，避免 React 刷新前连续点击产生相反请求。
   const updatingRelayPlaybackRef = useRef(false);
+  const [updatingJellyfin, setUpdatingJellyfin] = useState(false);
+  const [accessUsername, setAccessUsername] = useState("");
+  const [newAccessPassword, setNewAccessPassword] = useState("");
+  const [visibleAccessPassword, setVisibleAccessPassword] = useState<string | null>(null);
   const [clearingCatalog, setClearingCatalog] = useState(false);
   // 关键变量：引用会在点击处理函数中同步占用，避免 React 刷新按钮状态前重复提交清空请求。
   const clearingCatalogRef = useRef(false);
@@ -567,6 +613,8 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   const deletingServiceRef = useRef(false);
   const [creatingScanMode, setCreatingScanMode] = useState<"full" | "incremental" | null>(null);
   const creatingScanModeRef = useRef<"full" | "incremental" | null>(null);
+  const [backfillingMediaSpecs, setBackfillingMediaSpecs] = useState(false);
+  const backfillingMediaSpecsRef = useRef(false);
   const service = resource.data;
   const [fullScanRoots, setFullScanRoots] = useState<ProviderDirectory[]>([]);
   const [incrementalScanRoots, setIncrementalScanRoots] = useState<ProviderDirectory[]>([]);
@@ -576,6 +624,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     region: "CN",
     useNfo: true,
     syncDetails: false,
+    analyzeMediaSpecs: false,
   });
   const [scanConcurrencySettings, setScanConcurrencySettings] = useState<ScanConcurrencySettings>({
     scanDirectoryConcurrency: 8,
@@ -598,6 +647,24 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     const descriptor = providers.data?.find((item) => item.type === service.providerType);
     setScanConcurrencySettings(readScanConcurrencySettings(service.scanProfile, descriptor));
   }, [serviceId, service?.id, service?.scanProfileRevision, providers.data]);
+
+  useEffect(() => {
+    if (accessResource.data?.account.username) setAccessUsername(accessResource.data.account.username);
+  }, [accessResource.data?.account.username]);
+
+  useEffect(() => {
+    const storageKey = `flycloud-service-access:${serviceId}`;
+    const value = sessionStorage.getItem(storageKey);
+    if (!value) return;
+    sessionStorage.removeItem(storageKey);
+    try {
+      const credentials = JSON.parse(value) as { username?: string; password?: string };
+      if (credentials.username) setAccessUsername(credentials.username);
+      if (credentials.password) setVisibleAccessPassword(credentials.password);
+    } catch {
+      setVisibleAccessPassword(null);
+    }
+  }, [serviceId]);
 
   if (!service) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取服务详情…"}</div></Panel>;
   // 关键变量：详情已经通过空值检查，异步回调统一捕获稳定引用，避免刷新期间类型重新变为可空。
@@ -679,7 +746,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     try {
       const profile = buildVideoMetadataProfile(activeService.metadataProfile, metadataSettings);
       await updateServiceMetadataProfile(serviceId, profile, admin);
-      setMessage("元数据配置已保存，新修订只影响之后创建的任务");
+      setMessage("元数据配置已保存，规格开关只影响之后执行的扫描刮削任务");
       await resource.refresh();
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "元数据配置保存失败";
@@ -691,9 +758,38 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         地区: metadataSettings.region,
         使用本地NFO: metadataSettings.useNfo,
         同步刮削详情: metadataSettings.syncDetails,
+        分析媒体规格: metadataSettings.analyzeMediaSpecs,
         错误信息: errorMessage,
       });
       setMessage(errorMessage);
+    }
+  }
+
+  /** 手动为当前服务已有但缺少规格的视频创建独立后台任务。 */
+  async function backfillMediaSpecs(): Promise<void> {
+    if (backfillingMediaSpecsRef.current) return;
+    backfillingMediaSpecsRef.current = true;
+    setBackfillingMediaSpecs(true);
+    setMessage("正在检查已有视频的规格缺失情况…");
+    try {
+      const result = await backfillExistingMediaProbes(serviceId, admin);
+      setMessage(result.job
+        ? result.job.errorCode === "provider_authentication_failed"
+          ? `已创建视频规格后台任务，共 ${result.queuedCount.toLocaleString()} 个待分析视频；当前等待 APP 同步有效登录信息`
+          : `已创建视频规格后台任务，共 ${result.queuedCount.toLocaleString()} 个待分析视频`
+        : "已有视频均已具备规格，或已在其他后台任务中等待分析");
+      await resource.refresh();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "创建视频规格后台任务失败";
+      console.warn("codex-media-ffprobe-backfill", {
+        事件: "触发已有视频规格分析失败",
+        服务ID: serviceId,
+        错误信息: errorMessage,
+      });
+      setMessage(errorMessage);
+    } finally {
+      backfillingMediaSpecsRef.current = false;
+      setBackfillingMediaSpecs(false);
     }
   }
 
@@ -730,6 +826,60 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
       updatingRelayPlaybackRef.current = false;
       setUpdatingRelayPlayback(false);
     }
+  }
+
+  /** 立即保存当前服务的 Jellyfin 协议开关。 */
+  async function toggleJellyfin(): Promise<void> {
+    if (updatingJellyfin || !accessResource.data) return;
+    const nextEnabled = !accessResource.data.jellyfinEnabled;
+    setUpdatingJellyfin(true);
+    try {
+      await updateServiceJellyfinSettings(serviceId, nextEnabled, admin);
+      setMessage(nextEnabled ? "Jellyfin 协议已启用" : "Jellyfin 协议已关闭，旧 Jellyfin 会话已撤销");
+      await Promise.all([accessResource.refresh(), resource.refresh()]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Jellyfin 设置保存失败");
+    } finally { setUpdatingJellyfin(false); }
+  }
+
+  /** 修改服务独立账号，修改后全部协议旧会话立即失效。 */
+  async function saveAccessCredentials(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const input: { username?: string; password?: string } = {};
+    if (accessUsername !== accessResource.data?.account.username) input.username = accessUsername;
+    // 关键变量：当前仍需要密码时，空输入是用户明确切换为免密码；已经免密码时空输入不重复提交。
+    if (newAccessPassword.length > 0 || accessResource.data?.account.hasPassword === true) {
+      input.password = newAccessPassword;
+    }
+    if (input.username === undefined && input.password === undefined) { setMessage("用户名和密码均未修改"); return; }
+    try {
+      await updateServiceAccessCredentials(serviceId, input, admin);
+      setNewAccessPassword(""); setVisibleAccessPassword(null);
+      setMessage(newAccessPassword.length > 0
+        ? "服务访问账号和密码已保存，全部旧协议会话已撤销"
+        : "服务访问账号已保存为免密码登录，全部旧协议会话已撤销");
+      await accessResource.refresh();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "服务访问凭据保存失败"); }
+  }
+
+  /** 重置随机密码并只在当前页面展示一次。 */
+  async function resetAccessPassword(): Promise<void> {
+    if (!window.confirm("确定重置服务访问密码吗？全部 Jellyfin/Emby 兼容会话会立即失效。")) return;
+    try {
+      const result = await resetServiceAccessPassword(serviceId, admin);
+      setVisibleAccessPassword(result.password); setNewAccessPassword("");
+      setMessage("密码已重置，请立即保存下方一次性明文密码");
+      await accessResource.refresh();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "密码重置失败"); }
+  }
+
+  /** 管理员主动撤销当前服务的全部协议会话。 */
+  async function revokeAccessSessions(): Promise<void> {
+    if (!window.confirm("确定撤销当前服务的全部协议会话吗？播放记录不会删除。")) return;
+    try {
+      const result = await revokeServiceAccessSessions(serviceId, admin);
+      setMessage(`已撤销 ${result.revokedCount} 个协议会话`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "会话撤销失败"); }
   }
 
   /** 二次确认后仅清空当前服务的扫描与刮削结果。 */
@@ -792,7 +942,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
       await navigate({ to: admin ? "/admin/services" : "/app/services", replace: true });
     } catch (error) {
       const errorMessage = error instanceof ApiClientError && error.code === "service_has_active_job"
-        ? "服务仍有未结束的扫描任务，请先终止任务后再删除"
+        ? "服务仍有未结束的后台任务，请先终止任务后再删除"
         : error instanceof Error ? error.message : "删除云端服务失败";
       console.warn("codex-flycloud-helper-service-delete", {
         事件: "删除云端服务失败",
@@ -843,7 +993,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="媒体条目" value={service.itemCount.toLocaleString()} hint="当前已入库" />
         <StatCard label="目录版本" value={`v${service.catalogVersion}`} hint={formatTime(service.lastScanAt)} tone="info" />
-        <StatCard label="最近任务" value={recentJob ? jobStatusLabels[recentJob.status] : "暂无"} hint={recentJob ? getJobStageLabel(recentJob.stage) : "尚未扫描"} tone="warning" />
+        <StatCard label="最近后台任务" value={recentJob ? recentJob.status === "retry_waiting" && recentJob.jobType === "media_probe" ? "等待重试" : jobStatusLabels[recentJob.status] : "暂无"} hint={recentJob ? `${recentJob.jobType === "media_probe" ? "视频规格分析" : "扫描刮削"} · ${getJobStageLabel(recentJob.stage)}` : "尚无任务"} tone="warning" />
         <StatCard
           label="连接状态"
           value={service.status === "reauthorization_required" ? "需重新授权" : service.credentialConfigured ? "已配置" : "未配置"}
@@ -867,7 +1017,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         </div>
       </Panel>
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <Panel title="播放设置" description="设置只对当前服务生效，默认关闭。">
+        <Panel title="播放与协议设置" description="中转播放和 Jellyfin 协议分别控制，只对当前服务生效。">
           <div className="rounded-xl border border-border bg-secondary/35 p-4">
             <div className="flex items-center justify-between gap-4">
               <div>
@@ -892,6 +1042,37 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
                 <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${service.relayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} />
               </button>
             </div>
+          </div>
+          <div className="mt-4 rounded-xl border border-border bg-secondary/35 p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-medium">启用 Jellyfin 协议</p>
+                <p className="mt-1 text-xs text-muted-foreground">关闭后会撤销当前服务的 Jellyfin 会话，但保留账号、播放记录和继续观看。</p>
+              </div>
+              <button type="button" role="switch" aria-checked={accessResource.data?.jellyfinEnabled ?? false} aria-label="启用 Jellyfin 协议" disabled={!accessResource.data || updatingJellyfin} onClick={() => void toggleJellyfin()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${accessResource.data?.jellyfinEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+                <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${accessResource.data?.jellyfinEnabled ? "translate-x-5" : "translate-x-0"}`} />
+              </button>
+            </div>
+            <div className="mt-4 rounded-lg border border-border bg-background/40 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs text-muted-foreground">Jellyfin 服务地址</p>
+                  <p className="mt-1 break-all font-mono text-xs">{accessResource.data?.jellyfinUrl ?? (accessResource.data ? `云助手 API 地址${accessResource.data.jellyfinPath}` : "正在读取…")}</p>
+                  <p className="mt-2 text-xs text-muted-foreground">{accessResource.data?.jellyfinUrl ? "当前使用系统配置的对外地址覆盖值。" : "未设置覆盖地址，请在云助手 API 地址（默认端口 9934）后追加上述服务路径。"}</p>
+                </div>
+                {accessResource.data && <SecondaryButton type="button" onClick={() => void copyServiceAccessText(accessResource.data?.jellyfinUrl ?? accessResource.data?.jellyfinPath ?? "").then(() => setMessage(accessResource.data?.jellyfinUrl ? "Jellyfin 服务地址已复制" : "Jellyfin 服务路径已复制"))}>{accessResource.data.jellyfinUrl ? "复制地址" : "复制路径"}</SecondaryButton>}
+              </div>
+            </div>
+            {visibleAccessPassword && <div className="mt-3 rounded-lg border border-warning/40 bg-warning/10 p-3"><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-medium text-warning">一次性明文密码，请立即保存</p><p className="mt-2 break-all font-mono text-sm">{visibleAccessPassword}</p></div><SecondaryButton type="button" onClick={() => void copyServiceAccessText(visibleAccessPassword).then(() => setMessage("一次性密码已复制"))}>复制密码</SecondaryButton></div></div>}
+            <form onSubmit={(event) => void saveAccessCredentials(event)} className="mt-4 grid gap-3 md:grid-cols-2">
+              <label><span className="text-xs text-muted-foreground">服务访问用户名</span><input value={accessUsername} minLength={4} maxLength={255} onChange={(event) => setAccessUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+              <label><span className="text-xs text-muted-foreground">访问密码（长度不限，留空表示无需密码）</span><input value={newAccessPassword} type="password" autoComplete="new-password" placeholder={accessResource.data?.account.hasPassword ? "当前需要密码；留空保存将改为免密码" : "当前无需密码；填写后恢复密码校验"} onChange={(event) => setNewAccessPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+              <div className="flex flex-wrap gap-2 md:col-span-2">
+                <PrimaryButton type="submit">保存访问凭据</PrimaryButton>
+                <SecondaryButton type="button" onClick={() => void resetAccessPassword()}>重置随机密码</SecondaryButton>
+                <SecondaryButton type="button" onClick={() => void revokeAccessSessions()}>撤销全部会话</SecondaryButton>
+              </div>
+            </form>
           </div>
         </Panel>
         <Panel title="扫描路径" description="全量和增量任务分别选择网盘目录，不需要手动输入路径。" className="xl:col-span-2">
@@ -971,15 +1152,29 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
                 </button>
               </div>
             </div>
+            <div className="rounded-xl border border-border bg-secondary/35 p-4">
+              <div className="flex items-center justify-between gap-4">
+                <div><p className="text-sm font-medium">扫描时读取视频规格（ffprobe）</p><p className="mt-1 text-xs text-muted-foreground">{metadataSettings.analyzeMediaSpecs ? "后续扫描刮削会为新发现或变化的视频读取时长、编码、分辨率、音轨和字幕。" : "后续扫描刮削不读取视频规格，不影响已经入库的视频和已有规格结果。"}</p></div>
+                <button type="button" role="switch" aria-checked={metadataSettings.analyzeMediaSpecs} aria-label="分析视频规格" onClick={() => setMetadataSettings((current) => ({ ...current, analyzeMediaSpecs: !current.analyzeMediaSpecs }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.analyzeMediaSpecs ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+                  <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.analyzeMediaSpecs ? "translate-x-5" : "translate-x-0"}`} />
+                </button>
+              </div>
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border/70 pt-4">
+                <p className="text-xs text-muted-foreground">需要补充历史数据时单独执行，不受上方扫描开关影响。</p>
+                <SecondaryButton type="button" onClick={() => void backfillMediaSpecs()} disabled={backfillingMediaSpecs}>
+                  <ScanLine className="size-4" /> {backfillingMediaSpecs ? "正在创建任务…" : "分析已有缺失规格视频"}
+                </SecondaryButton>
+              </div>
+            </div>
             <div className="flex justify-end"><PrimaryButton type="submit">保存元数据配置</PrimaryButton></div>
           </form>
         </Panel>
         <Panel title="危险操作" description="以下操作会移除当前服务的数据，需要二次确认。">
           <div className="flex flex-wrap gap-2">
             <button type="button" onClick={() => void clearCatalog()} disabled={service.status === "scanning" || clearingCatalog || deletingService} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空扫描刮削结果"}</button>
-            <button type="button" onClick={() => void deleteCurrentService()} disabled={hasUnfinishedJob || clearingCatalog || deletingService} title={hasUnfinishedJob ? "请先终止该服务未结束的扫描任务" : undefined} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground shadow-sm transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {deletingService ? "正在删除…" : "删除服务"}</button>
+            <button type="button" onClick={() => void deleteCurrentService()} disabled={hasUnfinishedJob || clearingCatalog || deletingService} title={hasUnfinishedJob ? "请先终止该服务未结束的后台任务" : undefined} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground shadow-sm transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {deletingService ? "正在删除…" : "删除服务"}</button>
           </div>
-          {hasUnfinishedJob && <p className="mt-3 text-xs text-warning">该服务仍有未结束的扫描任务，请先终止任务后再删除服务。</p>}
+          {hasUnfinishedJob && <p className="mt-3 text-xs text-warning">该服务仍有未结束的后台任务，请先终止任务后再删除服务。</p>}
         </Panel>
       </div>
     </>

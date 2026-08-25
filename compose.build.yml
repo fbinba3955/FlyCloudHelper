@@ -1,0 +1,7 @@
+services:
+  flycloud-helper:
+    # 仅在开发者需要从当前源码构建镜像时叠加此文件。
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: flycloud-helper:local

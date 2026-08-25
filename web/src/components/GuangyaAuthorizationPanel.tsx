@@ -42,9 +42,9 @@ const authorizationStatusLabels: Record<GuangyaAuthorizationStatus["status"], st
 };
 
 const loginModeLabels: Record<GuangyaLoginMode, string> = {
-  official_api: "光鸭官方 API 登录",
-  web_qr: "光鸭网页二维码登录",
-  web_sms: "光鸭网页验证码登录",
+  official_api: "官方光鸭",
+  web_qr: "三方光鸭（扫码登录）",
+  web_sms: "三方光鸭（验证码登录）",
 };
 
 /** 返回光鸭网页授权状态对应的视觉语义。 */
@@ -136,25 +136,25 @@ export function GuangyaAuthorizationPanel({
     setAuthorization(null);
     setCaptchaChallenge(null);
     setVerificationCode("");
-    setMessage(nextMode === "official_api" ? "请在 Flymby APP 完成光鸭登录后，通过接口同步到 Fly云助手。" : null);
+    setMessage(nextMode === "official_api" ? "请在 Flymby APP 完成官方光鸭登录后，通过接口同步到 Fly云助手。" : null);
     authorizationChangeRef.current(null);
   }
 
   /** 创建服务端 Device Code 会话，二维码仅展示本次短期官方验证地址。 */
   async function startQrAuthorization(): Promise<void> {
     if (admin && !targetUserId) {
-      setMessage("请先选择所属用户，再进行光鸭网页二维码登录");
+      setMessage("请先选择所属用户，再进行三方光鸭扫码登录");
       return;
     }
     setWorking(true);
-    setMessage("正在获取光鸭网页登录二维码…");
+    setMessage("正在获取三方光鸭登录二维码…");
     try {
       const nextAuthorization = await startGuangyaAuthorization(admin, targetUserId);
       setAuthorization(nextAuthorization);
       authorizationChangeRef.current(nextAuthorization);
       setMessage("请使用光鸭 APP 扫描二维码并确认登录");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "无法启动光鸭网页二维码登录");
+      setMessage(error instanceof Error ? error.message : "无法启动三方光鸭扫码登录");
     } finally {
       setWorking(false);
     }
@@ -167,7 +167,7 @@ export function GuangyaAuthorizationPanel({
       `codex-flycloud-helper-guangya-sms-auth 事件=点击获取验证码 是否管理员=${admin} 是否选择目标用户=${Boolean(targetUserId)} 是否同意协议=${agreementAccepted}`,
     );
     if (admin && !targetUserId) {
-      setMessage("请先选择所属用户，再发送光鸭网页验证码");
+      setMessage("请先选择所属用户，再发送三方光鸭验证码");
       return;
     }
     if (!/^1\d{10}$/u.test(normalizedPhoneNumber)) {
@@ -180,7 +180,7 @@ export function GuangyaAuthorizationPanel({
     }
     setWorking(true);
     setCaptchaChallenge(null);
-    setMessage("正在初始化光鸭官方人机验证…");
+    setMessage("正在初始化光鸭官网人机验证…");
     try {
       const startResult = await startGuangyaSmsAuthorization(
         normalizedPhoneNumber,
@@ -207,7 +207,7 @@ export function GuangyaAuthorizationPanel({
       console.warn(
         `codex-flycloud-helper-guangya-sms-auth 事件=验证码接口返回失败 错误类型=${error instanceof Error ? error.name : typeof error}`,
       );
-      setMessage(error instanceof Error ? error.message : "发送光鸭网页验证码失败");
+      setMessage(error instanceof Error ? error.message : "发送三方光鸭验证码失败");
     } finally {
       setWorking(false);
     }
@@ -217,7 +217,7 @@ export function GuangyaAuthorizationPanel({
   async function completeCaptchaVerification(captchaToken: string): Promise<void> {
     if (!captchaChallenge) return;
     setWorking(true);
-    setMessage("人机验证已完成，正在发送光鸭网页验证码…");
+    setMessage("人机验证已完成，正在发送三方光鸭验证码…");
     try {
       const nextAuthorization = await completeGuangyaSmsCaptcha(
         captchaChallenge.captchaSessionId,
@@ -241,14 +241,14 @@ export function GuangyaAuthorizationPanel({
     if (!captchaChallenge) return;
     const popup = window.open(captchaChallenge.verificationUri, "flycloud-helper-guangya-captcha", "popup,width=420,height=620");
     setMessage(popup
-      ? "请在新窗口完成光鸭官方人机验证，完成后会自动发送短信验证码"
+      ? "请在新窗口完成光鸭官网人机验证，完成后会自动发送短信验证码"
       : "浏览器阻止了验证窗口，请允许本站弹出窗口后重试");
   }
 
   /** 校验网页验证码，成功连接仍只保存在服务端。 */
   async function verifySmsCode(): Promise<void> {
     if (!authorization || authorization.authMethod !== "sms") {
-      setMessage("请先获取光鸭网页验证码");
+      setMessage("请先获取三方光鸭验证码");
       return;
     }
     if (!/^\d{4,8}$/u.test(verificationCode.trim())) {
@@ -265,9 +265,9 @@ export function GuangyaAuthorizationPanel({
       );
       setAuthorization(nextAuthorization);
       authorizationChangeRef.current(nextAuthorization);
-      setMessage("光鸭网页验证码登录成功");
+      setMessage("三方光鸭验证码登录成功");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "光鸭网页验证码登录失败");
+      setMessage(error instanceof Error ? error.message : "三方光鸭验证码登录失败");
     } finally {
       setWorking(false);
     }
@@ -278,8 +278,8 @@ export function GuangyaAuthorizationPanel({
     <div className="rounded-xl border border-border bg-secondary/25 p-4 lg:col-span-2">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="text-sm font-medium">光鸭登录方式</p>
-          <p className="mt-1 text-xs text-muted-foreground">三种登录的连接彼此独立，凭据均由服务端加密保存。</p>
+          <p className="text-sm font-medium">光鸭类型</p>
+          <p className="mt-1 text-xs text-muted-foreground">官方光鸭与三方光鸭连接彼此独立，凭据均由服务端加密保存。</p>
         </div>
         {authorization && <StatusPill tone={getAuthorizationTone(authorization.status)}>{authorizationStatusLabels[authorization.status]}</StatusPill>}
       </div>
@@ -295,14 +295,14 @@ export function GuangyaAuthorizationPanel({
       {loginMode === "official_api" && (
         <div className="mt-4 rounded-lg border border-border bg-background/35 p-4">
           <p className="text-sm font-medium">仅支持从 Flymby APP 同步</p>
-          <p className="mt-2 text-xs leading-6 text-muted-foreground">先在 Flymby APP 中完成光鸭官方 API 登录，再由 APP 使用当前 Fly云助手账号调用服务连接接口同步。Fly云助手前台不提供官方 API 登录入口。</p>
+          <p className="mt-2 text-xs leading-6 text-muted-foreground">先在 Flymby APP 中完成官方光鸭登录，再由 APP 使用当前 Fly云助手账号同步。Fly云助手前台不提供官方光鸭登录入口。</p>
         </div>
       )}
 
       {loginMode === "web_qr" && authorization?.authMethod === "qr" && authorization.status === "pending" && (
         <div className="mt-4 grid gap-4 rounded-lg border border-border bg-background/35 p-4 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center">
           <div className="w-fit rounded-lg bg-white p-2">
-            <QRCodeSVG value={verificationAddress} size={176} bgColor="#ffffff" fgColor="#111827" level="M" marginSize={1} title="光鸭网页二维码登录" />
+            <QRCodeSVG value={verificationAddress} size={176} bgColor="#ffffff" fgColor="#111827" level="M" marginSize={1} title="三方光鸭扫码登录" />
           </div>
           <div>
             <p className="text-sm font-medium">使用光鸭 APP 扫描并确认登录</p>
@@ -321,7 +321,7 @@ export function GuangyaAuthorizationPanel({
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-secondary/35 p-3 sm:col-span-2">
               <div>
                 <p className="text-sm font-medium">需要完成人机验证</p>
-                <p className="mt-1 text-xs text-muted-foreground">验证页面由光鸭官方提供，有效期至 {new Date(captchaChallenge.expiresAt).toLocaleTimeString("zh-CN")}。</p>
+                <p className="mt-1 text-xs text-muted-foreground">验证页面由光鸭官网提供，有效期至 {new Date(captchaChallenge.expiresAt).toLocaleTimeString("zh-CN")}。</p>
               </div>
               <PrimaryButton type="button" disabled={working} onClick={openCaptchaVerification}><ShieldCheck className="size-4" />打开官方验证页面</PrimaryButton>
             </div>
@@ -339,14 +339,14 @@ export function GuangyaAuthorizationPanel({
       )}
 
       {authorization?.status === "authorized" && <p className="mt-4 text-sm text-success">已完成{loginModeLabels[loginMode]}{authorization.accountLabel ? `，账号 ${authorization.accountLabel}` : ""}。</p>}
-      {(authorization?.status === "expired" || authorization?.status === "failed") && <p className="mt-4 text-sm text-destructive">{authorization.errorMessage || "本次光鸭网页登录未完成，请重新登录"}</p>}
+      {(authorization?.status === "expired" || authorization?.status === "failed") && <p className="mt-4 text-sm text-destructive">{authorization.errorMessage || "本次三方光鸭登录未完成，请重新登录"}</p>}
 
       {loginMode === "web_qr" && (
         <div className="mt-4 flex flex-wrap items-center gap-3">
           {authorization ? (
             <SecondaryButton type="button" disabled={working || authorization.status === "pending"} onClick={() => void startQrAuthorization()}>{working ? <LoaderCircle className="size-4 animate-spin" /> : <RotateCcw className="size-4" />}重新获取二维码</SecondaryButton>
           ) : (
-            <PrimaryButton type="button" disabled={working} onClick={() => void startQrAuthorization()}>{working ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}{working ? "正在获取…" : "开始网页二维码登录"}</PrimaryButton>
+            <PrimaryButton type="button" disabled={working} onClick={() => void startQrAuthorization()}>{working ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}{working ? "正在获取…" : "开始三方光鸭扫码登录"}</PrimaryButton>
           )}
         </div>
       )}

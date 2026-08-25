@@ -12,6 +12,9 @@ import type { ServiceRepository } from "./service-repository.js";
 import type { ServiceMigrationRepository } from "./service-migration-repository.js";
 import type { ServiceMigrationWorker } from "./service-migration-worker.js";
 import type { ScanWorker } from "./worker.js";
+import type { PublicAccessService } from "./public-access.js";
+import type { ServiceAccessService } from "./service-access.js";
+import type { MediaProbeWorker } from "./media-probe-worker.js";
 
 /** 后台路由共享的已初始化运行时依赖。 */
 export interface ApiRuntime {
@@ -26,9 +29,12 @@ export interface ApiRuntime {
   tmdb: TmdbKeyPool;
   musicBrainz: MusicBrainzClient;
   worker: ScanWorker;
+  mediaProbeWorker: MediaProbeWorker;
   plugins: MetadataPluginManager;
   exports: LibraryExportService;
   failureReports: ScanFailureReportService;
+  publicAccess: PublicAccessService;
+  serviceAccess: ServiceAccessService;
   logBusinessEvent: (
     level: "info" | "warn",
     fields: Record<string, string | number | boolean | null>,

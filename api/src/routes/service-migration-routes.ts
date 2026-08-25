@@ -262,7 +262,7 @@ export async function registerServiceMigrationRoutes(
     const serviceId = randomUUID();
     const libraryId = randomUUID();
     const migrationId = randomUUID();
-    const service = await runtime.repository.createService({
+    const creation = await runtime.repository.createService({
       serviceId,
       libraryId,
       userId: user.id,
@@ -276,6 +276,7 @@ export async function registerServiceMigrationRoutes(
       binding: { id: randomUUID(), clientDeviceId, clientServiceId },
       initialStatus: "disabled",
     });
+    const service = creation.service;
     try {
       const migration = await runtime.migrations.create({
         migrationId,

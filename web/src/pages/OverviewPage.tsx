@@ -91,9 +91,9 @@ export function OverviewPage() {
                 <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium">{job.serviceName}</p>
-                    <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{job.id} · {job.scanMode === "full" ? "全量" : "增量"} · {job.stage}</p>
+                    <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{job.id} · {job.jobType === "media_probe" ? "视频规格分析" : `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`} · {job.stage}</p>
                   </div>
-                  <StatusPill tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{jobStatusLabels[job.status]}</StatusPill>
+                  <StatusPill tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{job.status === "retry_waiting" && job.jobType === "media_probe" ? "等待重试" : jobStatusLabels[job.status]}</StatusPill>
                 </div>
                 <div className="mt-2.5 flex items-center gap-3">
                   <ProgressMeter value={job.processedCount} total={job.totalCount} />
@@ -101,7 +101,7 @@ export function OverviewPage() {
                 </div>
               </li>
             ))}
-            {jobs.length === 0 && <li className="py-6 text-center text-sm text-muted-foreground">还没有扫描任务</li>}
+            {jobs.length === 0 && <li className="py-6 text-center text-sm text-muted-foreground">还没有后台任务</li>}
           </ul>
         </Panel>
       </div>

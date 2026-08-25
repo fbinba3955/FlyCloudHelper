@@ -6,7 +6,7 @@ import { providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileStreamAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
 
-interface RelayLibraryRow {
+export interface RelayLibraryRow {
   id: string;
   service_id: string;
   provider_type: string;
@@ -45,7 +45,7 @@ function readRangeHeader(request: FastifyRequest): string | null {
 }
 
 /** 生成上游媒体请求头，只增加播放所需字段，不转发 APP 的认证信息。 */
-function buildUpstreamHeaders(
+export function buildUpstreamHeaders(
   request: FastifyRequest,
   providerHeaders: Record<string, string>,
 ): Record<string, string> {
@@ -65,7 +65,7 @@ function buildUpstreamHeaders(
 }
 
 /** 仅复制媒体播放需要的上游响应头，过滤 Cookie、认证挑战和连接级响应头。 */
-function copyMediaResponseHeaders(reply: FastifyReply, headers: IncomingHttpHeaders): void {
+export function copyMediaResponseHeaders(reply: FastifyReply, headers: IncomingHttpHeaders): void {
   const allowedHeaders = [
     "accept-ranges",
     "content-disposition",
@@ -89,7 +89,7 @@ function copyMediaResponseHeaders(reply: FastifyReply, headers: IncomingHttpHead
 }
 
 /** 根据服务凭据和源文件 locator 解析仅供服务端使用的上游媒体地址。 */
-async function resolveRelayAccess(
+export async function resolveRelayAccess(
   runtime: ApiRuntime,
   library: RelayLibraryRow,
   userId: string,

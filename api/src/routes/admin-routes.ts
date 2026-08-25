@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { FastifyInstance } from "fastify";
 import { authenticateUser, createUsernameLookup, hashPassword, validatePassword, validatePasswordConfirmation, validateUsername } from "../auth.js";
 import type { JobStatus, MatchState, MediaType, ServiceStatus, UserRole, UserStatus } from "../domain.js";
@@ -64,6 +66,18 @@ async function requireRecentAuthentication(runtime: ApiRuntime, operator: { user
   await authenticateUser(runtime.database, operator.username, body.currentPassword);
 }
 
+/** 删除指定根目录内当前用户独占的数据目录，不允许目录范围越出配置根路径。 */
+async function removeUserOwnedDirectory(rootDirectory: string, userId: string): Promise<void> {
+  const resolvedRoot = path.resolve(rootDirectory);
+  const resolvedTarget = path.resolve(resolvedRoot, userId);
+  // 关键变量：用户 ID 必须只解析为根目录下的一个直接子目录。
+  const relativeTarget = path.relative(resolvedRoot, resolvedTarget);
+  if (!relativeTarget || relativeTarget === ".." || relativeTarget.startsWith(`..${path.sep}`) || path.isAbsolute(relativeTarget)) {
+    throw new ApiError(500, "invalid_user_data_directory", "用户数据目录不正确，无法彻底删除");
+  }
+  await fs.rm(resolvedTarget, { recursive: true, force: true });
+}
+
 /** 返回不含 Key 原文或局部值的 TMDB 系统配置状态。 */
 async function getTmdbConfigurationStatus(runtime: ApiRuntime) {
   const setting = await runtime.database.getSystemSecretSetting(tmdbKeySettingName);
@@ -91,20 +105,23 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       userCount: Number(userCount?.count ?? 0),
       ...overview,
       worker: runtime.worker.getStatus(),
+      mediaProbeWorker: runtime.mediaProbeWorker.getStatus(),
       database: { type: runtime.config.databaseType, connected: true },
     };
   });
 
   server.get("/api/v1/admin/config/status", async (request) => {
     await requireSuperAdmin(request, runtime.database);
-    const [pluginCount, enabledPluginCount, tmdbStatus] = await Promise.all([
+    const [pluginCount, enabledPluginCount, tmdbStatus, publicAccess] = await Promise.all([
       runtime.database.query("metadata_plugin_versions").count<{ count: string | number }[]>({ count: "id" }).first(),
       runtime.database.query("metadata_plugin_versions").where({ status: "enabled" }).count<{ count: string | number }[]>({ count: "id" }).first(),
       getTmdbConfigurationStatus(runtime),
+      runtime.publicAccess.getStatus(),
     ]);
     return {
       database: { type: runtime.config.databaseType, schemaVersion: (await runtime.database.getSystemState()).schemaVersion },
       tmdb: tmdbStatus,
+      publicAccess,
       music: {
         musicBrainz: { status: "unavailable", reasonCode: "media_type_not_enabled" },
         acoustId: {
@@ -343,6 +360,12 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const targetUser = await runtime.database.findPublicUserById(request.params.userId);
     await runtime.database.updateUserStatus(request.params.userId, "pending_delete");
     await audit(runtime, operator, "schedule_user_delete", "user", request.params.userId);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-user-action",
+      事件: "管理员删除用户",
+      用户ID: operator.id,
+      目标用户ID: targetUser.id,
+    });
     await runtime.database.createNotificationSafely({
       userId: targetUser.id,
       category: "security",
@@ -362,15 +385,59 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     return reply.status(202).send({ status: "pending_delete" });
   });
 
+  /** 彻底清理已经处于待删除状态的其他用户。 */
+  server.delete<{ Params: { userId: string }; Body: Record<string, unknown> }>("/api/v1/admin/users/:userId/purge", async (request, reply) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    requireConfirmation(request.body, request.params.userId);
+    if (request.params.userId === operator.id) {
+      throw new ApiError(409, "cannot_delete_current_user", "不能删除当前登录的超级管理员");
+    }
+    const targetUser = await runtime.database.assertUserCanBePurged(request.params.userId);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-user-action",
+      事件: "管理员开始彻底删除用户",
+      用户ID: operator.id,
+      目标用户ID: targetUser.id,
+    });
+    try {
+      await Promise.all([
+        removeUserOwnedDirectory(runtime.config.exportDirectory, targetUser.id),
+        removeUserOwnedDirectory(path.join(runtime.config.exportDirectory, "scan-failures"), targetUser.id),
+        removeUserOwnedDirectory(runtime.config.migrationDirectory, targetUser.id),
+      ]);
+      await runtime.database.purgePendingUser(targetUser.id);
+      await audit(runtime, operator, "purge_user", "user", null);
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-helper-user-action",
+        事件: "管理员彻底删除用户完成",
+        用户ID: operator.id,
+        目标用户ID: targetUser.id,
+      });
+      return reply.status(204).send();
+    } catch (error) {
+      runtime.logBusinessEvent("warn", {
+        日志关键字: "codex-flycloud-helper-user-action",
+        事件: "管理员彻底删除用户失败",
+        用户ID: operator.id,
+        目标用户ID: targetUser.id,
+        错误信息: error instanceof Error ? error.message : "未知错误",
+      });
+      throw error;
+    }
+  });
+
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/services", async (request) => {
     await requireSuperAdmin(request, runtime.database);
-    return runtime.repository.listServices({
+    const result = await runtime.repository.listServices({
       userId: typeof request.query.userId === "string" ? request.query.userId : undefined,
       providerType: typeof request.query.providerType === "string" ? request.query.providerType : undefined,
       status: typeof request.query.status === "string" ? request.query.status as ServiceStatus : undefined,
       keyword: typeof request.query.search === "string" ? request.query.search : undefined,
       ...readPagination(request.query),
     });
+    // 关键变量：管理端列表仅追加登录类型，用于区分官方光鸭和三方光鸭。
+    const items = await Promise.all(result.items.map((service) => attachConnectionAuthMode(runtime, service)));
+    return { ...result, items };
   });
 
   server.post<{ Body: Record<string, unknown> }>("/api/v1/admin/services", async (request, reply) => {
@@ -397,7 +464,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       adapter.descriptor.recommendedScanSettings,
     );
     await validateProviderAccess(adapter, connection, scanProfile);
-    const service = await runtime.repository.createService({
+    const creation = await runtime.repository.createService({
       serviceId: randomUUID(),
       libraryId: randomUUID(),
       userId: owner.id,
@@ -412,6 +479,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
         dataType,
       ),
     });
+    const service = creation.service;
     consumeProviderAuthorization(runtime, operator.id, resolvedConnection.authorizationSessionId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-service-data-type",
@@ -445,7 +513,13 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       网盘类型: providerType,
       数据类型: dataType,
     });
-    return reply.status(201).send({ service });
+    return reply.status(201).send({
+      service,
+      serviceAccessCredentials: {
+        username: creation.accessCredentials.account.username,
+        password: creation.accessCredentials.password,
+      },
+    });
   });
 
   server.get<{ Params: { serviceId: string } }>("/api/v1/admin/services/:serviceId", async (request) => {
@@ -714,10 +788,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/metadata-profile", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+    const profile = validateMetadataProfile(requireObject(request.body, "metadata", "元数据配置"), service.dataType);
     const updated = await runtime.repository.updateMetadataProfile(
       service.id,
       service.userId,
-      validateMetadataProfile(requireObject(request.body, "metadata", "元数据配置"), service.dataType),
+      profile,
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-metadata-profile",
@@ -728,6 +803,44 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     });
     await audit(runtime, operator, "update_service_metadata_profile", "service", service.id);
     return { service: updated };
+  });
+
+  /** 管理员手动为服务中已有但缺少规格的视频建立独立后台任务。 */
+  server.post<{ Params: { serviceId: string } }>("/api/v1/admin/services/:serviceId/media-probes/backfill", async (request, reply) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+    if (service.dataType !== "video") throw new ApiError(409, "media_probe_video_only", "只有影视服务可以分析视频规格");
+    if (service.status !== "active" && service.status !== "reauthorization_required") {
+      throw new ApiError(409, "service_not_active", "请先启用服务，再分析已有视频规格");
+    }
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-media-ffprobe-backfill",
+      事件: "开始创建已有视频规格后台任务",
+      管理员ID: operator.id,
+      目标用户ID: service.userId,
+      服务ID: service.id,
+    });
+    const result = await runtime.repository.enqueueExistingServiceMediaProbes(service.id, service.userId, operator.id);
+    const job = result.jobId
+      ? service.status === "reauthorization_required"
+        ? await runtime.repository.waitMediaProbeJobForReauthorization(result.jobId)
+        : await runtime.repository.getJob(result.jobId)
+      : null;
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-media-ffprobe-backfill",
+      事件: "管理员触发已有视频规格分析",
+      管理员ID: operator.id,
+      目标用户ID: service.userId,
+      服务ID: service.id,
+      后台任务ID: result.jobId,
+      入队文件数量: result.queuedCount,
+      是否等待重新授权: service.status === "reauthorization_required",
+    });
+    await audit(runtime, operator, "backfill_media_probes", "background_job", result.jobId ?? service.id, {
+      服务ID: service.id,
+      入队文件数量: result.queuedCount,
+    });
+    return reply.status(result.jobId ? 202 : 200).send({ job, queuedCount: result.queuedCount });
   });
 
   server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/playback-settings", async (request) => {
@@ -904,33 +1017,47 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.post<{ Params: { jobId: string } }>("/api/v1/admin/jobs/:jobId/cancel", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const job = await runtime.repository.requestJobControl(request.params.jobId, undefined, "cancel");
-    const interrupted = runtime.worker.interruptJobControl(job.id, "cancel");
+    const interrupted = job.jobType === "media_probe"
+      ? runtime.mediaProbeWorker.interruptJobControl(job.id, "cancel")
+      : runtime.worker.interruptJobControl(job.id, "cancel");
+    // 规格分析任务可能正处于两个文件之间；没有 ffprobe 可中断时由接口直接完成状态切换。
+    const updatedJob = job.jobType === "media_probe" && !interrupted && job.status === "running"
+      ? await runtime.repository.applyMediaProbeJobControl(job.id, "cancel")
+      : job;
     await audit(runtime, operator, "cancel_scan_job", "scan_job", job.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-control",
-      事件: "管理员终止扫描任务",
+      事件: "管理员终止后台任务",
       管理员ID: operator.id,
       任务ID: job.id,
+      后台任务类型: job.jobType,
       控制动作: "cancel",
       是否中断运行请求: interrupted,
     });
-    return { job };
+    return { job: updatedJob };
   });
 
   server.post<{ Params: { jobId: string } }>("/api/v1/admin/jobs/:jobId/pause", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const job = await runtime.repository.requestJobControl(request.params.jobId, undefined, "pause");
-    const interrupted = runtime.worker.interruptJobControl(job.id, "pause");
+    const interrupted = job.jobType === "media_probe"
+      ? runtime.mediaProbeWorker.interruptJobControl(job.id, "pause")
+      : runtime.worker.interruptJobControl(job.id, "pause");
+    // 规格分析任务可能正处于两个文件之间；没有 ffprobe 可中断时由接口直接完成状态切换。
+    const updatedJob = job.jobType === "media_probe" && !interrupted && job.status === "running"
+      ? await runtime.repository.applyMediaProbeJobControl(job.id, "pause")
+      : job;
     await audit(runtime, operator, "pause_scan_job", "scan_job", job.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-control",
-      事件: "管理员暂停扫描任务",
+      事件: "管理员暂停后台任务",
       管理员ID: operator.id,
       任务ID: job.id,
+      后台任务类型: job.jobType,
       控制动作: "pause",
       是否中断运行请求: interrupted,
     });
-    return { job };
+    return { job: updatedJob };
   });
 
   server.post<{ Params: { jobId: string } }>("/api/v1/admin/jobs/:jobId/resume", async (request) => {
@@ -939,7 +1066,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     await audit(runtime, operator, "resume_scan_job", "scan_job", job.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-control",
-      事件: "管理员继续扫描任务",
+      事件: "管理员继续后台任务",
       管理员ID: operator.id,
       任务ID: job.id,
       控制动作: "resume",
@@ -952,11 +1079,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     requireConfirmation(request.body, request.params.jobId);
     const job = await runtime.repository.getJob(request.params.jobId);
     await runtime.repository.deleteScanJob(request.params.jobId);
-    await runtime.failureReports.remove(job);
+    if (job.jobType === "scan") await runtime.failureReports.remove(job);
     await audit(runtime, operator, "delete_scan_job", "scan_job", request.params.jobId);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-delete",
-      事件: "管理员删除扫描任务",
+      事件: "管理员删除后台任务",
       管理员ID: operator.id,
       任务ID: request.params.jobId,
     });
@@ -967,6 +1094,18 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.post<{ Params: { jobId: string }; Body: Record<string, unknown> }>("/api/v1/admin/jobs/:jobId/retry", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const sourceJob = await runtime.repository.getJob(request.params.jobId);
+    if (sourceJob.jobType === "media_probe") {
+      const job = await runtime.repository.retryMediaProbeJob(sourceJob.id, undefined, operator.id);
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-media-ffprobe",
+        事件: "管理员重试规格后台任务",
+        管理员ID: operator.id,
+        原任务ID: sourceJob.id,
+        新任务ID: job.id,
+      });
+      await audit(runtime, operator, "retry_media_probe_job", "background_job", job.id, { 原任务ID: sourceJob.id });
+      return reply.status(202).send({ job });
+    }
     if (sourceJob.status !== "failed" && sourceJob.status !== "cancelled") {
       throw new ApiError(409, "job_not_retryable", "只有失败或已取消任务可以重试");
     }
@@ -994,6 +1133,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     });
     await audit(runtime, operator, "retry_scan_job", "scan_job", job.id, { 原任务ID: sourceJob.id });
     return reply.status(202).send({ job });
+  });
+
+  server.get<{ Params: { jobId: string } }>("/api/v1/admin/jobs/:jobId/media-probe-failures", async (request) => {
+    await requireSuperAdmin(request, runtime.database);
+    return { items: await runtime.repository.listMediaProbeJobFailures(request.params.jobId) };
   });
 
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/jobs/events", async (request, reply) => {

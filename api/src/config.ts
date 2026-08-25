@@ -9,6 +9,8 @@ export type DatabaseType = "sqlite" | "postgres" | "mysql";
 export interface ApiConfig {
   host: string;
   port: number;
+  /** 对外公布的实例根地址；配置时优先于数据库设置。 */
+  publicBaseUrlOverride: string | null;
   databaseType: DatabaseType;
   sqlitePath: string;
   databaseUrl: string | null;
@@ -30,6 +32,14 @@ export interface ApiConfig {
   workerEnabled: boolean;
   workerConcurrency: number;
   workerPollIntervalMs: number;
+  /** ffprobe 可执行文件；Docker 镜像固定为 /usr/bin/ffprobe。 */
+  ffprobePath: string;
+  /** 媒体规格独立 Worker 的低并发数量。 */
+  mediaProbeConcurrency: number;
+  mediaProbePollIntervalMs: number;
+  ffprobeTimeoutMs: number;
+  ffprobeAnalyzeDurationUs: number;
+  ffprobeProbeSizeBytes: number;
   pluginDirectory: string;
   exportDirectory: string;
   migrationDirectory: string;
@@ -91,6 +101,20 @@ function readBoolean(name: string, fallback: boolean): boolean {
     return false;
   }
   throw new Error(`环境变量 ${name} 只能是 true 或 false`);
+}
+
+/** 校验环境变量中的公开根地址，避免生成带凭据或查询参数的协议地址。 */
+function validateConfiguredPublicBaseUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("环境变量 FLYCLOUDHELPER_PUBLIC_BASE_URL 必须是完整 HTTP 或 HTTPS 地址");
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error("环境变量 FLYCLOUDHELPER_PUBLIC_BASE_URL 不能包含账号、查询参数或片段");
+  }
+  return url.href.replace(/\/+$/u, "");
 }
 
 /** 把项目相对路径或绝对路径解析为可直接使用的路径。 */
@@ -287,6 +311,9 @@ export function loadApiConfig(): ApiConfig {
   return {
     host: readEnvironmentValue("FLYCLOUDHELPER_API_HOST") || "0.0.0.0",
     port: readPositiveInteger("FLYCLOUDHELPER_API_PORT", 9934),
+    publicBaseUrlOverride: readEnvironmentValue("FLYCLOUDHELPER_PUBLIC_BASE_URL")
+      ? validateConfiguredPublicBaseUrl(readEnvironmentValue("FLYCLOUDHELPER_PUBLIC_BASE_URL") as string)
+      : null,
     databaseType,
     sqlitePath: resolveSqlitePath(),
     databaseUrl,
@@ -318,6 +345,12 @@ export function loadApiConfig(): ApiConfig {
     workerEnabled: readBoolean("FLYCLOUDHELPER_WORKER_ENABLED", true),
     workerConcurrency: readPositiveInteger("FLYCLOUDHELPER_WORKER_CONCURRENCY", 2),
     workerPollIntervalMs: readPositiveInteger("FLYCLOUDHELPER_WORKER_POLL_INTERVAL_MS", 1000),
+    ffprobePath: readEnvironmentValue("FLYCLOUDHELPER_FFPROBE_PATH") || "ffprobe",
+    mediaProbeConcurrency: readPositiveInteger("FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY", 1),
+    mediaProbePollIntervalMs: readPositiveInteger("FLYCLOUDHELPER_MEDIA_PROBE_POLL_INTERVAL_MS", 2000),
+    ffprobeTimeoutMs: readPositiveInteger("FLYCLOUDHELPER_FFPROBE_TIMEOUT_MS", 60_000),
+    ffprobeAnalyzeDurationUs: readPositiveInteger("FLYCLOUDHELPER_FFPROBE_ANALYZE_DURATION_US", 10_000_000),
+    ffprobeProbeSizeBytes: readPositiveInteger("FLYCLOUDHELPER_FFPROBE_PROBE_SIZE_BYTES", 10 * 1024 * 1024),
     pluginDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_PLUGIN_DIR"), "data/plugins"),
     exportDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_EXPORT_DIR"), "data/exports"),
     migrationDirectory: resolveProjectPath(

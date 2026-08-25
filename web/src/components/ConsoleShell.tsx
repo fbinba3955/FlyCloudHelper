@@ -63,7 +63,7 @@ function formatNotificationTime(createdAt: string): string {
 const userNavigation: NavigationItem[] = [
   { to: "/app", label: "概览", icon: LayoutDashboard },
   { to: "/app/services", label: "我的服务", icon: HardDrive },
-  { to: "/app/jobs", label: "扫描任务", icon: ListChecks },
+  { to: "/app/jobs", label: "后台任务", icon: ListChecks },
   { to: "/app/catalog", label: "媒体库", icon: LibraryBig },
 ];
 
@@ -72,7 +72,7 @@ const adminNavigation: NavigationItem[] = [
   { to: "/admin", label: "管理概览", icon: Activity },
   { to: "/admin/users", label: "用户管理", icon: Users },
   { to: "/admin/services", label: "全部服务", icon: HardDrive },
-  { to: "/admin/jobs", label: "扫描任务", icon: ListChecks },
+  { to: "/admin/jobs", label: "后台任务", icon: ListChecks },
   { to: "/admin/catalog", label: "媒体库", icon: LibraryBig },
   { to: "/admin/plugins", label: "插件管理", icon: Puzzle },
   { to: "/admin/config", label: "系统配置", icon: Settings2 },

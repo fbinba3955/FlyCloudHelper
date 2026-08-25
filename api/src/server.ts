@@ -19,9 +19,13 @@ import { registerGuangyaAuthRoutes } from "./routes/guangya-auth-routes.js";
 import { registerMediaStreamRoutes } from "./routes/media-stream-routes.js";
 import { registerNotificationRoutes } from "./routes/notification-routes.js";
 import { registerPluginRoutes } from "./routes/plugin-routes.js";
+import { PublicAccessService } from "./public-access.js";
+import { ServiceAccessService } from "./service-access.js";
 import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
 import { registerServiceMigrationRoutes } from "./routes/service-migration-routes.js";
+import { registerServiceAccessRoutes } from "./routes/service-access-routes.js";
+import { registerJellyfinRoutes } from "./routes/jellyfin-routes.js";
 import type { ApiRuntime } from "./runtime.js";
 import { ScanFailureReportService } from "./scan-failure-report-service.js";
 import { CredentialVault } from "./secrets.js";
@@ -30,6 +34,7 @@ import { ServiceMigrationRepository } from "./service-migration-repository.js";
 import { ServiceMigrationWorker } from "./service-migration-worker.js";
 import { loadTmdbKeys } from "./system-settings.js";
 import { ScanWorker } from "./worker.js";
+import { MediaProbeWorker } from "./media-probe-worker.js";
 
 /** 判断当前 API 是否允许在首次初始化未完成时访问。 */
 function isSetupPublicPath(url: string): boolean {
@@ -106,6 +111,15 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const providers = new ProviderRegistry(config, (fields) => logger("warn", fields));
   const vault = new CredentialVault(config.credentialMasterKey);
   const repository = new ServiceRepository(database);
+  const publicAccess = new PublicAccessService(database, config);
+  const serviceAccess = new ServiceAccessService(database);
+  const backfilledServiceAccessAccounts = await serviceAccess.ensureExistingServices();
+  if (backfilledServiceAccessAccounts > 0) {
+    logger("info", {
+      日志关键字: "codex-jellyfin-compat", 事件: "为历史服务补齐独立访问账号",
+      补齐账号数量: backfilledServiceAccessAccounts,
+    });
+  }
   const migrations = new ServiceMigrationRepository(database);
   const tmdbCache = new TmdbMetadataCache(database, logger);
   const tmdb = new TmdbKeyPool(
@@ -136,6 +150,14 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     logger: server.log,
     config,
   });
+  const mediaProbeWorker = new MediaProbeWorker({
+    database,
+    repository,
+    providers,
+    vault,
+    logger: server.log,
+    config,
+  });
   const migrationWorker = new ServiceMigrationWorker({
     database,
     repository: migrations,
@@ -155,9 +177,12 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     tmdb,
     musicBrainz,
     worker,
+    mediaProbeWorker,
     plugins,
     exports,
     failureReports,
+    publicAccess,
+    serviceAccess,
     logBusinessEvent: logger,
   };
 
@@ -173,12 +198,15 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   server.addHook("onClose", async () => {
     await migrationWorker.stop();
     await worker.stop();
+    await mediaProbeWorker.stop();
     await tmdbCache.close();
     await database.close();
   });
 
   server.addHook("preHandler", async (request) => {
-    const systemState = request.url.startsWith("/api/") ? await database.getSystemState() : null;
+    // 关键变量：Jellyfin 同样依赖数据库和凭据主密钥，初始化或主密钥待备份时不能绕过后台保护状态。
+    const requiresReadyState = request.url.startsWith("/api/") || request.url.startsWith("/jellyfin/");
+    const systemState = requiresReadyState ? await database.getSystemState() : null;
     if (systemState?.setupRequired && !isSetupPublicPath(request.url)) {
       throw new ApiError(503, "setup_required", "实例尚未完成首次初始化");
     }
@@ -259,6 +287,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     status: "ok",
     databaseType: config.databaseType,
     worker: worker.getStatus(),
+    mediaProbeWorker: mediaProbeWorker.getStatus(),
   }));
 
   server.get("/api/v1/system/info", async () => {
@@ -311,6 +340,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
         catalogQuery: true,
         catalogExport: true,
         relayPlayback: true,
+        jellyfinCompatibility: true,
       },
     };
   });
@@ -318,10 +348,12 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerAuthRoutes(server, { config, database, logBusinessEvent: logger });
   await registerGuangyaAuthRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
+  await registerServiceAccessRoutes(server, runtime);
   await registerServiceMigrationRoutes(server, runtime);
   await registerScanFailureReportRoutes(server, runtime);
   await registerCatalogRoutes(server, runtime);
   await registerMediaStreamRoutes(server, runtime);
+  await registerJellyfinRoutes(server, runtime);
   await registerNotificationRoutes(server, runtime);
   await registerAdminRoutes(server, runtime);
   await registerPluginRoutes(server, runtime);
@@ -333,7 +365,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       wildcard: false,
     });
     server.setNotFoundHandler((request, reply) => {
-      if (request.url.startsWith("/api/")) {
+      if (request.url.startsWith("/api/") || request.url.startsWith("/jellyfin/")) {
         return reply.status(404).send({ error: { code: "not_found", message: "接口不存在" } });
       }
       return reply.sendFile("index.html");
@@ -352,7 +384,16 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       迁移数量: recoveredMigrations,
     });
   }
+  const recoveredMediaProbes = await mediaProbeWorker.recoverInterrupted();
+  if (recoveredMediaProbes > 0) {
+    logger("warn", {
+      日志关键字: "codex-media-ffprobe",
+      事件: "恢复中断媒体规格任务",
+      任务数量: recoveredMediaProbes,
+    });
+  }
   migrationWorker.start();
   worker.start();
+  mediaProbeWorker.start();
   return server;
 }

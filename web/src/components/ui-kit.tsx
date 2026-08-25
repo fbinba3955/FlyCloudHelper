@@ -142,6 +142,20 @@ export function FilterChip({
   );
 }
 
+/** 把 ffprobe 视频高度转换为海报上的简短清晰度。 */
+function formatPosterResolution(width: number, height: number): string {
+  if (width >= 3800 || height >= 2100) return "4K";
+  if (width >= 2500 || height >= 1400) return "2K";
+  if (height > 0) return `${height}P`;
+  return "";
+}
+
+/** 把 ffprobe 编码名称转换为用户熟悉的显示名称。 */
+function formatPosterCodec(codec: string): string {
+  const labels: Record<string, string> = { h264: "H.264", hevc: "H.265", h265: "H.265", av1: "AV1", vp9: "VP9" };
+  return labels[codec.toLocaleLowerCase("zh-CN")] ?? codec.toLocaleUpperCase("zh-CN");
+}
+
 /** 展示可进入只读详情、但不提供播放能力的媒体海报卡片。 */
 export function PosterCard({ item, onClick }: { item: MediaItem; onClick?: () => void }) {
   const statusTone: Record<MatchState, StatusTone> = {
@@ -164,6 +178,13 @@ export function PosterCard({ item, onClick }: { item: MediaItem; onClick?: () =>
     "audiobook.book": "有声书",
   };
   const hue = [...item.id].reduce((sum, character) => sum + character.charCodeAt(0), 0) % 360;
+  const mediaProbeSummary = item.mediaProbeSummary;
+  // 关键变量：海报只保留最有辨识度的三个规格，完整音视频流放在详情中展示。
+  const mediaSpecLabels = mediaProbeSummary ? [
+    formatPosterResolution(mediaProbeSummary.width, mediaProbeSummary.height),
+    formatPosterCodec(mediaProbeSummary.videoCodec),
+    mediaProbeSummary.videoRangeType || (mediaProbeSummary.videoRange === "HDR" ? "HDR" : ""),
+  ].filter(Boolean).slice(0, 3) : [];
 
   return (
     <button
@@ -189,6 +210,15 @@ export function PosterCard({ item, onClick }: { item: MediaItem; onClick?: () =>
         <span className="font-display absolute top-3 left-3 text-[11px] tracking-[0.2em] text-foreground/70 uppercase">
           {itemTypeLabels[item.itemType] ?? mediaTypeLabels[item.mediaType]}
         </span>
+        {mediaSpecLabels.length > 0 && (
+          <div className="absolute top-2.5 right-2.5 flex max-w-[65%] flex-wrap justify-end gap-1">
+            {mediaSpecLabels.map((label) => (
+              <span key={label} className="rounded-md border border-white/20 bg-black/65 px-1.5 py-0.5 text-[9px] font-semibold text-white shadow-sm backdrop-blur-sm">
+                {label}
+              </span>
+            ))}
+          </div>
+        )}
         <div className="absolute inset-x-3 bottom-3">
           <StatusPill tone={statusTone[item.matchState]}>{statusLabels[item.matchState]}</StatusPill>
         </div>
@@ -197,6 +227,12 @@ export function PosterCard({ item, onClick }: { item: MediaItem; onClick?: () =>
       <p className="truncate text-[11px] text-muted-foreground">
         {item.subtitle || item.itemType} · {item.year ?? "年份未知"}
       </p>
+      {mediaProbeSummary && (
+        <p className="mt-1 truncate text-[10px] text-muted-foreground">
+          已分析 {mediaProbeSummary.analyzedFileCount}/{item.fileCount || mediaProbeSummary.analyzedFileCount}
+          {mediaProbeSummary.container ? ` · ${mediaProbeSummary.container.toLocaleUpperCase("zh-CN")}` : ""}
+        </p>
+      )}
     </button>
   );
 }

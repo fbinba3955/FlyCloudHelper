@@ -7,6 +7,7 @@ import {
   type ProviderEnumerationOptions,
   type ProviderEnumerationWarning,
   type ProviderValidationResult,
+  type ProviderFileAccess,
   type ScanRoot,
   createFlymbyRecommendedScanSettings,
   requireConnectionString,
@@ -30,7 +31,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
     displayName: "阿里云盘",
     adapterVersion: "1.0.0",
     credentialSchemaVersion: 1,
-    capabilities: ["list", "stableResourceId", "playbackLocator"],
+    capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
     recommendedScanSettings: createFlymbyRecommendedScanSettings(),
     connectionFields: [
       { name: "accessToken", label: "Access Token", type: "password", required: true, secret: true },
@@ -159,6 +160,28 @@ export class AliyunDriveProvider implements ProviderAdapter {
         }
       }
     }
+  }
+
+  /** 使用开放平台 file_id 换取短期下载地址，可直接下发或作为中转上游。 */
+  public async resolveFileAccess(connection: Record<string, unknown>, locator: Record<string, unknown>, signal?: AbortSignal): Promise<ProviderFileAccess> {
+    const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
+    const driveId = requireConnectionString(locator, "driveId", "Drive ID");
+    const fileId = requireConnectionString(locator, "fileId", "File ID");
+    const apiBase = typeof connection.apiBaseUrl === "string" && connection.apiBaseUrl ? connection.apiBaseUrl : "https://openapi.alipan.com";
+    const baseUrl = await validateProviderUrl(apiBase, this.networkOptions);
+    const response = await providerFetch(new URL("/adrive/v1.0/openFile/getDownloadUrl", baseUrl), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ drive_id: driveId, file_id: fileId }),
+    }, this.networkOptions, signal);
+    const payload = await response.json() as { url?: string; expiration?: string };
+    if (!payload.url) throw new Error("阿里云盘开放接口未返回下载地址");
+    return { url: payload.url, expiresAt: payload.expiration ?? null, headers: {} };
+  }
+
+  /** 阿里云盘短期地址不含额外请求凭据，可直接复用为中转上游。 */
+  public async resolveFileStreamAccess(connection: Record<string, unknown>, locator: Record<string, unknown>, signal?: AbortSignal): Promise<ProviderFileAccess> {
+    return this.resolveFileAccess(connection, locator, signal);
   }
 
   /** 请求阿里云盘开放接口文件分页。 */

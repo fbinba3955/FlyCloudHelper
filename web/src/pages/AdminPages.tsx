@@ -1,12 +1,14 @@
 import { Link } from "@tanstack/react-router";
 import { Plus, Puzzle, RefreshCw, Save, ServerCog, Trash2, Upload } from "lucide-react";
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatCard, StatusPill } from "@/components/ui-kit";
 import {
   clearAdminTmdbCache,
   createAdminUser,
+  deleteAdminUser,
   getAdminConfigStatus,
+  getCurrentUser,
   getAdminStatus,
   importPlugin,
   listAdminUsers,
@@ -14,9 +16,11 @@ import {
   listJobs,
   listPlugins,
   listServices,
+  purgeAdminUser,
   revokeAdminUserSessions,
   updateAdminUserStatus,
   updateAdminTmdbKeys,
+  updateAdminPublicBaseUrl,
   updatePluginStatus,
   type AdminConfigStatus,
   type AdminRuntimeStatus,
@@ -101,7 +105,7 @@ function SystemRuntimeSummary({ status }: { status: AdminRuntimeStatus }) {
       <SystemSummaryItem label="数据库连接" value={databaseTypeLabels[status.database.type]} status={status.database.connected ? "已连接" : "未连接"} tone={status.database.connected ? "success" : "danger"} />
       <SystemSummaryItem label="用户与服务" value={`${status.userCount} 个用户 · ${status.serviceCount} 个服务`} status="正常" tone="info" />
       <SystemSummaryItem label="媒体目录" value={`${status.mediaCount.toLocaleString()} 个条目`} status={`待确认 ${status.needsReviewCount}`} tone={status.needsReviewCount > 0 ? "warning" : "success"} />
-      <SystemSummaryItem label="扫描任务" value={`${status.activeJobCount} 个活动任务`} status={`失败 ${status.failedJobCount}`} tone={status.failedJobCount > 0 ? "danger" : "success"} />
+      <SystemSummaryItem label="后台任务" value={`${status.activeJobCount} 个活动任务`} status={`含失败 ${status.failedJobCount}`} tone={status.failedJobCount > 0 ? "danger" : "success"} />
       <SystemSummaryItem label="Worker 槽位" value={`${status.worker.availableSlots} 个可用槽位`} status={status.worker.running ? "运行中" : "已停止"} tone={status.worker.running ? "success" : "warning"} />
     </div>
   );
@@ -145,7 +149,7 @@ export function AdminOverviewPage() {
           <SystemConfigurationSummary config={config} />
         </Panel>
         <Panel title="最近任务" description="跨用户任务进度" className="xl:col-span-2">
-          <ul className="space-y-2.5">{jobs.slice(0, 8).map((job) => <li key={job.id} className="rounded-xl border border-border bg-secondary/40 p-3.5"><div className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="truncate text-sm">{job.serviceName}</p><p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{job.id} · {job.ownerUsername} · {job.stage}</p></div><StatusPill tone={job.status === "failed" ? "danger" : job.status === "completed" ? "success" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{jobStatusLabels[job.status]}</StatusPill></div><div className="mt-2.5"><ProgressMeter value={job.processedCount} total={job.totalCount} /></div></li>)}</ul>
+          <ul className="space-y-2.5">{jobs.slice(0, 8).map((job) => <li key={job.id} className="rounded-xl border border-border bg-secondary/40 p-3.5"><div className="flex items-center justify-between gap-3"><div className="min-w-0"><p className="truncate text-sm">{job.serviceName}</p><p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{job.id} · {job.ownerUsername} · {job.jobType === "media_probe" ? "视频规格分析" : "扫描刮削"} · {job.stage}</p></div><StatusPill tone={job.status === "failed" ? "danger" : job.status === "completed" ? "success" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{job.status === "retry_waiting" && job.jobType === "media_probe" ? "等待重试" : jobStatusLabels[job.status]}</StatusPill></div><div className="mt-2.5"><ProgressMeter value={job.processedCount} total={job.totalCount} /></div></li>)}</ul>
         </Panel>
       </div>
       <Panel title="需要处理的服务" className="mt-4"><div className="overflow-x-auto"><table className="w-full min-w-[620px] text-left text-xs"><thead className="text-[10px] text-muted-foreground uppercase"><tr><th className="pb-2.5">服务</th><th className="pb-2.5">所属用户</th><th className="pb-2.5">Provider</th><th className="pb-2.5">状态</th></tr></thead><tbody className="divide-y divide-border">{services.filter((service) => service.status !== "active" || service.connectionStatus !== "valid").map((service) => <tr key={service.id}><td className="py-3">{service.displayName}</td><td className="py-3 text-muted-foreground">{service.ownerUsername}</td><td className="py-3 font-mono text-muted-foreground">{service.providerType}</td><td className="py-3"><StatusPill tone="warning">{service.status}</StatusPill></td></tr>)}</tbody></table></div></Panel>
@@ -155,9 +159,15 @@ export function AdminOverviewPage() {
 
 /** 超级管理员用户管理页面。 */
 export function AdminUsersPage() {
-  const resource = useApiResource(() => listAdminUsers(), []);
+  const resource = useApiResource(async () => {
+    const [users, currentUser] = await Promise.all([listAdminUsers(), getCurrentUser()]);
+    return { ...users, currentUser };
+  }, []);
   const [showCreate, setShowCreate] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [deletingUserId, setDeletingUserId] = useState<string | null>(null);
+  // 关键变量：同步占用删除操作，避免状态刷新前重复提交同一个敏感请求。
+  const deletingUserIdRef = useRef<string | null>(null);
 
   /** 创建普通用户并刷新用户列表。 */
   async function submitCreate(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -196,12 +206,74 @@ export function AdminUsersPage() {
     }
   }
 
+  /** 二次确认后将其他账号标记为待删除，并刷新用户列表。 */
+  async function deleteUser(userId: string, username: string): Promise<void> {
+    if (userId === resource.data?.currentUser.userId) {
+      setMessage("不能删除当前登录的超级管理员账号");
+      return;
+    }
+    if (deletingUserIdRef.current) return;
+    if (!window.confirm(`确定要删除用户“${username}”吗？该账号会立即退出全部登录并进入待删除状态。`)) return;
+    deletingUserIdRef.current = userId;
+    setDeletingUserId(userId);
+    setMessage(`正在删除用户“${username}”…`);
+    try {
+      await deleteAdminUser(userId);
+      setMessage(`用户“${username}”已进入待删除状态`);
+      await resource.refresh();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "删除用户失败";
+      console.warn("codex-flycloud-helper-user-action", {
+        事件: "管理员删除用户失败",
+        目标用户ID: userId,
+        错误信息: errorMessage,
+      });
+      setMessage(errorMessage);
+    } finally {
+      deletingUserIdRef.current = null;
+      setDeletingUserId(null);
+    }
+  }
+
+  /** 二次确认后彻底删除待删除账号及其全部关联数据。 */
+  async function purgeUser(userId: string, username: string): Promise<void> {
+    if (userId === resource.data?.currentUser.userId) {
+      setMessage("不能删除当前登录的超级管理员账号");
+      return;
+    }
+    if (deletingUserIdRef.current) return;
+    if (!window.confirm(`确定要彻底删除用户“${username}”吗？该账号、服务、媒体库及相关数据删除后无法恢复。`)) return;
+    deletingUserIdRef.current = userId;
+    setDeletingUserId(userId);
+    setMessage(`正在彻底删除用户“${username}”…`);
+    try {
+      await purgeAdminUser(userId);
+      setMessage(`用户“${username}”及其全部关联数据已彻底删除`);
+      await resource.refresh();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "彻底删除用户失败";
+      console.warn("codex-flycloud-helper-user-action", {
+        事件: "管理员彻底删除用户失败",
+        目标用户ID: userId,
+        错误信息: errorMessage,
+      });
+      setMessage(errorMessage);
+    } finally {
+      deletingUserIdRef.current = null;
+      setDeletingUserId(null);
+    }
+  }
+
   return (
     <>
       <PageHeader title="用户管理" actions={<PrimaryButton onClick={() => setShowCreate((value) => !value)}><Plus className="size-4" /> 创建用户</PrimaryButton>} />
       {showCreate && <Panel className="mb-4" title="创建普通用户"><form onSubmit={(event) => void submitCreate(event)} className="grid gap-3 md:grid-cols-4"><input name="username" required minLength={4} placeholder="用户名" className="rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /><input name="password" required minLength={4} type="password" placeholder="密码" className="rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /><input name="passwordConfirmation" required minLength={4} type="password" placeholder="确认密码" className="rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /><PrimaryButton type="submit">确认创建</PrimaryButton></form></Panel>}
       {message && <p className="mb-4 text-sm text-muted-foreground">{message}</p>}
-      <div className="grid gap-4 lg:grid-cols-2">{resource.data?.items.map((user) => <article key={user.userId} className="surface p-5"><header className="flex items-center justify-between gap-3"><div><h2 className="text-sm font-semibold">{user.username}</h2><p className="mt-1 font-mono text-[11px] text-muted-foreground">{user.userId}</p></div><div className="flex gap-2"><StatusPill tone={user.role === "super_admin" ? "primary" : "neutral"}>{userRoleLabels[user.role]}</StatusPill><StatusPill tone={user.status === "active" ? "success" : "danger"}>{userStatusLabels[user.status]}</StatusPill></div></header><dl className="mt-5 grid grid-cols-2 gap-3 text-center"><div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">服务数</dt><dd className="mt-1 text-xs font-medium">{user.serviceCount}</dd></div><div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">媒体数</dt><dd className="mt-1 text-xs font-medium">{user.mediaCount.toLocaleString()}</dd></div></dl><footer className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void toggleUser(user.userId, user.username, user.status === "active")} className="cursor-pointer rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-foreground transition-colors hover:border-foreground/30 hover:bg-secondary">{user.status === "active" ? "停用用户" : "启用用户"}</button><button type="button" onClick={() => void revokeUserSessions(user.userId, user.username)} className="cursor-pointer rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-foreground transition-colors hover:border-warning/50 hover:bg-warning/10 hover:text-warning">撤销全部会话</button></footer></article>)}</div>
+      <div className="grid gap-4 lg:grid-cols-2">{resource.data?.items.map((user) => {
+        const isCurrentUser = user.userId === resource.data?.currentUser.userId;
+        const isDeleting = deletingUserId === user.userId;
+        return <article key={user.userId} className="surface p-5"><header className="flex items-center justify-between gap-3"><div><h2 className="text-sm font-semibold">{user.username}</h2><p className="mt-1 font-mono text-[11px] text-muted-foreground">{user.userId}</p></div><div className="flex gap-2"><StatusPill tone={user.role === "super_admin" ? "primary" : "neutral"}>{userRoleLabels[user.role]}</StatusPill><StatusPill tone={user.status === "active" ? "success" : "danger"}>{userStatusLabels[user.status]}</StatusPill></div></header><dl className="mt-5 grid grid-cols-2 gap-3 text-center"><div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">服务数</dt><dd className="mt-1 text-xs font-medium">{user.serviceCount}</dd></div><div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">媒体数</dt><dd className="mt-1 text-xs font-medium">{user.mediaCount.toLocaleString()}</dd></div></dl><footer className="mt-5 flex flex-wrap gap-2"><button type="button" onClick={() => void toggleUser(user.userId, user.username, user.status === "active")} className="cursor-pointer rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-foreground transition-colors hover:border-foreground/30 hover:bg-secondary">{user.status === "active" ? "停用用户" : "启用用户"}</button><button type="button" onClick={() => void revokeUserSessions(user.userId, user.username)} className="cursor-pointer rounded-lg border border-border bg-secondary/30 px-3 py-2 text-xs text-foreground transition-colors hover:border-warning/50 hover:bg-warning/10 hover:text-warning">撤销全部会话</button>{!isCurrentUser && user.status !== "pending_delete" && <button type="button" disabled={isDeleting} onClick={() => void deleteUser(user.userId, user.username)} className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive transition-colors hover:border-destructive/70 hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-60"><Trash2 className="size-3.5" /> {isDeleting ? "正在删除…" : "删除用户"}</button>}{!isCurrentUser && user.status === "pending_delete" && <button type="button" disabled={isDeleting} onClick={() => void purgeUser(user.userId, user.username)} className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-destructive/60 bg-destructive px-3 py-2 text-xs font-semibold text-destructive-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"><Trash2 className="size-3.5" /> {isDeleting ? "正在彻底删除…" : "彻底删除"}</button>}</footer></article>;
+      })}</div>
     </>
   );
 }
@@ -224,6 +296,17 @@ export function AdminConfigurationPage() {
   const resource = useApiResource(() => getAdminConfigStatus(), []);
   const [message, setMessage] = useState<string | null>(null);
   const [clearingTmdbCache, setClearingTmdbCache] = useState(false);
+
+  /** 保存 Jellyfin 等外部协议使用的可选对外地址覆盖值。 */
+  async function savePublicBaseUrl(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const publicBaseUrl = String(new FormData(event.currentTarget).get("publicBaseUrl") ?? "").trim();
+    try {
+      await updateAdminPublicBaseUrl(publicBaseUrl);
+      setMessage(publicBaseUrl ? "Jellyfin 对外地址覆盖值已保存" : "地址覆盖值已清空，Jellyfin 将使用云助手 API 地址");
+      await resource.refresh();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "公开访问地址保存失败"); }
+  }
 
   /** 二次确认后使用表单中的完整列表替换 TMDB Key 池。 */
   async function saveTmdbKeys(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -285,6 +368,14 @@ export function AdminConfigurationPage() {
       <PageHeader title="系统配置" actions={<SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新状态</SecondaryButton>} />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
       {resource.data && <Panel title="当前配置摘要" description="只显示数量和状态，不返回任何 Key 原文。"><SystemConfigurationSummary config={resource.data} /></Panel>}
+      <Panel title="Jellyfin 公开地址（可选）" description="不填写时直接使用云助手 API 地址；填写后使用该地址生成 Jellyfin 对外服务地址。" className="mt-4">
+        <form onSubmit={(event) => void savePublicBaseUrl(event)} className="flex flex-col gap-3 md:flex-row md:items-end">
+          <label className="min-w-0 flex-1"><span className="text-xs font-medium">对外地址覆盖值（可选）</span><input name="publicBaseUrl" type="url" defaultValue={resource.data?.publicAccess.publicBaseUrl ?? ""} disabled={resource.data?.publicAccess.editable === false} placeholder="选填，例如 https://media.example.com" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm disabled:opacity-60" /></label>
+          <PrimaryButton type="submit" disabled={resource.data?.publicAccess.editable === false}><Save className="size-4" /> 保存地址</PrimaryButton>
+        </form>
+        <p className="mt-3 text-xs text-muted-foreground">作用：仅当使用反向代理、HTTPS 域名，或外部端口与云助手 API 实际地址不一致时填写。系统会在该地址后自动追加 /jellyfin/{`{服务ID}`}；清空不会影响 Jellyfin 的启用和访问。</p>
+        <p className="mt-2 text-xs text-muted-foreground">配置来源：{resource.data?.publicAccess.source === "environment" ? "环境变量（控制台只读）" : resource.data?.publicAccess.source === "database" ? "数据库" : "未设置（使用云助手 API 地址）"}</p>
+      </Panel>
       <Panel title="TMDB Key 配置" description="支持 API Key 或 Read Access Token；每行一个，也可以使用英文逗号分隔。" className="mt-4">
         <form onSubmit={(event) => void saveTmdbKeys(event)} className="grid gap-4">
           <label className="block">

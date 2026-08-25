@@ -4,7 +4,8 @@ export type NotificationCategory = "task" | "security" | "system";
 export type NotificationTone = "info" | "success" | "warning" | "danger";
 export type ServiceStatus = "active" | "scanning" | "reauthorization_required" | "disabled";
 export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "completed" | "failed" | "cancelled";
-export type JobStage = "queued" | "enumerating" | "classifying" | "scraping" | "persisting" | "completed";
+export type BackgroundJobType = "scan" | "media_probe";
+export type JobStage = "queued" | "enumerating" | "classifying" | "scraping" | "persisting" | "probing" | "completed";
 export type MediaType = "video" | "music" | "audiobook";
 export type CatalogSort =
   | "created_desc"
@@ -74,6 +75,8 @@ export interface CloudServiceRecord {
   connectionStatus: string;
   /** 当前服务是否允许 APP 通过 FlyCloudHelper 中转媒体文件。 */
   relayPlaybackEnabled: boolean;
+  /** 当前服务是否对外提供 Jellyfin 兼容接口。 */
+  jellyfinEnabled: boolean;
   credentialRevision: number;
   scanProfileRevision: number;
   metadataProfileRevision: number;
@@ -94,6 +97,8 @@ export interface ServiceDetailRecord extends CloudServiceRecord {
 
 export interface ScanJobRecord {
   id: string;
+  /** 后台任务类型；保留 ScanJobRecord 名称兼容现有 APP 和接口。 */
+  jobType: BackgroundJobType;
   userId: string;
   serviceId: string;
   libraryId: string;
@@ -131,6 +136,14 @@ export interface ScanJobRecord {
   /** 任务真正处于扫描刮削运行状态的累计时长，不包含排队、暂停和延迟恢复等待。 */
   elapsedMs: number;
   updatedAt: string;
+}
+
+/** 视频规格后台任务中的失败文件，只返回脱敏后的文件名和错误分类。 */
+export interface MediaProbeFailureRecord {
+  sourceFileId: string;
+  fileName: string;
+  errorCode: string;
+  errorMessage: string;
 }
 
 /** APP 本地媒体库迁移到云助手的持久化状态。 */
@@ -203,10 +216,30 @@ export interface MediaItemRecord {
   externalIds: Record<string, string>;
   metadata: Record<string, unknown>;
   fileCount: number;
+  /** 当前条目及其直接子项已经完成的媒体规格汇总；尚未分析时为空。 */
+  mediaProbeSummary: MediaProbeSummaryRecord | null;
   ownerUsername: string;
   serviceName: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** 海报墙和媒体详情使用的 ffprobe 汇总信息。 */
+export interface MediaProbeSummaryRecord {
+  analyzedFileCount: number;
+  durationMs: number;
+  container: string;
+  bitRate: number;
+  videoCodec: string;
+  width: number;
+  height: number;
+  videoRange: string;
+  videoRangeType: string;
+  audioCodec: string;
+  audioChannels: number;
+  audioChannelLayout: string;
+  audioStreamCount: number;
+  subtitleStreamCount: number;
 }
 
 export interface JobEventRecord {

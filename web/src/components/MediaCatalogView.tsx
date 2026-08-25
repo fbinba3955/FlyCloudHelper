@@ -120,6 +120,52 @@ function formatFileSize(size: number): string {
   return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
 }
 
+/** 将毫秒时长转换为海报详情使用的小时分钟文本。 */
+function formatMediaDuration(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return "未知";
+  const totalMinutes = Math.max(1, Math.round(durationMs / 60_000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0 ? `${hours} 小时 ${minutes} 分钟` : `${minutes} 分钟`;
+}
+
+/** 将媒体码率转换为易读的 Mbps 或 Kbps。 */
+function formatMediaBitRate(bitRate: number): string {
+  if (!Number.isFinite(bitRate) || bitRate <= 0) return "未知";
+  return bitRate >= 1_000_000 ? `${(bitRate / 1_000_000).toFixed(1)} Mbps` : `${Math.round(bitRate / 1000)} Kbps`;
+}
+
+/** 把 ffprobe 编码名称转换为用户熟悉的名称。 */
+function formatMediaCodec(codec: string): string {
+  const labels: Record<string, string> = { h264: "H.264", hevc: "H.265", h265: "H.265", av1: "AV1", vp9: "VP9", aac: "AAC", ac3: "AC3", eac3: "EAC3", truehd: "TrueHD", dts: "DTS" };
+  return labels[codec.toLocaleLowerCase("zh-CN")] ?? codec.toLocaleUpperCase("zh-CN");
+}
+
+/** 返回视频流的实际宽高和常用清晰度名称。 */
+function formatMediaResolution(width: number, height: number): string {
+  if (width <= 0 && height <= 0) return "未知";
+  const label = width >= 3800 || height >= 2100 ? "4K" : width >= 2500 || height >= 1400 ? "2K" : height > 0 ? `${height}P` : "";
+  const sizeText = width > 0 && height > 0 ? `${width} × ${height}` : height > 0 ? `${height}P` : `${width} 像素宽`;
+  return `${sizeText}${label ? `（${label}）` : ""}`;
+}
+
+/** 将单条 ffprobe 音视频流转换为文件路径下的简短规格。 */
+function formatMediaStream(stream: Record<string, unknown>): string {
+  const type = String(stream.Type ?? "");
+  const codec = formatMediaCodec(String(stream.Codec ?? ""));
+  if (type === "Video") {
+    const resolution = formatMediaResolution(Number(stream.Width ?? 0), Number(stream.Height ?? 0));
+    const videoRange = String(stream.VideoRangeType ?? stream.VideoRange ?? "");
+    return ["视频", codec, resolution === "未知" ? "" : resolution, videoRange === "SDR" ? "" : videoRange].filter(Boolean).join(" · ");
+  }
+  if (type === "Audio") {
+    const channels = Number(stream.Channels ?? 0);
+    return ["音频", codec, String(stream.Language ?? ""), String(stream.ChannelLayout ?? "") || (channels > 0 ? `${channels} 声道` : "")].filter(Boolean).join(" · ");
+  }
+  if (type === "Subtitle") return ["字幕", String(stream.Language ?? ""), codec, String(stream.Title ?? "")].filter(Boolean).join(" · ");
+  return [type || "数据流", codec].filter(Boolean).join(" · ");
+}
+
 /** 返回当前匹配状态的中文名称。 */
 function getMatchStateLabel(matchState: MatchState | "all"): string {
   return matchState === "all" ? "全部" : matchStateLabels[matchState];
@@ -149,6 +195,7 @@ function MediaDetailDialog({
 }) {
   const metadata = getDisplayMetadata(item.metadata);
   const externalIds = Object.entries(item.externalIds).filter(([, value]) => Boolean(value));
+  const mediaProbeSummary = item.mediaProbeSummary;
   const canMatchVideo = item.mediaType === "video" && (item.itemType === "video.movie" || item.itemType === "video.series");
   // 关键变量：只有节目详情使用季集位置展示子项，电影及其他媒体保持原展示。
   const isSeries = item.itemType === "video.series";
@@ -209,6 +256,19 @@ function MediaDetailDialog({
                 </dl>
               </div>
             )}
+            {mediaProbeSummary && (
+              <div>
+                <h3 className="text-sm font-semibold">视频规格</h3>
+                <dl className="mt-3 grid gap-3 rounded-xl border border-border bg-secondary/30 p-4 sm:grid-cols-2">
+                  <div><dt className="text-[11px] text-muted-foreground">分析进度</dt><dd className="mt-1 text-sm">{mediaProbeSummary.analyzedFileCount} / {item.fileCount || mediaProbeSummary.analyzedFileCount} 个文件</dd></div>
+                  <div><dt className="text-[11px] text-muted-foreground">{isSeries ? "最长单集时长" : "时长"}</dt><dd className="mt-1 text-sm">{formatMediaDuration(mediaProbeSummary.durationMs)}</dd></div>
+                  <div><dt className="text-[11px] text-muted-foreground">视频</dt><dd className="mt-1 text-sm">{[formatMediaCodec(mediaProbeSummary.videoCodec), formatMediaResolution(mediaProbeSummary.width, mediaProbeSummary.height), mediaProbeSummary.videoRangeType || mediaProbeSummary.videoRange].filter((value) => value && value !== "未知" && value !== "SDR").join(" · ") || "未知"}</dd></div>
+                  <div><dt className="text-[11px] text-muted-foreground">音频</dt><dd className="mt-1 text-sm">{[formatMediaCodec(mediaProbeSummary.audioCodec), mediaProbeSummary.audioChannelLayout || (mediaProbeSummary.audioChannels > 0 ? `${mediaProbeSummary.audioChannels} 声道` : "")].filter(Boolean).join(" · ") || "未知"}</dd></div>
+                  <div><dt className="text-[11px] text-muted-foreground">封装与码率</dt><dd className="mt-1 text-sm">{[mediaProbeSummary.container.toLocaleUpperCase("zh-CN"), formatMediaBitRate(mediaProbeSummary.bitRate)].filter((value) => value && value !== "未知").join(" · ") || "未知"}</dd></div>
+                  <div><dt className="text-[11px] text-muted-foreground">内置流</dt><dd className="mt-1 text-sm">音轨 {mediaProbeSummary.audioStreamCount} · 字幕 {mediaProbeSummary.subtitleStreamCount}</dd></div>
+                </dl>
+              </div>
+            )}
             {externalIds.length > 0 && (
               <div>
                 <h3 className="text-sm font-semibold">外部编号</h3>
@@ -223,6 +283,20 @@ function MediaDetailDialog({
                     <li key={pathItem.fileId} className="rounded-lg border border-border bg-secondary/30 p-3">
                       <p className="break-all font-mono text-xs leading-5">{pathItem.path}</p>
                       <p className="mt-1 text-[11px] text-muted-foreground">{pathItem.linkedItemTitle || pathItem.name} · {formatFileSize(pathItem.size)}</p>
+                      {pathItem.mediaProbe && (
+                        <div className="mt-2 space-y-1.5 border-t border-border/70 pt-2">
+                          <p className="text-[11px] text-muted-foreground">
+                            {[formatMediaDuration(pathItem.mediaProbe.runTimeTicks / 10_000), pathItem.mediaProbe.container.toLocaleUpperCase("zh-CN"), formatMediaBitRate(pathItem.mediaProbe.bitRate)].filter((value) => value && value !== "未知").join(" · ")}
+                          </p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {pathItem.mediaProbe.mediaStreams.map((stream, streamIndex) => (
+                              <span key={`${pathItem.fileId}-${streamIndex}`} className="rounded-md border border-border bg-background/60 px-2 py-1 text-[10px] text-muted-foreground">
+                                {formatMediaStream(stream)}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </li>
                   ))}
                 </ul>

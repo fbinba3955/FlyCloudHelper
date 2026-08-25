@@ -598,6 +598,9 @@ export class ScanWorker {
     const useLocalVideoNfo = videoMetadataProfile.useNfo !== false;
     // 关键变量：旧服务没有 syncDetails 字段时默认关闭，使扫描匹配方式与 Flymby APP 一致。
     const synchronizeVideoDetails = videoMetadataProfile.syncDetails === true;
+    // 关键变量：规格分析只收集源文件，真正的 ffprobe 在扫描完成后由独立 Worker 执行。
+    const analyzeMediaSpecs = videoMetadataProfile.analyzeMediaSpecs === true;
+    const mediaProbeSourceFiles = new Map<string, SourceFileRecord>();
     const tmdbStatusAtStart = this.tmdb.getStatus();
     // 没有配置 Key 或全部 Key 已永久禁用时不可恢复；冷却中的 Key 在建立检查点后进入延迟恢复。
     if (defaultMediaTypes.includes("video")
@@ -1063,6 +1066,9 @@ export class ScanWorker {
             const preparedFiles = await this.repository.prepareSourceFiles(
               candidatesToPrepare.map((candidate) => candidate.sourceFileInput),
             );
+            if (analyzeMediaSpecs) {
+              preparedFiles.forEach((prepared) => mediaProbeSourceFiles.set(prepared.sourceFile.id, prepared.sourceFile));
+            }
             preparedFiles.forEach((prepared, index) => {
               const candidate = candidatesToPrepare[index];
               if (!candidate) return;
@@ -1603,6 +1609,23 @@ export class ScanWorker {
     if (signal.aborted) {
       await this.applyAbortedJobState(job, "任务完成前");
       return;
+    }
+    if (analyzeMediaSpecs && mediaProbeSourceFiles.size > 0) {
+      const queuedProbeResult = await this.repository.enqueueMediaProbes([...mediaProbeSourceFiles.values()], false, {
+        requestedByUserId: job.userId,
+        triggerType: "scan_completed",
+        sourceScanJobId: job.id,
+      });
+      const queuedProbeCount = queuedProbeResult.queuedCount;
+      this.logger.info({
+        日志关键字: "codex-media-ffprobe",
+        事件: "扫描完成后写入媒体规格队列",
+        任务ID: job.id,
+        服务ID: job.serviceId,
+        扫描文件数量: mediaProbeSourceFiles.size,
+        新增或变化文件数量: queuedProbeCount,
+        后台任务ID: queuedProbeResult.jobId,
+      });
     }
     await this.repository.finishJob(job.id, { status: "completed" });
     await this.database.createNotificationSafely({

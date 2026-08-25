@@ -7,6 +7,7 @@ import {
   type ProviderEnumerationOptions,
   type ProviderEnumerationWarning,
   type ProviderValidationResult,
+  type ProviderFileStreamAccess,
   type ScanRoot,
   createFlymbyRecommendedScanSettings,
   requireConnectionString,
@@ -30,7 +31,7 @@ export class BaiduPanProvider implements ProviderAdapter {
     displayName: "百度网盘",
     adapterVersion: "1.0.0",
     credentialSchemaVersion: 1,
-    capabilities: ["list", "stableResourceId", "playbackLocator"],
+    capabilities: ["list", "stableResourceId", "playbackLocator", "relay"],
     recommendedScanSettings: createFlymbyRecommendedScanSettings(),
     connectionFields: [
       { name: "accessToken", label: "Access Token", type: "password", required: true, secret: true },
@@ -146,6 +147,27 @@ export class BaiduPanProvider implements ProviderAdapter {
         }
       }
     }
+  }
+
+  /** 使用 fs_id 换取百度网盘 dlink；令牌只保留在中转上游地址中，不下发客户端。 */
+  public async resolveFileStreamAccess(connection: Record<string, unknown>, locator: Record<string, unknown>, signal?: AbortSignal): Promise<ProviderFileStreamAccess> {
+    const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
+    const fsId = requireConnectionString(locator, "fsId", "文件 ID");
+    const apiBase = typeof connection.apiBaseUrl === "string" && connection.apiBaseUrl ? connection.apiBaseUrl : "https://pan.baidu.com";
+    const baseUrl = await validateProviderUrl(apiBase, this.networkOptions);
+    const url = new URL("/rest/2.0/xpan/multimedia", baseUrl);
+    url.searchParams.set("method", "filemetas");
+    url.searchParams.set("access_token", accessToken);
+    url.searchParams.set("fsids", JSON.stringify([Number.isFinite(Number(fsId)) ? Number(fsId) : fsId]));
+    url.searchParams.set("dlink", "1");
+    const response = await providerFetch(url, { method: "GET" }, this.networkOptions, signal);
+    const payload = await response.json() as { errno?: number; list?: Array<{ dlink?: string }> };
+    if (payload.errno && payload.errno !== 0) throw new Error(`百度网盘下载接口错误 ${payload.errno}`);
+    const dlink = payload.list?.[0]?.dlink;
+    if (!dlink) throw new Error("百度网盘开放接口未返回下载地址");
+    const downloadUrl = new URL(dlink);
+    downloadUrl.searchParams.set("access_token", accessToken);
+    return { url: downloadUrl.href, expiresAt: null, headers: { "User-Agent": "pan.baidu.com" } };
   }
 
   /** 请求百度网盘 xpan 文件列表接口。 */

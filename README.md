@@ -62,7 +62,86 @@ npm run dev:web
 
 ## Docker 启动
 
-### 默认 SQLite
+### 前后端集成版
+
+生产镜像已经集成 Web 前端、后台 API 和扫描 Worker，部署时只需要启动一个容器。
+
+#### 使用 Docker Compose（推荐）
+
+Docker 部署也比较简单，新建 `docker-compose.yml` 并写入以下内容：
+
+```yaml
+services:
+  flycloud-helper:
+    image: fbinba3955/flycloud-helper:latest
+    container_name: flycloud-helper
+    restart: unless-stopped
+    ports:
+      - "9934:9934"
+    environment:
+      FLYCLOUDHELPER_DATABASE_TYPE: sqlite
+      FLYCLOUDHELPER_COOKIE_SECURE: "false"
+      FLYCLOUDHELPER_ALLOW_INSECURE_HTTP: "true"
+    volumes:
+      - flycloud_helper_data:/data
+
+volumes:
+  flycloud_helper_data:
+```
+
+然后启动服务：
+
+```sh
+docker compose up -d
+```
+
+也可以直接下载项目提供的完整配置文件：
+
+```sh
+# 下载配置文件
+curl -o docker-compose.yml https://raw.githubusercontent.com/fbinba3955/FlyCloudHelper/master/docker-compose.yml
+
+# 启动服务
+docker compose up -d
+
+# 查看日志
+docker compose logs -f
+```
+
+该编排默认拉取 `fbinba3955/flycloud-helper:latest`，使用 SQLite，并把数据库、凭据主密钥、插件和导出文件保存在 `flycloud_helper_data` 持久卷中。启动完成后访问：
+
+```text
+http://服务器IP:9934/setup
+```
+
+首次进入初始化页面设置超级管理员。需要修改对外端口或连接外部数据库时，在 `docker-compose.yml` 同目录创建 `.env`；例如修改宿主机端口：
+
+```dotenv
+FLYCLOUDHELPER_HOST_PORT=19934
+```
+
+常用维护命令：
+
+```sh
+# 查看运行状态
+docker compose ps
+
+# 查看实时日志
+docker compose logs -f flycloud-helper
+
+# 拉取新版本并保留原数据升级
+docker compose pull
+docker compose up -d
+
+# 停止服务但保留数据
+docker compose down
+```
+
+不要使用 `docker compose down -v`，该命令会同时删除持久卷。需要固定镜像版本时，在 `.env` 中设置 `FLYCLOUDHELPER_IMAGE_TAG=0.1.3`；移除该配置后会继续使用 `latest`。
+
+如果已经克隆项目，进入项目目录直接执行 `docker compose -f docker-compose.yml up -d` 即可。完整编排文件见 [docker-compose.yml](docker-compose.yml)。
+
+#### 直接使用 Docker 命令
 
 直接运行 Docker Hub 公开镜像：
 
@@ -144,7 +223,7 @@ POSTGRES_PASSWORD=请替换
 然后执行：
 
 ```sh
-docker compose -f compose.yml -f compose.postgres.yml up -d --build
+docker compose -f compose.yml -f compose.postgres.yml up -d
 ```
 
 由项目同时创建 MySQL 时，在 `.env` 中设置：
@@ -159,7 +238,7 @@ MYSQL_ROOT_PASSWORD=请替换
 然后执行：
 
 ```sh
-docker compose -f compose.yml -f compose.mysql.yml up -d --build
+docker compose -f compose.yml -f compose.mysql.yml up -d
 ```
 
 ### 从源码构建
@@ -167,10 +246,12 @@ docker compose -f compose.yml -f compose.mysql.yml up -d --build
 从源码构建并启动：
 
 ```sh
-docker compose up -d --build
+docker compose -f compose.yml -f compose.build.yml up -d --build
 ```
 
 默认通过 `http://localhost:9934` 访问服务。生产镜像由同一个 API 进程提供后台接口、Web 静态文件和扫描 Worker。
+
+生产镜像已经直接安装 `ffprobe`（由 Debian `ffmpeg` 软件包提供），同时支持 `linux/amd64` 和 `linux/arm64`。服务详情中的“分析视频规格（ffprobe）”默认关闭；开启后无需在宿主机安装程序或向容器挂载可执行文件。
 
 ## 配置方式
 
@@ -196,6 +277,8 @@ cp .env.example .env
 | `FLYCLOUDHELPER_DATABASE_URL` | 空 | 兼容原有完整连接地址，配置后优先于拆分字段 |
 | `FLYCLOUDHELPER_COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true` |
 | `FLYCLOUDHELPER_WORKER_CONCURRENCY` | `2` | 同时执行的扫描任务数 |
+| `FLYCLOUDHELPER_FFPROBE_PATH` | Docker 中为 `/usr/bin/ffprobe` | ffprobe 可执行文件路径 |
+| `FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY` | `1` | 独立媒体规格队列并发数；不会占用扫描 Worker 槽位 |
 | `FLYCLOUDHELPER_ALLOW_INSECURE_HTTP` | `true` | 是否允许 Provider 使用 HTTP |
 | `FLYCLOUDHELPER_HUAWEI_BINDING_PROOF_SECRET` | 空 | 可选的华为账号绑定凭证验签密钥；配置后 APP 注册必须提供短期受信任签名，支持同名 `_FILE` Secret |
 
@@ -316,7 +399,7 @@ Content-Type: application/json
 
 切换 SQLite、PostgreSQL 或 MySQL 不会自动迁移数据，需要自行执行导出、导入或数据库迁移。
 
-当前项目处于 `0.x` 开发阶段，schema 24 已加入用户直接归属的数据结构、服务级中转播放开关和用户通知表。使用不兼容的旧开发数据库时可以删除并重新初始化，首次启动后重新设置超级管理员。
+当前项目处于 `0.x` 开发阶段，schema 28 已加入用户直接归属的数据结构、服务级中转播放、Jellyfin 兼容和源文件媒体规格队列。升级现有数据库时服务会自动创建新增表；使用不兼容的旧开发数据库时也可以删除并重新初始化，首次启动后重新设置超级管理员。
 
 ## 项目结构
 
