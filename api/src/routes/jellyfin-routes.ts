@@ -4,8 +4,8 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
 import { buildJellyfinPath } from "../jellyfin-path.js";
 import { parseCompletedMediaProbeResult, readJellyfinRunTimeTicks } from "../media/media-probe.js";
-import { JellyfinCompatibilityService, type JellyfinContext } from "../jellyfin-service.js";
-import { providerStream } from "../providers/network.js";
+import { JellyfinCompatibilityService, readJellyfinToken, type JellyfinContext, type JellyfinLibraryContext } from "../jellyfin-service.js";
+import { providerFetch, providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
 import { buildUpstreamHeaders, copyMediaResponseHeaders, resolveRelayAccess, type RelayLibraryRow } from "./media-stream-routes.js";
@@ -13,6 +13,12 @@ import { buildUpstreamHeaders, copyMediaResponseHeaders, resolveRelayAccess, typ
 /** 统一读取任意 Jellyfin 查询参数。 */
 function readQuery(request: FastifyRequest): Record<string, unknown> {
   return (request.query ?? {}) as Record<string, unknown>;
+}
+
+/** 读取 Jellyfin 官方小驼峰写法和旧客户端大驼峰写法的媒体源 ID。 */
+function readMediaSourceId(request: FastifyRequest): string {
+  const query = readQuery(request);
+  return String(query.mediaSourceId ?? query.MediaSourceId ?? "");
 }
 
 /** 确认 URL 中的用户 ID 就是当前服务访问账号。 */
@@ -29,11 +35,47 @@ function toRelayLibrary(service: Record<string, unknown>): RelayLibraryRow {
   };
 }
 
-/** 读取播放路由偏好，默认自动选择安全原始地址或服务端中转。 */
+/** 读取播放路由偏好；标准 Jellyfin 客户端默认自动选择安全原始地址或服务端直放。 */
 function readPlaybackRoute(request: FastifyRequest): "auto" | "server" | "origin" {
   const value = String(request.headers["x-flycloud-playback-route"] ?? readQuery(request).FlyCloudPlaybackRoute ?? "auto").toLowerCase();
   if (value === "server" || value === "origin") return value;
+  if (value === "auto") return value;
   return "auto";
+}
+
+/** 生成 Jellyfin 标准 MediaSourceInfo 的公共默认字段。 */
+function buildStandardMediaSourceDefaults(): Record<string, unknown> {
+  return {
+    EncoderPath: null,
+    EncoderProtocol: null,
+    ETag: null,
+    ReadAtNativeFramerate: false,
+    IgnoreDts: false,
+    IgnoreIndex: false,
+    GenPtsInput: false,
+    SupportsTranscoding: false,
+    SupportsDirectStream: true,
+    SupportsDirectPlay: true,
+    IsInfiniteStream: false,
+    UseMostCompatibleTranscodingProfile: false,
+    RequiresOpening: false,
+    OpenToken: null,
+    RequiresClosing: false,
+    LiveStreamId: null,
+    BufferMs: null,
+    RequiresLooping: false,
+    SupportsProbing: false,
+    MediaStreams: [],
+    MediaAttachments: [],
+    Formats: [],
+    RequiredHttpHeaders: {},
+    TranscodingUrl: null,
+    TranscodingSubProtocol: null,
+    TranscodingContainer: null,
+    AnalyzeDurationMs: null,
+    DefaultAudioStreamIndex: null,
+    DefaultSubtitleStreamIndex: null,
+  };
 }
 
 /** 解析文件访问地址，并在 Provider 刷新令牌时安全持久化。 */
@@ -56,7 +98,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   const item = await runtime.repository.getCatalogItem(itemId, context.ownerUserId);
   if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
   const files = await runtime.repository.listItemFiles(itemId, context.ownerUserId);
-  const requestedSource = String(readQuery(request).MediaSourceId ?? "");
+  const requestedSource = readMediaSourceId(request);
   // 关键变量：节目查询可能连带返回所有单集文件，PlaybackInfo 只能暴露当前电影或单集自身的多版本文件。
   const itemFiles = files.filter((candidate) => String(candidate.itemId) === itemId);
   const playableFiles = itemFiles;
@@ -68,7 +110,6 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   const candidateFiles = requestedFile ? [requestedFile] : playableFiles;
   if (candidateFiles.length === 0) throw new ApiError(404, "jellyfin_media_source_not_found", "媒体条目没有可播放文件");
   const preference = readPlaybackRoute(request);
-  const relayEnabled = Number(service.relay_playback_enabled) === 1;
   const itemMediaProbes = itemFiles.map((file) => (
     context.mediaSpecsEnabled
       ? parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult)
@@ -83,7 +124,6 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
     mediaSpecsReady ? itemMediaProbes[index] ?? null : null,
   ]));
   const runTimeTicks = mediaSpecsReady ? readJellyfinRunTimeTicks(itemMediaProbes) : 0;
-  if (preference === "server" && !relayEnabled) throw new ApiError(409, "jellyfin_server_direct_disabled", "当前服务未启用中转播放，不能经服务器直放");
   const routeNames = new Set<string>();
   const mediaSources: Array<Record<string, unknown>> = [];
   for (const file of candidateFiles) {
@@ -96,33 +136,30 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
     const safeOriginUrl = access && Object.keys(access.headers).length === 0 && /^https?:\/\//iu.test(access.url) ? access.url : null;
     if (preference === "origin" && !safeOriginUrl) continue;
     const useOrigin = preference === "origin" || (preference === "auto" && Boolean(safeOriginUrl));
-    if (!useOrigin && !relayEnabled) continue;
     const fileName = String(file.name ?? "video.mp4");
     const mediaProbe = mediaProbeByFileId.get(String(file.fileId)) ?? null;
-    // 关键变量：路由扩展名只用于中转地址匹配，不代表向客户端下发了已分析的容器规格。
-    const streamContainer = mediaProbe?.container
-      || (fileName.includes(".") ? fileName.split(".").pop()?.toLowerCase() ?? "mp4" : "mp4");
     const directStreamUrl = useOrigin
       ? safeOriginUrl
-      : `/videos/${encodeURIComponent(itemId)}/stream.${encodeURIComponent(streamContainer)}?MediaSourceId=${encodeURIComponent(String(file.fileId))}`;
+      : `/Videos/${encodeURIComponent(itemId)}/stream?static=true&mediaSourceId=${encodeURIComponent(String(file.fileId))}`;
     routeNames.add(useOrigin ? "原始地址" : "服务器");
     mediaSources.push({
-      Protocol: "Http", Id: String(file.fileId), Path: directStreamUrl,
+      ...buildStandardMediaSourceDefaults(),
+      // 关键变量：服务器中转在 Jellyfin 中按服务端文件处理；安全原始地址才属于远程 HTTP 媒体源。
+      Protocol: useOrigin ? "Http" : "File", Id: String(file.fileId), Path: useOrigin ? safeOriginUrl : fileName,
       Type: "Default", Container: mediaProbe?.container || undefined, Size: mediaProbe?.size || undefined, Name: fileName,
       Bitrate: mediaProbe?.bitRate || undefined,
-      IsRemote: true, SupportsDirectPlay: true, SupportsDirectStream: true, SupportsTranscoding: false,
+      IsRemote: useOrigin,
       DirectStreamUrl: directStreamUrl, AddApiKeyToDirectStreamUrl: !useOrigin,
       RunTimeTicks: mediaProbe?.runTimeTicks || runTimeTicks || undefined,
-      MediaStreams: mediaProbe?.mediaStreams, Formats: mediaProbe ? [] : undefined,
+      MediaStreams: mediaProbe?.mediaStreams ?? [],
     });
   }
   if (mediaSources.length === 0 && preference === "origin") {
     throw new ApiError(409, "jellyfin_origin_direct_unavailable", "当前文件不能安全下发原始地址，请改用服务器直放");
   }
-  if (mediaSources.length === 0) {
-    throw new ApiError(409, "jellyfin_direct_play_unavailable", "原始地址不能安全下发，且当前服务未启用中转播放");
-  }
-  const playSessionId = String(readQuery(request).PlaySessionId ?? "") || randomUUID();
+  if (mediaSources.length === 0) throw new ApiError(409, "jellyfin_direct_play_unavailable", "当前媒体文件没有可用的直放地址");
+  const playbackQuery = readQuery(request);
+  const playSessionId = String(playbackQuery.playSessionId ?? playbackQuery.PlaySessionId ?? "") || randomUUID();
   const selectedSourceId = requestedSource || String(mediaSources[0]?.Id ?? "");
   const now = new Date().toISOString();
   // PlaybackInfo 先登记 created 会话；Playing、Progress、Stopped 将在相同会话上继续更新。
@@ -136,36 +173,70 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
     媒体条目ID: itemId, 播放路由: [...routeNames].join("+"), 路由偏好: preference, 媒体源数量: mediaSources.length,
     规格分析开关: context.mediaSpecsEnabled,
     影片规格是否全部完成: mediaSpecsReady,
-    包含已完成规格媒体源数量: mediaSources.filter((source) => source.MediaStreams !== undefined).length,
+    包含已完成规格媒体源数量: candidateFiles.filter((file) => mediaProbeByFileId.get(String(file.fileId)) !== null).length,
   });
   return {
     MediaSources: mediaSources, PlaySessionId: playSessionId, ErrorCode: null,
   };
 }
 
-/** 安全代理 TMDB 图片，拒绝把元数据字段变成通用 SSRF 入口。 */
-async function sendItemImage(runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, context: JellyfinContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
+/** 通过 Jellyfin 图片接口代理媒体库已经保存的公开 HTTP 图片。 */
+async function sendItemImage(runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, context: JellyfinLibraryContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
+  runtime.logBusinessEvent("info", {
+    日志关键字: "codex-jellyfin-image",
+    事件: "收到Jellyfin图片请求",
+    服务ID: context.serviceId,
+    媒体条目ID: itemId,
+    图片类型: imageType,
+    是否携带访问令牌: Boolean(readJellyfinToken(request)),
+  });
   const item = await compatibility.resolveImageItem(context, itemId, imageType);
   const rawUrl = imageType.toLowerCase() === "backdrop" ? item.backdropUrl : item.posterUrl;
   if (!rawUrl) throw new ApiError(404, "jellyfin_image_not_found", "图片不存在");
   let imageUrl: URL;
   try { imageUrl = new URL(rawUrl); } catch { throw new ApiError(404, "jellyfin_image_not_found", "图片地址不可用"); }
-  if (imageUrl.protocol !== "https:" || imageUrl.hostname !== "image.tmdb.org") {
+  if (imageUrl.protocol !== "https:" && imageUrl.protocol !== "http:") {
     throw new ApiError(422, "jellyfin_image_source_unsupported", "当前图片来源暂不支持协议代理");
   }
+  const imageTag = String(Date.parse(item.updatedAt) || 1);
+  const responseEtag = `"${imageTag}"`;
+  reply.header("ETag", responseEtag);
+  reply.header("Last-Modified", new Date(item.updatedAt).toUTCString());
+  if (request.headers["if-none-match"] === responseEtag) return reply.status(304).send();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10_000);
   try {
-    const response = await fetch(imageUrl, { method: request.method === "HEAD" ? "HEAD" : "GET", signal: controller.signal, redirect: "error" });
+    const response = await providerFetch(imageUrl, { method: request.method === "HEAD" ? "HEAD" : "GET" }, {
+      // 图片 URL 已经是媒体库元数据的一部分；协议层同时兼容 NFO 中常见的 HTTP 图片地址。
+      allowInsecureHttp: true,
+      logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", {
+        ...fields,
+        日志关键字: "codex-jellyfin-image",
+        事件: "Jellyfin图片上游请求失败",
+        服务ID: context.serviceId,
+        媒体条目ID: itemId,
+        图片类型: imageType,
+      }),
+    }, controller.signal);
     if (!response.ok) throw new ApiError(502, "jellyfin_image_upstream_failed", "图片服务暂时不可用");
     const length = Number(response.headers.get("content-length") ?? 0);
     if (length > 20 * 1024 * 1024) throw new ApiError(413, "jellyfin_image_too_large", "图片文件过大");
-    reply.header("Content-Type", response.headers.get("content-type") ?? "image/jpeg");
+    const contentType = response.headers.get("content-type") ?? "image/jpeg";
+    if (!contentType.toLowerCase().startsWith("image/")) throw new ApiError(502, "jellyfin_image_content_invalid", "图片服务返回了非图片内容");
+    reply.header("Content-Type", contentType);
     reply.header("Cache-Control", "private, max-age=86400");
     if (length > 0) reply.header("Content-Length", length);
     if (request.method === "HEAD") return reply.send();
     const body = Buffer.from(await response.arrayBuffer());
     if (body.length > 20 * 1024 * 1024) throw new ApiError(413, "jellyfin_image_too_large", "图片文件过大");
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-image",
+      事件: "返回Jellyfin图片",
+      服务ID: context.serviceId,
+      媒体条目ID: itemId,
+      图片类型: imageType,
+      图片字节数: body.length,
+    });
     return reply.send(body);
   } finally { clearTimeout(timer); }
 }
@@ -173,11 +244,11 @@ async function sendItemImage(runtime: ApiRuntime, compatibility: JellyfinCompati
 /** 将 Provider 原始媒体流转发给 Jellyfin 客户端。 */
 async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, context: JellyfinContext, request: FastifyRequest, reply: FastifyReply, itemId: string) {
   const service = await compatibility.requireEnabledService(context.serviceId);
-  if (Number(service.relay_playback_enabled) !== 1) throw new ApiError(409, "jellyfin_server_direct_disabled", "当前服务未启用中转播放");
+  // Jellyfin 的标准 Videos 接口本身就是服务端媒体入口，不受 APP 专用中转开关限制。
   const item = await runtime.repository.getCatalogItem(itemId, context.ownerUserId);
   if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
   const files = await runtime.repository.listItemFiles(itemId, context.ownerUserId);
-  const fileId = String(readQuery(request).MediaSourceId ?? "");
+  const fileId = readMediaSourceId(request);
   const itemFiles = files.filter((candidate) => String(candidate.itemId) === itemId);
   const file = fileId ? itemFiles.find((candidate) => String(candidate.fileId) === fileId) : itemFiles[0];
   if (!file) throw new ApiError(404, "jellyfin_media_source_not_found", "媒体源不存在");
@@ -190,7 +261,14 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompa
       (file.playbackLocator ?? {}) as Record<string, unknown>, abortController.signal);
     const upstream = await providerStream(access.url, { method: request.method, headers: buildUpstreamHeaders(request, access.headers) }, {
       allowInsecureHttp: runtime.config.allowInsecureProviderHttp,
-      logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", fields),
+      logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", {
+        ...fields,
+        日志关键字: "codex-jellyfin-compat",
+        事件: "Jellyfin播放上游连接失败",
+        服务ID: context.serviceId,
+        媒体条目ID: itemId,
+        源文件ID: String(file.fileId),
+      }),
     }, abortController.signal);
     upstreamBody = upstream.body;
     copyMediaResponseHeaders(reply, upstream.headers);
@@ -212,12 +290,16 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompa
 async function buildJellyfinLocalAddress(runtime: ApiRuntime, request: FastifyRequest, pathSuffix: string): Promise<string> {
   const configuredUrl = await runtime.publicAccess.buildJellyfinUrl(pathSuffix);
   if (configuredUrl) return configuredUrl;
+  // 关键变量：反向代理后的协议和主机优先使用标准转发头，直接访问时再使用 Fastify 当前请求值。
+  const forwardedProtocol = String(request.headers["x-forwarded-proto"] ?? "").split(",", 1)[0]?.trim().toLowerCase();
+  const forwardedHost = String(request.headers["x-forwarded-host"] ?? "").split(",", 1)[0]?.trim();
+  const requestProtocol = forwardedProtocol === "http" || forwardedProtocol === "https" ? forwardedProtocol : request.protocol;
   /** Host 保留当前请求实际使用的端口，适用于直接访问云助手 API 的场景。 */
-  const requestHost = String(request.headers.host ?? "").trim();
+  const requestHost = forwardedHost || String(request.headers.host ?? "").trim();
   const jellyfinPath = buildJellyfinPath(pathSuffix);
   if (!requestHost) return jellyfinPath;
   try {
-    return `${new URL(`${request.protocol}://${requestHost}`).origin}${jellyfinPath}`;
+    return `${new URL(`${requestProtocol}://${requestHost}`).origin}${jellyfinPath}`;
   } catch {
     return jellyfinPath;
   }
@@ -230,6 +312,8 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
   /** 使用自定义后缀找到真实服务 ID。 */
   const resolveServiceId = async (request: FastifyRequest): Promise<string> => compatibility.resolveServiceIdByPathSuffix(readPathSuffix(request));
   const authenticated = async (request: FastifyRequest) => compatibility.authenticate(await resolveServiceId(request), request);
+  /** 图片读取按 Jellyfin 标准不要求客户端图片组件附带访问令牌。 */
+  const publicImageContext = async (request: FastifyRequest) => compatibility.resolvePublicImageContext(await resolveServiceId(request));
   server.get(`${prefix}/System/Info/Public`, async (request) => {
     const serviceId = await resolveServiceId(request);
     const service = await compatibility.requireEnabledService(serviceId);
@@ -270,10 +354,13 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
   server.get(`${prefix}/Shows/:seriesId/Episodes`, async (request) => compatibility.listEpisodes(await authenticated(request), String((request.params as { seriesId: string }).seriesId), readQuery(request)));
   server.get(`${prefix}/Shows/NextUp`, async (request) => compatibility.listNextUp(await authenticated(request), readQuery(request)));
   server.route({ method: ["GET", "POST"], url: `${prefix}/Items/:itemId/PlaybackInfo`, handler: async (request) => buildPlaybackInfo(runtime, compatibility, await authenticated(request), request, String((request.params as { itemId: string }).itemId)) });
-  server.route({ method: ["GET", "HEAD"], url: `${prefix}/videos/:itemId/stream.:container`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
-  server.route({ method: ["GET", "HEAD"], url: `${prefix}/videos/:itemId/stream`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
-  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
-  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+  // 官方 Jellyfin 使用 /Videos；Fastify 已按 Jellyfin 行为配置为大小写不敏感，Flymby 的 /videos 同样命中。
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Videos/:itemId/stream.:container`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Videos/:itemId/stream`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+  // 兼容 Jellyfin 旧客户端仍在使用的完整图片路径参数形式，实际缩放参数由上游图片承担。
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index/:tag/:format/:maxWidth/:maxHeight/:percentPlayed/:unplayedCount`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
   server.post(`${prefix}/Sessions/Playing`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "playing", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
   server.post(`${prefix}/Sessions/Playing/Progress`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "progress", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
   server.post(`${prefix}/Sessions/Playing/Stopped`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "stopped", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });

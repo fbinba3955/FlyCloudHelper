@@ -11,10 +11,14 @@ import {
   type MediaProbeResult,
 } from "./media/media-probe.js";
 
-export interface JellyfinContext {
+/** Jellyfin 媒体库和图片读取共用的服务上下文。 */
+export interface JellyfinLibraryContext {
   serviceId: string;
   ownerUserId: string;
   libraryId: string;
+}
+
+export interface JellyfinContext extends JellyfinLibraryContext {
   accountId: string;
   accountUsername: string;
   accountHasPassword: boolean;
@@ -68,6 +72,54 @@ function isJellyfinMediaSpecsEnabled(profileJson: unknown): boolean {
   return videoProfile.analyzeMediaSpecs === true;
 }
 
+/** 把目录文件映射为不包含转码能力的标准 Jellyfin MediaSourceInfo。 */
+function mapCatalogMediaSource(file: JellyfinFileSummary, mediaSpecsReady: boolean): Record<string, unknown> {
+  const fileName = String(file.name || "video.mp4");
+  const mediaProbe = mediaSpecsReady ? file.mediaProbe : null;
+  const fileRunTimeTicks = mediaProbe?.runTimeTicks ?? 0;
+  return {
+    Protocol: "File",
+    Id: file.fileId,
+    Path: fileName,
+    EncoderPath: null,
+    EncoderProtocol: null,
+    Type: "Default",
+    Container: mediaProbe?.container || undefined,
+    Size: mediaProbe?.size || undefined,
+    Name: fileName,
+    IsRemote: false,
+    ETag: null,
+    RunTimeTicks: fileRunTimeTicks || undefined,
+    ReadAtNativeFramerate: false,
+    IgnoreDts: false,
+    IgnoreIndex: false,
+    GenPtsInput: false,
+    SupportsTranscoding: false,
+    SupportsDirectStream: true,
+    SupportsDirectPlay: true,
+    IsInfiniteStream: false,
+    UseMostCompatibleTranscodingProfile: false,
+    RequiresOpening: false,
+    OpenToken: null,
+    RequiresClosing: false,
+    LiveStreamId: null,
+    BufferMs: null,
+    RequiresLooping: false,
+    SupportsProbing: false,
+    MediaStreams: mediaProbe?.mediaStreams ?? [],
+    MediaAttachments: [],
+    Formats: [],
+    Bitrate: mediaProbe?.bitRate || undefined,
+    RequiredHttpHeaders: {},
+    TranscodingUrl: null,
+    TranscodingSubProtocol: null,
+    TranscodingContainer: null,
+    AnalyzeDurationMs: null,
+    DefaultAudioStreamIndex: null,
+    DefaultSubtitleStreamIndex: null,
+  };
+}
+
 /** 从 MediaBrowser 认证头或 Jellyfin 常见参数中读取访问令牌。 */
 export function readJellyfinToken(request: FastifyRequest): string {
   const direct = request.headers["x-emby-token"] ?? request.headers["x-mediabrowser-token"];
@@ -116,6 +168,16 @@ export class JellyfinCompatibilityService {
     if (!row) throw new ApiError(404, "jellyfin_service_not_found", "Jellyfin 服务不存在");
     if (Number(row.jellyfin_enabled) !== 1 || row.status === "disabled") throw new ApiError(404, "jellyfin_service_disabled", "Jellyfin 服务未启用");
     return row;
+  }
+
+  /** 为 Jellyfin 公开图片接口生成仅包含媒体归属的上下文。 */
+  public async resolvePublicImageContext(serviceId: string): Promise<JellyfinLibraryContext> {
+    const service = await this.requireEnabledService(serviceId);
+    return {
+      serviceId,
+      ownerUserId: String(service.user_id),
+      libraryId: String(service.library_id),
+    };
   }
 
   /** 使用服务独立账号登录并创建仅属于该服务的 Jellyfin 会话。 */
@@ -216,7 +278,7 @@ export class JellyfinCompatibilityService {
   }
 
   /** 返回当前服务固定的电影、节目两个虚拟媒体库定义。 */
-  private getLibraryDefinitions(context: JellyfinContext): JellyfinLibraryDefinition[] {
+  private getLibraryDefinitions(context: JellyfinLibraryContext): JellyfinLibraryDefinition[] {
     return [
       { id: `${context.libraryId}:movies`, name: "电影", collectionType: "movies", itemType: "video.movie" },
       { id: `${context.libraryId}:tvshows`, name: "节目", collectionType: "tvshows", itemType: "video.series" },
@@ -224,7 +286,7 @@ export class JellyfinCompatibilityService {
   }
 
   /** 根据 Jellyfin 虚拟媒体库 ID 读取媒体类型约束。 */
-  private findLibraryDefinition(context: JellyfinContext, libraryId: string): JellyfinLibraryDefinition | undefined {
+  private findLibraryDefinition(context: JellyfinLibraryContext, libraryId: string): JellyfinLibraryDefinition | undefined {
     return this.getLibraryDefinitions(context).find((library) => library.id === libraryId);
   }
 
@@ -391,18 +453,7 @@ export class JellyfinCompatibilityService {
       Container: primaryProbe?.container || undefined,
       Bitrate: primaryProbe?.bitRate || undefined,
       MediaStreams: primaryProbe?.mediaStreams,
-      MediaSources: itemFiles.map((file) => {
-        const fileName = String(file.name ?? "video.mp4");
-        const mediaProbe = mediaSpecsReady ? file.mediaProbe : null;
-        const fileRunTimeTicks = mediaProbe?.runTimeTicks ?? 0;
-        return {
-          Id: String(file.fileId), Name: fileName, Path: fileName, Type: "Default",
-          Container: mediaProbe?.container || undefined,
-          Size: mediaProbe?.size || undefined, Bitrate: mediaProbe?.bitRate || undefined,
-          SupportsDirectPlay: true, SupportsDirectStream: true, SupportsTranscoding: false,
-          RunTimeTicks: fileRunTimeTicks || undefined, MediaStreams: mediaProbe?.mediaStreams,
-        };
-      }),
+      MediaSources: itemFiles.map((file) => mapCatalogMediaSource(file, mediaSpecsReady)),
       SeriesId: type === "Episode" ? parent?.id : undefined, SeriesName: type === "Episode" ? parent?.title ?? item.subtitle : undefined,
       ParentIndexNumber: type === "Episode" ? seasonNumber : undefined, IndexNumber: type === "Episode" ? episodeNumber : undefined,
       SeasonId: type === "Episode" && parent ? `season:${parent.id}:${seasonNumber}` : undefined,
@@ -649,7 +700,7 @@ export class JellyfinCompatibilityService {
   }
 
   /** 为普通条目、虚拟媒体库和虚拟季解析实际承载图片的媒体条目。 */
-  public async resolveImageItem(context: JellyfinContext, itemId: string, imageType: string): Promise<MediaItemRecord> {
+  public async resolveImageItem(context: JellyfinLibraryContext, itemId: string, imageType: string): Promise<MediaItemRecord> {
     const library = this.findLibraryDefinition(context, itemId);
     if (library) {
       const result = await this.runtime.repository.listCatalogItems({
@@ -676,7 +727,24 @@ export class JellyfinCompatibilityService {
         请求条目ID: itemId, 实际条目ID: resolvedItemId, 图片类型: imageType,
       });
     }
-    return item;
+    const requestedImageUrl = imageType.toLowerCase() === "backdrop" ? item.backdropUrl : item.posterUrl;
+    if (requestedImageUrl || item.itemType !== "video.episode") return item;
+    // 单集 DTO 可以继承节目海报和背景图；图片请求使用单集 ID 时同样要回退到所属节目。
+    const relation = await this.runtime.database.query("media_relations")
+      .where({ library_id: context.libraryId, child_item_id: item.id }).first();
+    if (!relation) return item;
+    const parent = await this.runtime.repository.getCatalogItem(String(relation.parent_item_id), context.ownerUserId);
+    const parentImageUrl = imageType.toLowerCase() === "backdrop" ? parent.backdropUrl : parent.posterUrl;
+    if (parent.serviceId !== context.serviceId || !parentImageUrl) return item;
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-image",
+      事件: "Jellyfin单集图片回退到节目图片",
+      服务ID: context.serviceId,
+      单集条目ID: item.id,
+      节目条目ID: parent.id,
+      图片类型: imageType,
+    });
+    return parent;
   }
 
   /** 查询继续观看条目。 */

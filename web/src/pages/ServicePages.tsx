@@ -860,8 +860,8 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
                   {!relayPlaybackSupported
                     ? "当前网盘类型暂不支持中转播放。"
                     : service.relayPlaybackEnabled
-                      ? "APP 可以让媒体流经过 FlyCloudHelper，服务器将承担播放带宽。"
-                      : "APP 不能通过 FlyCloudHelper 中转该服务的媒体文件。"}
+                      ? "FlyCloudHelper APP 可以让媒体流经过服务器；Jellyfin 标准视频接口始终由服务器提供。"
+                      : "FlyCloudHelper APP 不使用专用中转；Jellyfin 标准视频接口不受此开关影响。"}
                 </p>
               </div>
               <button

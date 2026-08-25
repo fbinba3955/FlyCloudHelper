@@ -76,6 +76,8 @@ function createBusinessLogger(server: FastifyInstance) {
 /** 创建并初始化 FlyCloudHelper API、Worker 与全部后台能力。 */
 export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance> {
   const server = Fastify({
+    // Jellyfin 官方 ASP.NET 路由不区分大小写，兼容客户端可能混用 Items/items、Videos/videos。
+    caseSensitive: false,
     logger: {
       level: process.env.NODE_ENV === "production" ? "info" : "debug",
       redact: {

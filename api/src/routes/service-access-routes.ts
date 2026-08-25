@@ -115,7 +115,7 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-jellyfin-path", 事件: pathSuffix ? "更新媒体库Jellyfin地址" : (request.body.jellyfinEnabled ? "启用媒体库Jellyfin协议" : "停用媒体库Jellyfin协议"),
         操作用户ID: operator.id, 基础服务ID: request.params.serviceId, 撤销会话数: revokedCount,
-        Jellyfin地址后缀: pathSuffix?.value,
+        Jellyfin地址后缀: pathSuffix?.value ?? null,
         公开地址来源: publicAccess.source, 是否使用云助手请求地址: !publicAccess.publicBaseUrl,
       });
       return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
