@@ -221,7 +221,7 @@ export function ConsoleShell({
       await notifications.refresh();
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "全部通知清除失败";
-      console.warn("codex-flycloud-notification", {
+      console.warn("codex-flycloud-notification-clear", {
         事件: "网页清除全部通知失败",
         错误信息: errorMessage,
       });

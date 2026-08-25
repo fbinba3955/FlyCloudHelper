@@ -88,13 +88,15 @@ function createRequestId(): string {
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
+    // 关键变量：没有请求体时不能声明 JSON，否则 Fastify 会把空请求体判定为 JSON 解析失败。
+    const requestHeaders = new Headers(init?.headers);
+    if (init?.body !== undefined && !requestHeaders.has("Content-Type")) {
+      requestHeaders.set("Content-Type", "application/json");
+    }
     response = await fetch(path, {
       ...init,
       credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        ...init?.headers,
-      },
+      headers: requestHeaders,
     });
   } catch {
     throw new ApiClientError(0, "network_error", "无法连接 FlyCloudHelper API");

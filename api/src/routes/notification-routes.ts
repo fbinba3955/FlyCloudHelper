@@ -24,13 +24,23 @@ export async function registerNotificationRoutes(server: FastifyInstance, runtim
 
   server.delete("/api/v1/notifications", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
-    const deletedCount = await runtime.database.clearNotifications(user.id);
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-flycloud-notification",
-      事件: "用户清除全部通知",
-      用户ID: user.id,
-      清除数量: deletedCount,
-    });
-    return { deletedCount };
+    try {
+      const deletedCount = await runtime.database.clearNotifications(user.id);
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-notification-clear",
+        事件: "用户清除全部通知",
+        用户ID: user.id,
+        清除数量: deletedCount,
+      });
+      return { deletedCount };
+    } catch (error) {
+      runtime.logBusinessEvent("warn", {
+        日志关键字: "codex-flycloud-notification-clear",
+        事件: "用户清除全部通知失败",
+        用户ID: user.id,
+        错误类型: error instanceof Error ? error.name : "unknown",
+      });
+      throw error;
+    }
   });
 }
