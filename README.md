@@ -82,6 +82,8 @@ services:
       FLYCLOUDHELPER_DATABASE_TYPE: sqlite
       FLYCLOUDHELPER_COOKIE_SECURE: "false"
       FLYCLOUDHELPER_ALLOW_INSECURE_HTTP: "true"
+      FLYCLOUDHELPER_PUID: "1000"
+      FLYCLOUDHELPER_PGID: "1000"
     volumes:
       - flycloud_helper_data:/data
 
@@ -157,6 +159,8 @@ docker run -d \
 镜像同时支持 `linux/amd64` 和 `linux/arm64`。固定版本可将 `latest` 改为 `0.1.3`。
 
 容器内部端口固定为 `9934`，`-p` 左侧可以修改宿主机端口。`/data` 必须持久化，其中保存 SQLite 数据库、凭据主密钥、插件和导出文件。即使改用 PostgreSQL 或 MySQL，也不能删除这个数据卷。
+
+镜像启动时会先以 root 身份创建并修复 `/data` 下的数据库、密钥、插件、导出和迁移目录，再按 `FLYCLOUDHELPER_PUID`、`FLYCLOUDHELPER_PGID` 指定的普通用户身份启动服务，默认均为 `1000`。这可以兼容极空间、飞牛等 NAS 创建的 root 所有宿主机挂载目录。使用目录映射且 NAS 所有者不是 `1000:1000` 时，应把两个变量改成该目录实际的 UID/GID；只读挂载、NFS/SMB root squash 或 NAS ACL 禁止容器修改权限时，仍需先在宿主机授权。
 
 启动后访问 `http://服务器地址:9934/setup` 设置超级管理员。
 
@@ -266,6 +270,8 @@ cp .env.example .env
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `FLYCLOUDHELPER_HOST_PORT` | `9934` | Docker 对外端口 |
+| `FLYCLOUDHELPER_PUID` | `1000` | 容器内后台进程使用的用户 ID；启动时用于修复 `/data` 权限 |
+| `FLYCLOUDHELPER_PGID` | `1000` | 容器内后台进程使用的用户组 ID；启动时用于修复 `/data` 权限 |
 | `FLYCLOUDHELPER_DATABASE_TYPE` | `sqlite` | 数据库类型：`sqlite`、`postgres` 或 `mysql` |
 | `FLYCLOUDHELPER_SQLITE_PATH` | `data/database/flycloud-helper.db` | SQLite 文件位置 |
 | `FLYCLOUDHELPER_DATABASE_HOST` | 空 | PostgreSQL 或 MySQL 地址 |

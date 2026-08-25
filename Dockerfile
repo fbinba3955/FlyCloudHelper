@@ -31,6 +31,8 @@ FROM node:20-bookworm-slim AS runtime
 ENV NODE_ENV=production \
     FLYCLOUDHELPER_API_HOST=0.0.0.0 \
     FLYCLOUDHELPER_API_PORT=9934 \
+    FLYCLOUDHELPER_PUID=1000 \
+    FLYCLOUDHELPER_PGID=1000 \
     FLYCLOUDHELPER_PUBLIC_BASE_URL= \
     FLYCLOUDHELPER_DATABASE_TYPE=sqlite \
     FLYCLOUDHELPER_DATABASE_HOST= \
@@ -59,19 +61,22 @@ COPY --from=build --chown=node:node /app/package.json ./package.json
 COPY --from=build --chown=node:node /app/api/package.json ./api/package.json
 COPY --from=build --chown=node:node /app/api/dist ./api/dist
 COPY --from=build --chown=node:node /app/web/dist ./web/dist
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-# Debian 的 ffmpeg 软件包同时提供原生 amd64/arm64 ffprobe，镜像启动后无需宿主机安装或挂载。
+# Debian 的 ffmpeg 软件包提供原生 ffprobe；gosu 用于修复 NAS 挂载权限后降权启动服务。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
+    && apt-get install -y --no-install-recommends ffmpeg gosu \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations \
     && chown -R node:node /data
 
-USER node
+# 入口脚本需要先修复 NAS 挂载目录，随后立即通过 gosu 降权运行 Node 服务。
+USER root
 EXPOSE 9934
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + process.env.FLYCLOUDHELPER_API_PORT + '/api/v1/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "api/dist/main.js"]

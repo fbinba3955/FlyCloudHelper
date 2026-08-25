@@ -4,7 +4,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
 import { buildJellyfinPath } from "../jellyfin-path.js";
 import { parseCompletedMediaProbeResult, readJellyfinRunTimeTicks } from "../media/media-probe.js";
-import { JellyfinCompatibilityService, readJellyfinToken, type JellyfinContext, type JellyfinLibraryContext } from "../jellyfin-service.js";
+import { JellyfinCompatibilityService, type JellyfinContext, type JellyfinLibraryContext } from "../jellyfin-service.js";
 import { providerFetch, providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
@@ -181,15 +181,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
 }
 
 /** 通过 Jellyfin 图片接口代理媒体库已经保存的公开 HTTP 图片。 */
-async function sendItemImage(runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, context: JellyfinLibraryContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
-  runtime.logBusinessEvent("info", {
-    日志关键字: "codex-jellyfin-image",
-    事件: "收到Jellyfin图片请求",
-    服务ID: context.serviceId,
-    媒体条目ID: itemId,
-    图片类型: imageType,
-    是否携带访问令牌: Boolean(readJellyfinToken(request)),
-  });
+async function sendItemImage(compatibility: JellyfinCompatibilityService, context: JellyfinLibraryContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
   const item = await compatibility.resolveImageItem(context, itemId, imageType);
   const rawUrl = imageType.toLowerCase() === "backdrop" ? item.backdropUrl : item.posterUrl;
   if (!rawUrl) throw new ApiError(404, "jellyfin_image_not_found", "图片不存在");
@@ -209,14 +201,6 @@ async function sendItemImage(runtime: ApiRuntime, compatibility: JellyfinCompati
     const response = await providerFetch(imageUrl, { method: request.method === "HEAD" ? "HEAD" : "GET" }, {
       // 图片 URL 已经是媒体库元数据的一部分；协议层同时兼容 NFO 中常见的 HTTP 图片地址。
       allowInsecureHttp: true,
-      logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", {
-        ...fields,
-        日志关键字: "codex-jellyfin-image",
-        事件: "Jellyfin图片上游请求失败",
-        服务ID: context.serviceId,
-        媒体条目ID: itemId,
-        图片类型: imageType,
-      }),
     }, controller.signal);
     if (!response.ok) throw new ApiError(502, "jellyfin_image_upstream_failed", "图片服务暂时不可用");
     const length = Number(response.headers.get("content-length") ?? 0);
@@ -229,14 +213,6 @@ async function sendItemImage(runtime: ApiRuntime, compatibility: JellyfinCompati
     if (request.method === "HEAD") return reply.send();
     const body = Buffer.from(await response.arrayBuffer());
     if (body.length > 20 * 1024 * 1024) throw new ApiError(413, "jellyfin_image_too_large", "图片文件过大");
-    runtime.logBusinessEvent("info", {
-      日志关键字: "codex-jellyfin-image",
-      事件: "返回Jellyfin图片",
-      服务ID: context.serviceId,
-      媒体条目ID: itemId,
-      图片类型: imageType,
-      图片字节数: body.length,
-    });
     return reply.send(body);
   } finally { clearTimeout(timer); }
 }
@@ -261,14 +237,7 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompa
       (file.playbackLocator ?? {}) as Record<string, unknown>, abortController.signal);
     const upstream = await providerStream(access.url, { method: request.method, headers: buildUpstreamHeaders(request, access.headers) }, {
       allowInsecureHttp: runtime.config.allowInsecureProviderHttp,
-      logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", {
-        ...fields,
-        日志关键字: "codex-jellyfin-compat",
-        事件: "Jellyfin播放上游连接失败",
-        服务ID: context.serviceId,
-        媒体条目ID: itemId,
-        源文件ID: String(file.fileId),
-      }),
+      logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", fields),
     }, abortController.signal);
     upstreamBody = upstream.body;
     copyMediaResponseHeaders(reply, upstream.headers);
@@ -357,10 +326,10 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
   // 官方 Jellyfin 使用 /Videos；Fastify 已按 Jellyfin 行为配置为大小写不敏感，Flymby 的 /videos 同样命中。
   server.route({ method: ["GET", "HEAD"], url: `${prefix}/Videos/:itemId/stream.:container`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
   server.route({ method: ["GET", "HEAD"], url: `${prefix}/Videos/:itemId/stream`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
-  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
-  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType`, handler: async (request, reply) => sendItemImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index`, handler: async (request, reply) => sendItemImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
   // 兼容 Jellyfin 旧客户端仍在使用的完整图片路径参数形式，实际缩放参数由上游图片承担。
-  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index/:tag/:format/:maxWidth/:maxHeight/:percentPlayed/:unplayedCount`, handler: async (request, reply) => sendItemImage(runtime, compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Images/:imageType/:index/:tag/:format/:maxWidth/:maxHeight/:percentPlayed/:unplayedCount`, handler: async (request, reply) => sendItemImage(compatibility, await publicImageContext(request), request, reply, String((request.params as { itemId: string }).itemId), String((request.params as { imageType: string }).imageType)) });
   server.post(`${prefix}/Sessions/Playing`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "playing", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
   server.post(`${prefix}/Sessions/Playing/Progress`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "progress", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
   server.post(`${prefix}/Sessions/Playing/Stopped`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "stopped", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });

@@ -736,14 +736,6 @@ export class JellyfinCompatibilityService {
     const parent = await this.runtime.repository.getCatalogItem(String(relation.parent_item_id), context.ownerUserId);
     const parentImageUrl = imageType.toLowerCase() === "backdrop" ? parent.backdropUrl : parent.posterUrl;
     if (parent.serviceId !== context.serviceId || !parentImageUrl) return item;
-    this.runtime.logBusinessEvent("info", {
-      日志关键字: "codex-jellyfin-image",
-      事件: "Jellyfin单集图片回退到节目图片",
-      服务ID: context.serviceId,
-      单集条目ID: item.id,
-      节目条目ID: parent.id,
-      图片类型: imageType,
-    });
     return parent;
   }
 
