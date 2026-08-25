@@ -1,6 +1,7 @@
 import type { ApiConfig } from "./config.js";
 import type { FlyCloudHelperDatabase } from "./database.js";
 import { validationError } from "./errors.js";
+import { buildJellyfinPath } from "./jellyfin-path.js";
 
 const publicBaseUrlSettingKey = "public_base_url";
 
@@ -49,9 +50,9 @@ export class PublicAccessService {
     return this.getStatus();
   }
 
-  /** 生成某个服务对外提供的 Jellyfin 根地址。 */
-  public async buildJellyfinUrl(serviceId: string): Promise<string | null> {
+  /** 使用媒体库自定义后缀生成 Jellyfin 根地址。 */
+  public async buildJellyfinUrl(pathSuffix: string): Promise<string | null> {
     const status = await this.getStatus();
-    return status.publicBaseUrl ? `${status.publicBaseUrl}/jellyfin/${encodeURIComponent(serviceId)}` : null;
+    return status.publicBaseUrl ? `${status.publicBaseUrl}${buildJellyfinPath(pathSuffix)}` : null;
   }
 }

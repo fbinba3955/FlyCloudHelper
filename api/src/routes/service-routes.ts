@@ -35,6 +35,26 @@ export function hasHttpProviderAddress(connection: Record<string, unknown>): boo
   return Object.values(connection).some((value) => typeof value === "string" && /^http:\/\//iu.test(value.trim()));
 }
 
+/** 记录阿里云盘和百度网盘的自动配置结果，不输出令牌、地址或文件路径。 */
+function logCloudDriveAutomaticConfig(
+  runtime: ApiRuntime,
+  providerType: string,
+  event: "创建服务" | "更新连接",
+  serviceId: string,
+  userId: string,
+): void {
+  if (providerType !== "aliyundrive" && providerType !== "baidupan") return;
+  runtime.logBusinessEvent("info", {
+    日志关键字: "codex-cloud-drive-automatic-config",
+    事件: event,
+    用户ID: userId,
+    服务ID: serviceId,
+    网盘类型: providerType,
+    云盘标识来源: providerType === "aliyundrive" ? "接口自动获取" : "不适用",
+    开放接口地址来源: "官方默认地址",
+  });
+}
+
 /** 从 APP 同步请求中读取光鸭官方 API 字段，并兼容 APP 当前运行时字段名称。 */
 function readGuangyaOfficialApiText(
   connectionInput: Record<string, unknown>,
@@ -523,6 +543,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     });
     const service = creation.service;
     consumeProviderAuthorization(runtime, user.id, resolvedConnection.authorizationSessionId);
+    logCloudDriveAutomaticConfig(runtime, providerType, "创建服务", service.id, user.id);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-service-data-type",
       事件: "创建云端服务",
@@ -664,6 +685,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       expectedRevision: readExpectedRevision(request.body.expectedRevision),
     });
     consumeProviderAuthorization(runtime, user.id, resolvedConnection.authorizationSessionId);
+    logCloudDriveAutomaticConfig(runtime, service.providerType, "更新连接", service.id, user.id);
     if (service.providerType === "guangya" && connection.authMode === "official_api") {
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-flycloud-helper-guangya-official-api",

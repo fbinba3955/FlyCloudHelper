@@ -205,7 +205,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
 
   server.addHook("preHandler", async (request) => {
     // 关键变量：Jellyfin 同样依赖数据库和凭据主密钥，初始化或主密钥待备份时不能绕过后台保护状态。
-    const requiresReadyState = request.url.startsWith("/api/") || request.url.startsWith("/jellyfin/");
+    const requiresReadyState = request.url.startsWith("/api/") || request.url.startsWith("/j/");
     const systemState = requiresReadyState ? await database.getSystemState() : null;
     if (systemState?.setupRequired && !isSetupPublicPath(request.url)) {
       throw new ApiError(503, "setup_required", "实例尚未完成首次初始化");
@@ -365,7 +365,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       wildcard: false,
     });
     server.setNotFoundHandler((request, reply) => {
-      if (request.url.startsWith("/api/") || request.url.startsWith("/jellyfin/")) {
+      if (request.url.startsWith("/api/") || request.url.startsWith("/j/")) {
         return reply.status(404).send({ error: { code: "not_found", message: "接口不存在" } });
       }
       return reply.sendFile("index.html");

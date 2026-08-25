@@ -95,11 +95,24 @@ export class JellyfinCompatibilityService {
 
   public constructor(private readonly runtime: ApiRuntime) {}
 
+  /** 根据媒体库自定义地址后缀解析其基础服务。 */
+  public async resolveServiceIdByPathSuffix(pathSuffix: string): Promise<string> {
+    const row = await this.runtime.database.query("media_libraries as l")
+      .join("cloud_services as s", "s.id", "l.service_id")
+      .select("l.service_id")
+      .where("l.jellyfin_path_suffix_lookup", pathSuffix.toLowerCase())
+      .whereNull("s.deleted_at")
+      .first();
+    if (!row) throw new ApiError(404, "jellyfin_service_not_found", "Jellyfin 服务地址不存在");
+    return String(row.service_id);
+  }
+
   /** 校验服务启用状态，不要求客户端已登录。 */
   public async requireEnabledService(serviceId: string) {
-    const row = await this.runtime.database.query("cloud_services")
-      .select("id", "user_id", "library_id", "display_name", "status", "jellyfin_enabled", "relay_playback_enabled", "provider_type", "credential_revision")
-      .where({ id: serviceId }).whereNull("deleted_at").first();
+    const row = await this.runtime.database.query("cloud_services as s")
+      .join("media_libraries as l", "l.id", "s.library_id")
+      .select("s.id", "s.user_id", "s.library_id", "s.display_name", "s.status", "l.jellyfin_enabled", "s.relay_playback_enabled", "s.provider_type", "s.credential_revision")
+      .where("s.id", serviceId).whereNull("s.deleted_at").first();
     if (!row) throw new ApiError(404, "jellyfin_service_not_found", "Jellyfin 服务不存在");
     if (Number(row.jellyfin_enabled) !== 1 || row.status === "disabled") throw new ApiError(404, "jellyfin_service_disabled", "Jellyfin 服务未启用");
     return row;
@@ -153,13 +166,14 @@ export class JellyfinCompatibilityService {
     const row = await this.runtime.database.query("service_protocol_sessions as ps")
       .join("service_access_accounts as a", "a.id", "ps.account_id")
       .join("cloud_services as s", "s.id", "ps.service_id")
+      .join("media_libraries as l", "l.id", "s.library_id")
       .leftJoin("service_metadata_profiles as mp", function joinCurrentMetadataProfile() {
         this.on("mp.service_id", "s.id").andOn("mp.revision", "s.metadata_profile_revision");
       })
       .select(
         "ps.*", "a.username", "a.password_required", "a.credential_revision as account_revision",
         "a.status as account_status", "s.user_id", "s.library_id", "s.status as service_status",
-        "s.jellyfin_enabled", "mp.configuration_json as metadata_profile_json",
+        "l.jellyfin_enabled", "mp.configuration_json as metadata_profile_json",
       )
       .where("ps.token_hash", hashSessionToken(token)).where("ps.service_id", serviceId).where("ps.protocol", "jellyfin").whereNull("ps.revoked_at").whereNull("s.deleted_at").first();
     if (!row || String(row.expires_at) <= new Date().toISOString() || Number(row.credential_revision) !== Number(row.account_revision)

@@ -15,7 +15,7 @@ export interface ServiceAccessAccountRecord {
   updatedAt: string;
 }
 
-/** 创建服务时一次性返回给用户的初始凭据。 */
+/** 创建服务或重置密码时返回给用户的访问凭据；免密码账号的 password 为空。 */
 export interface GeneratedServiceAccessCredentials {
   account: ServiceAccessAccountRecord;
   password: string;
@@ -48,7 +48,7 @@ export function generateServiceAccessPassword(): string {
 export class ServiceAccessService {
   public constructor(private readonly database: FlyCloudHelperDatabase) {}
 
-  /** 为升级前已经存在的服务补齐账号；初始随机密码不可读取，用户可在详情页重置。 */
+  /** 为升级前已经存在的服务补齐默认免密码账号。 */
   public async ensureExistingServices(): Promise<number> {
     const services = await this.database.query("cloud_services as s")
       .leftJoin("service_access_accounts as a", "a.service_id", "s.id")
@@ -57,9 +57,9 @@ export class ServiceAccessService {
     return services.length;
   }
 
-  /** 为新服务创建稳定账号，并返回仅本次可见的明文密码。 */
+  /** 为新服务创建稳定的默认免密码账号。 */
   public async createForService(serviceId: string, transaction = this.database.query): Promise<GeneratedServiceAccessCredentials> {
-    const password = generateServiceAccessPassword();
+    const password = ""; // 关键变量：新服务默认允许 Jellyfin 免密码登录，用户仍可在详情页主动设置密码。
     const username = `flymby_${serviceId.replaceAll("-", "").slice(0, 8)}`;
     const accountId = randomUUID();
     const now = new Date().toISOString();
@@ -69,14 +69,14 @@ export class ServiceAccessService {
       username,
       username_lookup: createUsernameLookup(username),
       password_hash: await hashPassword(password),
-      password_required: 1,
+      password_required: 0,
       credential_revision: 1,
       status: "active",
       created_at: now,
       updated_at: now,
     });
     return {
-      account: { id: accountId, serviceId, username, hasPassword: true, credentialRevision: 1, status: "active", createdAt: now, updatedAt: now },
+      account: { id: accountId, serviceId, username, hasPassword: false, credentialRevision: 1, status: "active", createdAt: now, updatedAt: now },
       password,
     };
   }

@@ -373,7 +373,7 @@ export function AdminConfigurationPage() {
           <label className="min-w-0 flex-1"><span className="text-xs font-medium">对外地址覆盖值（可选）</span><input name="publicBaseUrl" type="url" defaultValue={resource.data?.publicAccess.publicBaseUrl ?? ""} disabled={resource.data?.publicAccess.editable === false} placeholder="选填，例如 https://media.example.com" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm disabled:opacity-60" /></label>
           <PrimaryButton type="submit" disabled={resource.data?.publicAccess.editable === false}><Save className="size-4" /> 保存地址</PrimaryButton>
         </form>
-        <p className="mt-3 text-xs text-muted-foreground">作用：仅当使用反向代理、HTTPS 域名，或外部端口与云助手 API 实际地址不一致时填写。系统会在该地址后自动追加 /jellyfin/{`{服务ID}`}；清空不会影响 Jellyfin 的启用和访问。</p>
+        <p className="mt-3 text-xs text-muted-foreground">作用：仅当使用反向代理、HTTPS 域名，或外部端口与云助手 API 实际地址不一致时填写。系统会在该地址后自动追加媒体库设置中的 /j/{`{自定义后缀}`}；清空不会影响 Jellyfin 的启用和访问。</p>
         <p className="mt-2 text-xs text-muted-foreground">配置来源：{resource.data?.publicAccess.source === "environment" ? "环境变量（控制台只读）" : resource.data?.publicAccess.source === "database" ? "数据库" : "未设置（使用云助手 API 地址）"}</p>
       </Panel>
       <Panel title="TMDB Key 配置" description="支持 API Key 或 Read Access Token；每行一个，也可以使用英文逗号分隔。" className="mt-4">

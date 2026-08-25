@@ -215,6 +215,8 @@ export interface ServiceAccessSettings {
   jellyfinEnabled: boolean;
   jellyfinUrl: string | null;
   jellyfinPath: string;
+  /** 固定 /j/ 前缀之后的单层可编辑地址后缀。 */
+  jellyfinPathSuffix: string;
   account: {
     id: string;
     serviceId: string;
@@ -897,9 +899,13 @@ export function revokeServiceAccessSessions(serviceId: string, admin = false): P
   return requestJson(admin ? `/api/v1/admin/services/${serviceId}/access-account/revoke-sessions` : `/api/v1/services/${serviceId}/access-account/revoke-sessions`, { method: "POST", body: "{}" });
 }
 
-/** 启用或关闭单个服务的 Jellyfin 协议。 */
-export async function updateServiceJellyfinSettings(serviceId: string, jellyfinEnabled: boolean, admin = false): Promise<ServiceAccessSettings> {
-  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/jellyfin-settings` : `/api/v1/services/${serviceId}/jellyfin-settings`, { method: "PATCH", body: JSON.stringify({ jellyfinEnabled }) });
+/** 修改单个媒体库的 Jellyfin 开关或自定义地址后缀。 */
+export async function updateServiceJellyfinSettings(
+  serviceId: string,
+  input: { jellyfinEnabled?: boolean; jellyfinPathSuffix?: string },
+  admin = false,
+): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/jellyfin-settings` : `/api/v1/services/${serviceId}/jellyfin-settings`, { method: "PATCH", body: JSON.stringify(input) });
   return result.settings;
 }
 

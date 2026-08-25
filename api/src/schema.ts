@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 28;
+export const currentSchemaVersion = 30;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -171,7 +171,6 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("status", 32).notNullable();
       table.string("connection_status", 64).notNullable();
       table.integer("relay_playback_enabled").notNullable().defaultTo(0);
-      table.integer("jellyfin_enabled").notNullable().defaultTo(0);
       table.integer("credential_revision").notNullable();
       table.integer("scan_profile_revision").notNullable();
       table.integer("metadata_profile_revision").notNullable();
@@ -188,9 +187,6 @@ async function createServiceTables(database: Knex): Promise<void> {
     await addColumnIfMissing(database, "cloud_services", "relay_playback_enabled", (table) => {
       table.integer("relay_playback_enabled").notNullable().defaultTo(0);
     });
-    await addColumnIfMissing(database, "cloud_services", "jellyfin_enabled", (table) => {
-      table.integer("jellyfin_enabled").notNullable().defaultTo(0);
-    });
   }
 
   if (!(await database.schema.hasTable("media_libraries"))) {
@@ -200,10 +196,24 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("service_id", 64).notNullable().unique().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.string("provider_type", 64).notNullable();
       table.bigInteger("catalog_version").notNullable().defaultTo(0);
+      table.integer("jellyfin_enabled").notNullable().defaultTo(0);
+      table.string("jellyfin_path_suffix", 255).notNullable();
+      table.string("jellyfin_path_suffix_lookup", 255).notNullable();
       table.string("status", 32).notNullable();
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
       table.index(["user_id"], "idx_media_libraries_user");
+      table.unique(["jellyfin_path_suffix_lookup"], { indexName: "uq_media_libraries_jellyfin_path_suffix" });
+    });
+  } else {
+    await addColumnIfMissing(database, "media_libraries", "jellyfin_enabled", (table) => {
+      table.integer("jellyfin_enabled").notNullable().defaultTo(0);
+    });
+    await addColumnIfMissing(database, "media_libraries", "jellyfin_path_suffix", (table) => {
+      table.string("jellyfin_path_suffix", 255).nullable();
+    });
+    await addColumnIfMissing(database, "media_libraries", "jellyfin_path_suffix_lookup", (table) => {
+      table.string("jellyfin_path_suffix_lookup", 255).nullable();
     });
   }
 
@@ -322,7 +332,7 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("username", 255).notNullable();
       table.string("username_lookup", 255).notNullable();
       table.text("password_hash").notNullable();
-      table.integer("password_required").notNullable().defaultTo(1);
+      table.integer("password_required").notNullable().defaultTo(0);
       table.integer("credential_revision").notNullable().defaultTo(1);
       table.string("status", 32).notNullable().defaultTo("active");
       table.string("created_at", 40).notNullable();
@@ -331,8 +341,8 @@ async function createServiceTables(database: Knex): Promise<void> {
     });
   }
   await addColumnIfMissing(database, "service_access_accounts", "password_required", (table) => {
-    // 关键变量：历史服务默认继续要求密码，只有用户明确保存空密码后才切换为免密码登录。
-    table.integer("password_required").notNullable().defaultTo(1);
+    // 关键变量：缺少密码状态字段的旧结构按新的默认规则补为免密码。
+    table.integer("password_required").notNullable().defaultTo(0);
   });
 
   if (!(await database.schema.hasTable("service_protocol_sessions"))) {
@@ -992,6 +1002,36 @@ async function createOperationTables(database: Knex): Promise<void> {
   }
 }
 
+/** 将旧版服务级 Jellyfin 开关一次性迁移到对应媒体库。 */
+async function migrateLibraryJellyfinOwnership(database: Knex): Promise<void> {
+  if (!(await database.schema.hasColumn("cloud_services", "jellyfin_enabled"))) return;
+  // 关键变量：只迁移旧结构中明确启用的服务，默认关闭的媒体库不需要逐条更新。
+  const enabledServices = await database("cloud_services")
+    .select("id")
+    .where({ jellyfin_enabled: 1 })
+    .whereNull("deleted_at");
+  const serviceIds = enabledServices.map((service) => String(service.id));
+  if (serviceIds.length > 0) {
+    await database("media_libraries").whereIn("service_id", serviceIds).update({ jellyfin_enabled: 1 });
+  }
+}
+
+/** 为已有媒体库生成默认 Jellyfin 地址后缀，并建立全局唯一约束。 */
+async function migrateLibraryJellyfinPathSuffix(database: Knex): Promise<void> {
+  const libraries = await database("media_libraries")
+    .select("service_id", "jellyfin_path_suffix", "jellyfin_path_suffix_lookup");
+  for (const library of libraries) {
+    // 关键变量：历史媒体库继续使用服务 ID 作为后缀，避免升级时发生地址归属冲突。
+    const pathSuffix = String(library.jellyfin_path_suffix ?? "").trim() || String(library.service_id);
+    const pathSuffixLookup = String(library.jellyfin_path_suffix_lookup ?? "").trim() || pathSuffix.toLowerCase();
+    await database("media_libraries").where({ service_id: library.service_id }).update({
+      jellyfin_path_suffix: pathSuffix,
+      jellyfin_path_suffix_lookup: pathSuffixLookup,
+    });
+  }
+  await addUniqueIfMissing(database, "media_libraries", ["jellyfin_path_suffix_lookup"], "uq_media_libraries_jellyfin_path_suffix");
+}
+
 /** 创建或升级 FlyCloudHelper 全部后台表。 */
 export async function migrateDatabase(database: Knex): Promise<void> {
   await createIdentityTables(database);
@@ -1029,6 +1069,12 @@ export async function migrateDatabase(database: Knex): Promise<void> {
     }
     if (Number(existingState.schema_version ?? 0) < 20) {
       await migrateUniqueSourceFileOwnership(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 29) {
+      await migrateLibraryJellyfinOwnership(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 30) {
+      await migrateLibraryJellyfinPathSuffix(database);
     }
     await database("system_state").where({ singleton_id: 1 }).update({
       service_instance_id: existingState.service_instance_id || randomUUID(),

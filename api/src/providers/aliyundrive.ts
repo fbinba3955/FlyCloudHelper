@@ -1,4 +1,5 @@
 import { providerFetch, validateProviderUrl, type ProviderNetworkOptions } from "./network.js";
+import { validationError } from "../errors.js";
 import {
   type ProviderAdapter,
   type ProviderDescriptor,
@@ -24,38 +25,43 @@ interface AliyunFileItem {
   content_hash?: string;
 }
 
+interface AliyunDriveInfo {
+  defaultDriveId: string;
+  resourceDriveId: string;
+  backupDriveId: string;
+}
+
 /** 阿里云盘开放接口 Provider，使用 APP 上送的开放平台访问令牌。 */
 export class AliyunDriveProvider implements ProviderAdapter {
   public readonly descriptor: ProviderDescriptor = {
     type: "aliyundrive",
     displayName: "阿里云盘",
     adapterVersion: "1.0.0",
-    credentialSchemaVersion: 1,
+    credentialSchemaVersion: 2,
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
     recommendedScanSettings: createFlymbyRecommendedScanSettings(),
     connectionFields: [
       { name: "accessToken", label: "Access Token", type: "password", required: true, secret: true },
-      { name: "driveId", label: "Drive ID", type: "text", required: true, secret: false },
-      { name: "apiBaseUrl", label: "开放接口地址", type: "url", required: false, secret: false },
     ],
   };
 
   private readonly networkOptions: ProviderNetworkOptions;
+  private cachedDriveInfo: { accessToken: string; info: AliyunDriveInfo } | null = null;
 
   public constructor(networkOptions: ProviderNetworkOptions) {
     this.networkOptions = networkOptions;
   }
 
-  /** 通过读取根目录首个分页验证 Token 和 Drive ID。 */
+  /** 通过自动读取 Drive 信息和根目录首个分页验证 Token。 */
   public async validateConnection(connection: Record<string, unknown>, signal?: AbortSignal): Promise<ProviderValidationResult> {
-    const driveId = requireConnectionString(connection, "driveId", "Drive ID");
+    const driveId = await this.resolveDefaultDriveId(connection, signal);
     await this.listDirectory(connection, driveId, "root", null, 1, signal);
-    return { valid: true, accountLabel: driveId, rootAccessible: true };
+    return { valid: true, accountLabel: "阿里云盘", rootAccessible: true };
   }
 
   /** 验证每个阿里云盘扫描根的 Drive ID 和目录资源 ID。 */
   public async validateRoots(connection: Record<string, unknown>, roots: ScanRoot[], signal?: AbortSignal): Promise<void> {
-    const defaultDriveId = requireConnectionString(connection, "driveId", "Drive ID");
+    const defaultDriveId = await this.resolveDefaultDriveId(connection, signal);
     const selectedRoots = roots.length > 0 ? roots : [{ resourceId: "root", driveId: defaultDriveId }];
     for (const root of selectedRoots) {
       await this.listDirectory(connection, root.driveId || defaultDriveId, root.resourceId || "root", null, 1, signal);
@@ -68,7 +74,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
     parent?: ScanRoot,
     signal?: AbortSignal,
   ): Promise<ProviderDirectoryListing> {
-    const defaultDriveId = requireConnectionString(connection, "driveId", "Drive ID");
+    const defaultDriveId = await this.resolveDefaultDriveId(connection, signal);
     const driveId = parent?.driveId || defaultDriveId;
     const parentFileId = parent?.resourceId || "root";
     const parentPath = parent?.displayPath || "/";
@@ -109,7 +115,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
     _onWarning?: (warning: ProviderEnumerationWarning) => void,
     options?: ProviderEnumerationOptions,
   ): AsyncGenerator<ProviderEntry> {
-    const defaultDriveId = requireConnectionString(connection, "driveId", "Drive ID");
+    const defaultDriveId = await this.resolveDefaultDriveId(connection, signal);
     const selectedRoots = roots.length > 0 ? roots : [{ resourceId: "root", driveId: defaultDriveId }];
     for (const root of selectedRoots) {
       const driveId = root.driveId || defaultDriveId;
@@ -167,7 +173,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
     const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
     const driveId = requireConnectionString(locator, "driveId", "Drive ID");
     const fileId = requireConnectionString(locator, "fileId", "File ID");
-    const apiBase = typeof connection.apiBaseUrl === "string" && connection.apiBaseUrl ? connection.apiBaseUrl : "https://openapi.alipan.com";
+    const apiBase = this.resolveApiBaseUrl(connection);
     const baseUrl = await validateProviderUrl(apiBase, this.networkOptions);
     const response = await providerFetch(new URL("/adrive/v1.0/openFile/getDownloadUrl", baseUrl), {
       method: "POST",
@@ -194,9 +200,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
     signal?: AbortSignal,
   ): Promise<{ items: AliyunFileItem[]; nextMarker: string | null }> {
     const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
-    const apiBase = typeof connection.apiBaseUrl === "string" && connection.apiBaseUrl
-      ? connection.apiBaseUrl
-      : "https://openapi.alipan.com";
+    const apiBase = this.resolveApiBaseUrl(connection);
     const baseUrl = await validateProviderUrl(apiBase, this.networkOptions);
     const response = await providerFetch(new URL("/adrive/v1.0/openFile/list", baseUrl), {
       method: "POST",
@@ -205,5 +209,46 @@ export class AliyunDriveProvider implements ProviderAdapter {
     }, this.networkOptions, signal);
     const payload = await response.json() as { items?: AliyunFileItem[]; next_marker?: string };
     return { items: Array.isArray(payload.items) ? payload.items : [], nextMarker: payload.next_marker || null };
+  }
+
+  /** 自动读取账号下的默认、资源库和备份盘 Drive ID，旧字段仅作为响应缺失时的兼容兜底。 */
+  private async resolveDefaultDriveId(connection: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+    const legacyDriveId = typeof connection.driveId === "string" ? connection.driveId.trim() : "";
+    const accessToken = requireConnectionString(connection, "accessToken", "Access Token");
+    const cached = this.cachedDriveInfo;
+    if (cached !== null && cached.accessToken === accessToken && cached.info.defaultDriveId.length > 0) {
+      return cached.info.defaultDriveId;
+    }
+    const apiBase = this.resolveApiBaseUrl(connection);
+    const baseUrl = await validateProviderUrl(apiBase, this.networkOptions);
+    const response = await providerFetch(new URL("/adrive/v1.0/user/getDriveInfo", baseUrl), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: "{}",
+    }, this.networkOptions, signal);
+    const payload = await response.json() as {
+      default_drive_id?: string;
+      resource_drive_id?: string;
+      backup_drive_id?: string;
+    };
+    const info: AliyunDriveInfo = {
+      defaultDriveId: `${payload.default_drive_id ?? payload.resource_drive_id ?? payload.backup_drive_id ?? ""}`.trim(),
+      resourceDriveId: `${payload.resource_drive_id ?? ""}`.trim(),
+      backupDriveId: `${payload.backup_drive_id ?? ""}`.trim(),
+    };
+    if (info.defaultDriveId.length === 0 && legacyDriveId.length === 0) {
+      throw validationError("accessToken", "阿里云盘授权未返回 Drive ID");
+    }
+    if (info.defaultDriveId.length === 0) {
+      info.defaultDriveId = legacyDriveId;
+    }
+    this.cachedDriveInfo = { accessToken, info };
+    return info.defaultDriveId;
+  }
+
+  /** 统一解析阿里云盘开放接口地址，未配置时使用官方固定地址。 */
+  private resolveApiBaseUrl(connection: Record<string, unknown>): string {
+    const configured = typeof connection.apiBaseUrl === "string" ? connection.apiBaseUrl.trim() : "";
+    return configured || "https://openapi.alipan.com";
   }
 }

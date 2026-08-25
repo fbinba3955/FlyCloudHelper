@@ -2,6 +2,7 @@ import type { IncomingMessage } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
+import { buildJellyfinPath } from "../jellyfin-path.js";
 import { parseCompletedMediaProbeResult, readJellyfinRunTimeTicks } from "../media/media-probe.js";
 import { JellyfinCompatibilityService, type JellyfinContext } from "../jellyfin-service.js";
 import { providerStream } from "../providers/network.js";
@@ -208,12 +209,12 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompa
  * 返回客户端可访问的 Jellyfin 服务地址。
  * 显式配置的公开地址用于覆盖反向代理、HTTPS 域名或端口映射；未配置时使用当前请求的协议和 Host。
  */
-async function buildJellyfinLocalAddress(runtime: ApiRuntime, request: FastifyRequest, serviceId: string): Promise<string> {
-  const configuredUrl = await runtime.publicAccess.buildJellyfinUrl(serviceId);
+async function buildJellyfinLocalAddress(runtime: ApiRuntime, request: FastifyRequest, pathSuffix: string): Promise<string> {
+  const configuredUrl = await runtime.publicAccess.buildJellyfinUrl(pathSuffix);
   if (configuredUrl) return configuredUrl;
   /** Host 保留当前请求实际使用的端口，适用于直接访问云助手 API 的场景。 */
   const requestHost = String(request.headers.host ?? "").trim();
-  const jellyfinPath = `/jellyfin/${encodeURIComponent(serviceId)}`;
+  const jellyfinPath = buildJellyfinPath(pathSuffix);
   if (!requestHost) return jellyfinPath;
   try {
     return `${new URL(`${request.protocol}://${requestHost}`).origin}${jellyfinPath}`;
@@ -224,18 +225,22 @@ async function buildJellyfinLocalAddress(runtime: ApiRuntime, request: FastifyRe
 
 /** 注册一个 API 前缀；同时支持标准 Jellyfin 根路径和 Flymby 使用的 /emby 路径。 */
 function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, prefix: string): void {
-  const authenticated = async (request: FastifyRequest) => compatibility.authenticate(String((request.params as { serviceId: string }).serviceId), request);
+  /** 读取路由中的单层自定义后缀。 */
+  const readPathSuffix = (request: FastifyRequest): string => String((request.params as { jellyfinPathSuffix: string }).jellyfinPathSuffix);
+  /** 使用自定义后缀找到真实服务 ID。 */
+  const resolveServiceId = async (request: FastifyRequest): Promise<string> => compatibility.resolveServiceIdByPathSuffix(readPathSuffix(request));
+  const authenticated = async (request: FastifyRequest) => compatibility.authenticate(await resolveServiceId(request), request);
   server.get(`${prefix}/System/Info/Public`, async (request) => {
-    const serviceId = String((request.params as { serviceId: string }).serviceId);
+    const serviceId = await resolveServiceId(request);
     const service = await compatibility.requireEnabledService(serviceId);
-    return { LocalAddress: await buildJellyfinLocalAddress(runtime, request, serviceId), ServerName: service.display_name, Version: "10.10.0", ProductName: "FlyCloudHelper", OperatingSystem: process.platform, Id: serviceId, StartupWizardCompleted: true };
+    return { LocalAddress: await buildJellyfinLocalAddress(runtime, request, readPathSuffix(request)), ServerName: service.display_name, Version: "10.10.0", ProductName: "FlyCloudHelper", OperatingSystem: process.platform, Id: serviceId, StartupWizardCompleted: true };
   });
   server.get(`${prefix}/System/Info`, async (request) => {
     const context = await authenticated(request); const service = await compatibility.requireEnabledService(context.serviceId);
-    return { LocalAddress: await buildJellyfinLocalAddress(runtime, request, context.serviceId), ServerName: service.display_name, Version: "10.10.0", ProductName: "FlyCloudHelper", OperatingSystem: process.platform, Id: context.serviceId, StartupWizardCompleted: true };
+    return { LocalAddress: await buildJellyfinLocalAddress(runtime, request, readPathSuffix(request)), ServerName: service.display_name, Version: "10.10.0", ProductName: "FlyCloudHelper", OperatingSystem: process.platform, Id: context.serviceId, StartupWizardCompleted: true };
   });
-  server.post(`${prefix}/Users/AuthenticateByName`, async (request) => compatibility.login(String((request.params as { serviceId: string }).serviceId), request, (request.body ?? {}) as Record<string, unknown>));
-  server.post(`${prefix}/Sessions/Logout`, async (request, reply) => { await compatibility.logout(String((request.params as { serviceId: string }).serviceId), request); return reply.status(204).send(); });
+  server.post(`${prefix}/Users/AuthenticateByName`, async (request) => compatibility.login(await resolveServiceId(request), request, (request.body ?? {}) as Record<string, unknown>));
+  server.post(`${prefix}/Sessions/Logout`, async (request, reply) => { await compatibility.logout(await resolveServiceId(request), request); return reply.status(204).send(); });
   server.get(`${prefix}/Users/:userId`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.mapUser(context.accountId, context.accountUsername, context.serviceId, context.accountHasPassword); });
   server.get(`${prefix}/Users/:userId/Views`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.listLibraries(context); });
   server.get(`${prefix}/UserViews`, async (request) => compatibility.listLibraries(await authenticated(request)));
@@ -281,6 +286,6 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
 /** 注册 Jellyfin 协议兼容接口。 */
 export async function registerJellyfinRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   const compatibility = new JellyfinCompatibilityService(runtime);
-  registerProtocolPrefix(server, runtime, compatibility, "/jellyfin/:serviceId");
-  registerProtocolPrefix(server, runtime, compatibility, "/jellyfin/:serviceId/emby");
+  registerProtocolPrefix(server, runtime, compatibility, "/j/:jellyfinPathSuffix");
+  registerProtocolPrefix(server, runtime, compatibility, "/j/:jellyfinPathSuffix/emby");
 }

@@ -1,35 +1,25 @@
 import { Link, useNavigate } from "@tanstack/react-router";
-import { FolderPlus, Plus, RefreshCw, ScanLine, Settings2, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCatalogView";
+import { Plus, RefreshCw, ScanLine, Settings2, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { GuangyaAuthorizationPanel } from "@/components/GuangyaAuthorizationPanel";
 import { ProviderConnectionGuide } from "@/components/ProviderConnectionGuide";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
-import { ServiceSnapshotPanel } from "@/components/ServiceSnapshotPanel";
 import { Panel, StatCard, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   ApiClientError,
   backfillExistingMediaProbes,
-  clearServiceCatalog,
   createScanJob,
   createService,
   deleteCloudService,
-  getServiceAccessSettings,
   getService,
-  listAdminServiceItems,
   listAdminUsers,
-  listLibraryItems,
   listProviders,
   listServices,
   reconnectServiceConnection,
-  resetServiceAccessPassword,
-  revokeServiceAccessSessions,
-  updateServiceAccessCredentials,
   updateServiceConnection,
   updateServiceMetadataProfile,
   updateServiceRelayPlayback,
-  updateServiceJellyfinSettings,
   updateServiceScanProfile,
   updateServiceStatus,
   type CloudService,
@@ -41,22 +31,6 @@ import {
   type ProviderDescriptor,
   type ServiceStatus,
 } from "@/lib/api";
-
-/** 复制服务地址或一次性密码，并兼容不开放 Clipboard API 的浏览器环境。 */
-async function copyServiceAccessText(value: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(value);
-  } catch {
-    const temporaryInput = document.createElement("textarea");
-    temporaryInput.value = value;
-    temporaryInput.style.position = "fixed";
-    temporaryInput.style.opacity = "0";
-    document.body.appendChild(temporaryInput);
-    temporaryInput.select();
-    document.execCommand("copy");
-    temporaryInput.remove();
-  }
-}
 import { useApiResource } from "@/lib/use-api-resource";
 
 const serviceStatusLabels: Record<ServiceStatus, string> = {
@@ -106,9 +80,6 @@ const jobStageLabels: Record<string, string> = {
   probing: "分析视频规格",
   completed: "已完成",
 };
-
-// 关键变量：单个服务海报墙每页读取 60 个顶层条目，避免一次加载整个媒体库。
-const SERVICE_CATALOG_PAGE_SIZE = 60;
 
 /** 将服务状态映射为视觉语义。 */
 function getServiceTone(status: ServiceStatus): StatusTone {
@@ -262,7 +233,6 @@ function getScanRootLabel(root: ScanRootValue): string {
 function ServiceCard({ service, admin, onScanned }: { service: CloudService; admin: boolean; onScanned: () => void }) {
   const [message, setMessage] = useState<string | null>(null);
   const detailPath = admin ? "/admin/services/$serviceId" : "/app/services/$serviceId";
-  const catalogPath = admin ? "/admin/services/$serviceId/catalog" : "/app/services/$serviceId/catalog";
 
   /** 创建默认增量扫描任务。 */
   async function triggerScan(): Promise<void> {
@@ -292,15 +262,13 @@ function ServiceCard({ service, admin, onScanned }: { service: CloudService; adm
       </header>
 
       <dl className="mt-5 grid grid-cols-3 gap-3 text-center">
-        <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">已入库</dt><dd className="mt-1 text-xs font-medium">{service.itemCount.toLocaleString()}</dd></div>
-        <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">目录版本</dt><dd className="mt-1 text-xs font-medium">v{service.catalogVersion}</dd></div>
+        <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">连接修订</dt><dd className="mt-1 text-xs font-medium">r{service.credentialRevision}</dd></div>
+        <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">扫描修订</dt><dd className="mt-1 text-xs font-medium">r{service.scanProfileRevision}</dd></div>
         <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">最近扫描</dt><dd className="mt-1 truncate text-xs font-medium">{formatTime(service.lastScanAt)}</dd></div>
       </dl>
 
       <div className="mt-4 flex flex-wrap gap-2">
         <StatusPill>{dataTypeLabels[service.dataType]}</StatusPill>
-        <StatusPill>连接 r{service.credentialRevision}</StatusPill>
-        <StatusPill>扫描 r{service.scanProfileRevision}</StatusPill>
         <StatusPill>刮削 r{service.metadataProfileRevision}</StatusPill>
       </div>
 
@@ -309,7 +277,6 @@ function ServiceCard({ service, admin, onScanned }: { service: CloudService; adm
           <ScanLine className="size-3.5" /> 触发增量扫描
         </button>
         <Link to={detailPath} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 服务详情与配置</Link>
-        <Link to={catalogPath} params={{ serviceId: service.id }} className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">服务海报墙</Link>
       </footer>
       {message && <p className="mt-3 text-xs text-muted-foreground">{message}</p>}
     </article>
@@ -405,8 +372,6 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
     setMessage("正在验证连接并创建服务，不会自动开始扫描…");
     try {
       const creation = await createService(input, admin);
-      // 关键变量：初始明文密码只在当前浏览器会话中暂存一次，刷新详情页后不再显示。
-      sessionStorage.setItem(`flycloud-service-access:${creation.service.id}`, JSON.stringify(creation.serviceAccessCredentials));
       await navigate({ to: admin ? "/admin/services/$serviceId" : "/app/services/$serviceId", params: { serviceId: creation.service.id } });
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "服务创建失败");
@@ -570,44 +535,17 @@ export function ServiceConnectionPage({ serviceId, admin = false }: { serviceId:
   );
 }
 
-/** 独立管理云端快照，可由用户或超级管理员从网页启动生成。 */
-export function ServiceSnapshotPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
-  const resource = useApiResource(() => getService(serviceId, admin), [serviceId, admin]);
-  const service = resource.data;
-  const detailPath = admin ? "/admin/services/$serviceId" : "/app/services/$serviceId";
-  if (!service) {
-    return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取服务快照…"}</div></Panel>;
-  }
-  return (
-    <>
-      <PageHeader
-        title={`${service.displayName} · 快照管理`}
-        actions={<Link to={detailPath} params={{ serviceId }} className="inline-flex rounded-lg border border-border px-4 py-2.5 text-sm text-muted-foreground">返回服务详情</Link>}
-      />
-      <ServiceSnapshotPanel serviceId={service.id} libraryId={service.libraryId} admin={admin} />
-    </>
-  );
-}
-
 /** 云端服务详情与配置页面。 */
 export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
   const navigate = useNavigate();
   const resource = useApiResource(() => getService(serviceId, admin), [serviceId, admin]);
   const providers = useApiResource(() => listProviders(), []);
-  const accessResource = useApiResource(() => getServiceAccessSettings(serviceId, admin), [serviceId, admin]);
   const [message, setMessage] = useState<string | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState(false);
   const updatingStatusRef = useRef(false);
   const [updatingRelayPlayback, setUpdatingRelayPlayback] = useState(false);
   // 关键变量：同步占用播放开关，避免 React 刷新前连续点击产生相反请求。
   const updatingRelayPlaybackRef = useRef(false);
-  const [updatingJellyfin, setUpdatingJellyfin] = useState(false);
-  const [accessUsername, setAccessUsername] = useState("");
-  const [newAccessPassword, setNewAccessPassword] = useState("");
-  const [visibleAccessPassword, setVisibleAccessPassword] = useState<string | null>(null);
-  const [clearingCatalog, setClearingCatalog] = useState(false);
-  // 关键变量：引用会在点击处理函数中同步占用，避免 React 刷新按钮状态前重复提交清空请求。
-  const clearingCatalogRef = useRef(false);
   const [deletingService, setDeletingService] = useState(false);
   // 关键变量：同步占用删除操作，避免 React 按钮状态尚未刷新时重复提交。
   const deletingServiceRef = useRef(false);
@@ -647,24 +585,6 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     const descriptor = providers.data?.find((item) => item.type === service.providerType);
     setScanConcurrencySettings(readScanConcurrencySettings(service.scanProfile, descriptor));
   }, [serviceId, service?.id, service?.scanProfileRevision, providers.data]);
-
-  useEffect(() => {
-    if (accessResource.data?.account.username) setAccessUsername(accessResource.data.account.username);
-  }, [accessResource.data?.account.username]);
-
-  useEffect(() => {
-    const storageKey = `flycloud-service-access:${serviceId}`;
-    const value = sessionStorage.getItem(storageKey);
-    if (!value) return;
-    sessionStorage.removeItem(storageKey);
-    try {
-      const credentials = JSON.parse(value) as { username?: string; password?: string };
-      if (credentials.username) setAccessUsername(credentials.username);
-      if (credentials.password) setVisibleAccessPassword(credentials.password);
-    } catch {
-      setVisibleAccessPassword(null);
-    }
-  }, [serviceId]);
 
   if (!service) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取服务详情…"}</div></Panel>;
   // 关键变量：详情已经通过空值检查，异步回调统一捕获稳定引用，避免刷新期间类型重新变为可空。
@@ -828,94 +748,10 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     }
   }
 
-  /** 立即保存当前服务的 Jellyfin 协议开关。 */
-  async function toggleJellyfin(): Promise<void> {
-    if (updatingJellyfin || !accessResource.data) return;
-    const nextEnabled = !accessResource.data.jellyfinEnabled;
-    setUpdatingJellyfin(true);
-    try {
-      await updateServiceJellyfinSettings(serviceId, nextEnabled, admin);
-      setMessage(nextEnabled ? "Jellyfin 协议已启用" : "Jellyfin 协议已关闭，旧 Jellyfin 会话已撤销");
-      await Promise.all([accessResource.refresh(), resource.refresh()]);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Jellyfin 设置保存失败");
-    } finally { setUpdatingJellyfin(false); }
-  }
-
-  /** 修改服务独立账号，修改后全部协议旧会话立即失效。 */
-  async function saveAccessCredentials(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    const input: { username?: string; password?: string } = {};
-    if (accessUsername !== accessResource.data?.account.username) input.username = accessUsername;
-    // 关键变量：当前仍需要密码时，空输入是用户明确切换为免密码；已经免密码时空输入不重复提交。
-    if (newAccessPassword.length > 0 || accessResource.data?.account.hasPassword === true) {
-      input.password = newAccessPassword;
-    }
-    if (input.username === undefined && input.password === undefined) { setMessage("用户名和密码均未修改"); return; }
-    try {
-      await updateServiceAccessCredentials(serviceId, input, admin);
-      setNewAccessPassword(""); setVisibleAccessPassword(null);
-      setMessage(newAccessPassword.length > 0
-        ? "服务访问账号和密码已保存，全部旧协议会话已撤销"
-        : "服务访问账号已保存为免密码登录，全部旧协议会话已撤销");
-      await accessResource.refresh();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "服务访问凭据保存失败"); }
-  }
-
-  /** 重置随机密码并只在当前页面展示一次。 */
-  async function resetAccessPassword(): Promise<void> {
-    if (!window.confirm("确定重置服务访问密码吗？全部 Jellyfin/Emby 兼容会话会立即失效。")) return;
-    try {
-      const result = await resetServiceAccessPassword(serviceId, admin);
-      setVisibleAccessPassword(result.password); setNewAccessPassword("");
-      setMessage("密码已重置，请立即保存下方一次性明文密码");
-      await accessResource.refresh();
-    } catch (error) { setMessage(error instanceof Error ? error.message : "密码重置失败"); }
-  }
-
-  /** 管理员主动撤销当前服务的全部协议会话。 */
-  async function revokeAccessSessions(): Promise<void> {
-    if (!window.confirm("确定撤销当前服务的全部协议会话吗？播放记录不会删除。")) return;
-    try {
-      const result = await revokeServiceAccessSessions(serviceId, admin);
-      setMessage(`已撤销 ${result.revokedCount} 个协议会话`);
-    } catch (error) { setMessage(error instanceof Error ? error.message : "会话撤销失败"); }
-  }
-
-  /** 二次确认后仅清空当前服务的扫描与刮削结果。 */
-  async function clearCatalog(): Promise<void> {
-    if (deletingServiceRef.current) {
-      console.warn("codex-flycloud-helper-service-delete", { 事件: "删除服务期间拦截清空请求", 服务ID: serviceId });
-      return;
-    }
-    if (clearingCatalogRef.current) {
-      console.warn("codex-flycloud-helper-catalog-clear", { 事件: "拦截重复清空请求", 服务ID: serviceId });
-      return;
-    }
-    if (!window.confirm(`确定清空“${activeService.displayName}”的全部扫描刮削结果吗？服务连接和配置会保留，媒体条目、文件索引和目录版本将被清空。`)) return;
-    clearingCatalogRef.current = true;
-    setClearingCatalog(true);
-    setMessage("正在清空当前服务的媒体库…");
-    try {
-      const result = await clearServiceCatalog(serviceId, admin);
-      setMessage(`已清空 ${result.mediaItemCount.toLocaleString()} 个媒体条目和 ${result.sourceFileCount.toLocaleString()} 个源文件索引`);
-      await resource.refresh();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "清空媒体库失败");
-    } finally {
-      clearingCatalogRef.current = false;
-      setClearingCatalog(false);
-    }
-  }
-
   /** 二次确认后删除当前云端服务，并返回对应的服务列表。 */
   async function deleteCurrentService(): Promise<void> {
     if (deletingServiceRef.current) {
       console.warn("codex-flycloud-helper-service-delete", { 事件: "拦截重复删除请求", 服务ID: serviceId });
-      return;
-    }
-    if (clearingCatalogRef.current) {
-      setMessage("当前服务正在清空媒体库，请稍后再删除");
       return;
     }
     const confirmed = window.confirm(
@@ -1005,19 +841,17 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         />
       </div>
       <Panel title="配置修订与范围" className="mt-4">
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div className="grid gap-3 md:grid-cols-2">
           <div className="rounded-xl border border-border bg-secondary/40 p-4">
             <p className="text-xs text-muted-foreground">配置修订</p>
             <div className="mt-3 flex flex-wrap gap-2"><StatusPill>{dataTypeLabels[service.dataType]}</StatusPill><StatusPill>连接 r{service.credentialRevision}</StatusPill><StatusPill>扫描 r{service.scanProfileRevision}</StatusPill><StatusPill>元数据 r{service.metadataProfileRevision}</StatusPill></div>
             <p className="mt-4 text-xs text-muted-foreground">全量路径 {fullScanRoots.length} 条 · 增量路径 {incrementalScanRoots.length} 条</p>
           </div>
-          <div className="rounded-xl border border-border bg-secondary/40 p-4"><p className="text-xs text-muted-foreground">服务海报墙</p><p className="mt-2 text-sm">固定当前服务作用域查看扫描结果。</p><Link to={admin ? "/admin/services/$serviceId/catalog" : "/app/services/$serviceId/catalog"} params={{ serviceId }} className="mt-3 inline-flex items-center gap-1 text-xs text-primary-soft">打开服务海报墙 <FolderPlus className="size-3.5" /></Link></div>
           <div className="rounded-xl border border-border bg-secondary/40 p-4"><p className="text-xs text-muted-foreground">连接管理</p><p className="mt-2 text-sm">重连、重新授权或替换完整连接。</p><Link to={admin ? "/admin/services/$serviceId/connection" : "/app/services/$serviceId/connection"} params={{ serviceId }} className="mt-3 inline-flex items-center gap-1 text-xs text-primary-soft">打开连接管理 <Settings2 className="size-3.5" /></Link></div>
-          <div className="rounded-xl border border-border bg-secondary/40 p-4"><p className="text-xs text-muted-foreground">快照管理</p><p className="mt-2 text-sm">生成、查看进度和删除云端快照。</p><Link to={admin ? "/admin/services/$serviceId/snapshots" : "/app/services/$serviceId/snapshots"} params={{ serviceId }} className="mt-3 inline-flex items-center gap-1 text-xs text-primary-soft">打开快照管理 <FolderPlus className="size-3.5" /></Link></div>
         </div>
       </Panel>
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <Panel title="播放与协议设置" description="中转播放和 Jellyfin 协议分别控制，只对当前服务生效。">
+        <Panel title="中转播放设置">
           <div className="rounded-xl border border-border bg-secondary/35 p-4">
             <div className="flex items-center justify-between gap-4">
               <div>
@@ -1042,37 +876,6 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
                 <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${service.relayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} />
               </button>
             </div>
-          </div>
-          <div className="mt-4 rounded-xl border border-border bg-secondary/35 p-4">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <p className="text-sm font-medium">启用 Jellyfin 协议</p>
-                <p className="mt-1 text-xs text-muted-foreground">关闭后会撤销当前服务的 Jellyfin 会话，但保留账号、播放记录和继续观看。</p>
-              </div>
-              <button type="button" role="switch" aria-checked={accessResource.data?.jellyfinEnabled ?? false} aria-label="启用 Jellyfin 协议" disabled={!accessResource.data || updatingJellyfin} onClick={() => void toggleJellyfin()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${accessResource.data?.jellyfinEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
-                <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${accessResource.data?.jellyfinEnabled ? "translate-x-5" : "translate-x-0"}`} />
-              </button>
-            </div>
-            <div className="mt-4 rounded-lg border border-border bg-background/40 p-3">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <p className="text-xs text-muted-foreground">Jellyfin 服务地址</p>
-                  <p className="mt-1 break-all font-mono text-xs">{accessResource.data?.jellyfinUrl ?? (accessResource.data ? `云助手 API 地址${accessResource.data.jellyfinPath}` : "正在读取…")}</p>
-                  <p className="mt-2 text-xs text-muted-foreground">{accessResource.data?.jellyfinUrl ? "当前使用系统配置的对外地址覆盖值。" : "未设置覆盖地址，请在云助手 API 地址（默认端口 9934）后追加上述服务路径。"}</p>
-                </div>
-                {accessResource.data && <SecondaryButton type="button" onClick={() => void copyServiceAccessText(accessResource.data?.jellyfinUrl ?? accessResource.data?.jellyfinPath ?? "").then(() => setMessage(accessResource.data?.jellyfinUrl ? "Jellyfin 服务地址已复制" : "Jellyfin 服务路径已复制"))}>{accessResource.data.jellyfinUrl ? "复制地址" : "复制路径"}</SecondaryButton>}
-              </div>
-            </div>
-            {visibleAccessPassword && <div className="mt-3 rounded-lg border border-warning/40 bg-warning/10 p-3"><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-medium text-warning">一次性明文密码，请立即保存</p><p className="mt-2 break-all font-mono text-sm">{visibleAccessPassword}</p></div><SecondaryButton type="button" onClick={() => void copyServiceAccessText(visibleAccessPassword).then(() => setMessage("一次性密码已复制"))}>复制密码</SecondaryButton></div></div>}
-            <form onSubmit={(event) => void saveAccessCredentials(event)} className="mt-4 grid gap-3 md:grid-cols-2">
-              <label><span className="text-xs text-muted-foreground">服务访问用户名</span><input value={accessUsername} minLength={4} maxLength={255} onChange={(event) => setAccessUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
-              <label><span className="text-xs text-muted-foreground">访问密码（长度不限，留空表示无需密码）</span><input value={newAccessPassword} type="password" autoComplete="new-password" placeholder={accessResource.data?.account.hasPassword ? "当前需要密码；留空保存将改为免密码" : "当前无需密码；填写后恢复密码校验"} onChange={(event) => setNewAccessPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
-              <div className="flex flex-wrap gap-2 md:col-span-2">
-                <PrimaryButton type="submit">保存访问凭据</PrimaryButton>
-                <SecondaryButton type="button" onClick={() => void resetAccessPassword()}>重置随机密码</SecondaryButton>
-                <SecondaryButton type="button" onClick={() => void revokeAccessSessions()}>撤销全部会话</SecondaryButton>
-              </div>
-            </form>
           </div>
         </Panel>
         <Panel title="扫描路径" description="全量和增量任务分别选择网盘目录，不需要手动输入路径。" className="xl:col-span-2">
@@ -1169,63 +972,13 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
             <div className="flex justify-end"><PrimaryButton type="submit">保存元数据配置</PrimaryButton></div>
           </form>
         </Panel>
-        <Panel title="危险操作" description="以下操作会移除当前服务的数据，需要二次确认。">
+        <Panel title="危险操作" description="删除服务会同时删除其媒体库，需要二次确认。">
           <div className="flex flex-wrap gap-2">
-            <button type="button" onClick={() => void clearCatalog()} disabled={service.status === "scanning" || clearingCatalog || deletingService} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空扫描刮削结果"}</button>
-            <button type="button" onClick={() => void deleteCurrentService()} disabled={hasUnfinishedJob || clearingCatalog || deletingService} title={hasUnfinishedJob ? "请先终止该服务未结束的后台任务" : undefined} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground shadow-sm transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {deletingService ? "正在删除…" : "删除服务"}</button>
+            <button type="button" onClick={() => void deleteCurrentService()} disabled={hasUnfinishedJob || deletingService} title={hasUnfinishedJob ? "请先终止该服务未结束的后台任务" : undefined} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive bg-destructive px-4 py-2.5 text-sm font-semibold text-destructive-foreground shadow-sm transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {deletingService ? "正在删除…" : "删除服务"}</button>
           </div>
           {hasUnfinishedJob && <p className="mt-3 text-xs text-warning">该服务仍有未结束的后台任务，请先终止任务后再删除服务。</p>}
         </Panel>
       </div>
-    </>
-  );
-}
-
-/** 固定单一服务作用域的海报墙页面。 */
-export function ServiceCatalogPage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
-  const [catalogQuery, setCatalogQuery] = useState<MediaCatalogQuery>({
-    search: "",
-    mediaType: "all",
-    videoItemType: "all",
-    matchState: "matched",
-    sort: "created_desc",
-  });
-  const [pageOffset, setPageOffset] = useState(0);
-  const resource = useApiResource(async () => {
-    const service = await getService(serviceId, admin);
-    const options = {
-      search: catalogQuery.search || undefined,
-      mediaType: catalogQuery.mediaType === "all" ? undefined : catalogQuery.mediaType,
-      itemType: catalogQuery.videoItemType === "all" ? undefined : catalogQuery.videoItemType,
-      matchState: catalogQuery.matchState === "all" ? undefined : catalogQuery.matchState,
-      sort: catalogQuery.sort,
-      limit: SERVICE_CATALOG_PAGE_SIZE,
-      offset: pageOffset,
-    };
-    const catalog = admin ? await listAdminServiceItems(serviceId, options) : await listLibraryItems(service.libraryId, options);
-    return { service, catalog };
-  }, [serviceId, admin, catalogQuery.search, catalogQuery.mediaType, catalogQuery.videoItemType, catalogQuery.matchState, catalogQuery.sort, pageOffset]);
-
-  /** 筛选变化后回到第一页；相同筛选不触发重复请求。 */
-  const updateCatalogQuery = useCallback((nextQuery: MediaCatalogQuery): void => {
-    setCatalogQuery((currentQuery) => {
-      const unchanged = currentQuery.search === nextQuery.search
-        && currentQuery.mediaType === nextQuery.mediaType
-        && currentQuery.videoItemType === nextQuery.videoItemType
-        && currentQuery.matchState === nextQuery.matchState
-        && currentQuery.sort === nextQuery.sort;
-      return unchanged ? currentQuery : nextQuery;
-    });
-    setPageOffset(0);
-  }, []);
-
-  if (!resource.data) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取服务海报墙…"}</div></Panel>;
-  const { service, catalog } = resource.data;
-  return (
-    <>
-      <PageHeader title={`${service.displayName} · 海报墙`} actions={<Link to={admin ? "/admin/services/$serviceId" : "/app/services/$serviceId"} params={{ serviceId }}><SecondaryButton>返回服务详情</SecondaryButton></Link>} />
-      {resource.error && <Panel className="mb-4"><p className="text-sm text-destructive">{resource.error}</p></Panel>}
-      <MediaCatalogView contextDescription={`${admin ? `用户 ${service.ownerUsername} · ` : ""}${service.displayName} · ${service.libraryId}`} items={catalog.items} total={catalog.total} catalogVersion={service.catalogVersion} fixedService showOwner={admin} admin={admin} loading={resource.loading} onRefresh={() => void resource.refresh()} serverFiltered pageOffset={pageOffset} pageLimit={SERVICE_CATALOG_PAGE_SIZE} onQueryChange={updateCatalogQuery} onPageChange={setPageOffset} />
     </>
   );
 }
@@ -1235,7 +988,3 @@ export function UserServiceDetailPage({ serviceId }: { serviceId: string }) { re
 export function AdminServiceDetailPage({ serviceId }: { serviceId: string }) { return <ServiceDetailPage serviceId={serviceId} admin />; }
 export function UserServiceConnectionPage({ serviceId }: { serviceId: string }) { return <ServiceConnectionPage serviceId={serviceId} />; }
 export function AdminServiceConnectionPage({ serviceId }: { serviceId: string }) { return <ServiceConnectionPage serviceId={serviceId} admin />; }
-export function UserServiceSnapshotPage({ serviceId }: { serviceId: string }) { return <ServiceSnapshotPage serviceId={serviceId} />; }
-export function AdminServiceSnapshotPage({ serviceId }: { serviceId: string }) { return <ServiceSnapshotPage serviceId={serviceId} admin />; }
-export function UserServiceCatalogPage({ serviceId }: { serviceId: string }) { return <ServiceCatalogPage serviceId={serviceId} />; }
-export function AdminServiceCatalogPage({ serviceId }: { serviceId: string }) { return <ServiceCatalogPage serviceId={serviceId} admin />; }

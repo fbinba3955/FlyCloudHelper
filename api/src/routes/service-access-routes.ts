@@ -1,9 +1,10 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
 import { requireRequestUser, requireSuperAdmin } from "../http.js";
+import { buildJellyfinPath, validateJellyfinPathSuffix } from "../jellyfin-path.js";
 import type { ApiRuntime } from "../runtime.js";
 
-/** 校验服务归属，并返回服务的 Jellyfin 开关状态。 */
+/** 通过基础服务校验媒体库归属，并返回一对一关联记录。 */
 async function requireManagedService(runtime: ApiRuntime, request: FastifyRequest, serviceId: string, admin: boolean) {
   const operator = admin
     ? await requireSuperAdmin(request, runtime.database)
@@ -12,16 +13,22 @@ async function requireManagedService(runtime: ApiRuntime, request: FastifyReques
   return { operator, service };
 }
 
-/** 构造服务协议配置，密码只会在创建或重置的单次响应中出现。 */
+/** 构造媒体库协议配置。 */
 async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string) {
   const service = await runtime.repository.getServiceDetail(serviceId);
   const account = await runtime.serviceAccess.getByService(serviceId);
-  /** 未设置公开地址覆盖值时，前端用于提示和复制的 Jellyfin 服务路径。 */
-  const jellyfinPath = `/jellyfin/${encodeURIComponent(serviceId)}`;
+  const library = await runtime.database.query("media_libraries")
+    .select("jellyfin_path_suffix")
+    .where({ service_id: serviceId })
+    .first();
+  // 关键变量：数据库升级尚未完成时临时回退服务 ID，保证设置页仍可读取。
+  const jellyfinPathSuffix = String(library?.jellyfin_path_suffix ?? "").trim() || serviceId;
+  const jellyfinPath = buildJellyfinPath(jellyfinPathSuffix);
   return {
     jellyfinEnabled: service.jellyfinEnabled,
-    jellyfinUrl: await runtime.publicAccess.buildJellyfinUrl(serviceId),
+    jellyfinUrl: await runtime.publicAccess.buildJellyfinUrl(jellyfinPathSuffix),
     jellyfinPath,
+    jellyfinPathSuffix,
     account,
   };
 }
@@ -70,14 +77,45 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
 
     server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/jellyfin-settings`, async (request) => {
       const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      if (typeof request.body.jellyfinEnabled !== "boolean") throw new ApiError(422, "jellyfin_enabled_invalid", "Jellyfin 开关必须是布尔值");
+      const changesJellyfinEnabled = request.body.jellyfinEnabled !== undefined;
+      const changesPathSuffix = request.body.jellyfinPathSuffix !== undefined;
+      if (!changesJellyfinEnabled && !changesPathSuffix) throw new ApiError(422, "jellyfin_settings_empty", "没有需要保存的 Jellyfin 设置");
+      if (changesJellyfinEnabled && typeof request.body.jellyfinEnabled !== "boolean") {
+        throw new ApiError(422, "jellyfin_enabled_invalid", "Jellyfin 开关必须是布尔值");
+      }
+      const pathSuffix = changesPathSuffix ? validateJellyfinPathSuffix(request.body.jellyfinPathSuffix) : null;
       const publicAccess = await runtime.publicAccess.getStatus();
       const now = new Date().toISOString();
-      await runtime.database.query("cloud_services").where({ id: request.params.serviceId }).update({ jellyfin_enabled: request.body.jellyfinEnabled ? 1 : 0, updated_at: now });
-      const revokedCount = request.body.jellyfinEnabled ? 0 : await runtime.serviceAccess.revokeSessions(request.params.serviceId, "jellyfin");
+      if (pathSuffix) {
+        const duplicate = await runtime.database.query("media_libraries")
+          .select("service_id")
+          .where({ jellyfin_path_suffix_lookup: pathSuffix.lookup })
+          .whereNot({ service_id: request.params.serviceId })
+          .first();
+        if (duplicate) throw new ApiError(409, "jellyfin_path_suffix_conflict", "该 Jellyfin 地址后缀已被使用，请更换后缀");
+      }
+      const updateValues: Record<string, unknown> = { updated_at: now };
+      if (changesJellyfinEnabled) updateValues.jellyfin_enabled = request.body.jellyfinEnabled ? 1 : 0;
+      if (pathSuffix) {
+        updateValues.jellyfin_path_suffix = pathSuffix.value;
+        updateValues.jellyfin_path_suffix_lookup = pathSuffix.lookup;
+      }
+      try {
+        await runtime.database.query("media_libraries").where({ service_id: request.params.serviceId }).update(updateValues);
+      } catch (error) {
+        const databaseError = error as Error & { code?: string };
+        const duplicateSuffix = databaseError.code === "23505"
+          || databaseError.code === "ER_DUP_ENTRY"
+          || /unique|duplicate/iu.test(databaseError.message);
+        if (pathSuffix && duplicateSuffix) throw new ApiError(409, "jellyfin_path_suffix_conflict", "该 Jellyfin 地址后缀已被使用，请更换后缀");
+        throw error;
+      }
+      const disabledJellyfin = changesJellyfinEnabled && request.body.jellyfinEnabled === false;
+      const revokedCount = disabledJellyfin ? await runtime.serviceAccess.revokeSessions(request.params.serviceId, "jellyfin") : 0;
       runtime.logBusinessEvent("info", {
-        日志关键字: "codex-jellyfin-compat", 事件: request.body.jellyfinEnabled ? "启用Jellyfin兼容服务" : "停用Jellyfin兼容服务",
-        操作用户ID: operator.id, 服务ID: request.params.serviceId, 撤销会话数: revokedCount,
+        日志关键字: "codex-jellyfin-path", 事件: pathSuffix ? "更新媒体库Jellyfin地址" : (request.body.jellyfinEnabled ? "启用媒体库Jellyfin协议" : "停用媒体库Jellyfin协议"),
+        操作用户ID: operator.id, 基础服务ID: request.params.serviceId, 撤销会话数: revokedCount,
+        Jellyfin地址后缀: pathSuffix?.value,
         公开地址来源: publicAccess.source, 是否使用云助手请求地址: !publicAccess.publicBaseUrl,
       });
       return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };

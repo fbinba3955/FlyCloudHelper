@@ -13,17 +13,13 @@ import { ApiClientError, getCurrentUser, getSetupStatus } from "@/lib/api";
 import { SetupPage, LoginPage, RegisterPage } from "@/pages/AuthPages";
 import { OverviewPage } from "@/pages/OverviewPage";
 import {
-  AdminServiceCatalogPage,
   AdminServiceConnectionPage,
   AdminServiceCreatePage,
   AdminServiceDetailPage,
-  AdminServiceSnapshotPage,
   AdminServicesPage,
   ServiceCreatePage,
-  UserServiceCatalogPage,
   UserServiceConnectionPage,
   UserServiceDetailPage,
-  UserServiceSnapshotPage,
   UserServicesPage,
 } from "@/pages/ServicePages";
 import {
@@ -32,6 +28,14 @@ import {
   UserCatalogPage,
   UserJobsPage,
 } from "@/pages/JobCatalogPages";
+import {
+  AdminLibraryCatalogPage,
+  AdminLibrarySettingsPage,
+  AdminLibrarySnapshotPage,
+  UserLibraryCatalogPage,
+  UserLibrarySettingsPage,
+  UserLibrarySnapshotPage,
+} from "@/pages/LibraryPages";
 import {
   AdminAuditPage,
   AdminConfigurationPage,
@@ -165,7 +169,7 @@ function UserServiceDetailRouteComponent() {
 /** 处理普通用户服务海报墙路由参数。 */
 function UserServiceCatalogRouteComponent() {
   const { serviceId } = userServiceCatalogRoute.useParams();
-  return <UserServiceCatalogPage serviceId={serviceId} />;
+  return <UserLibraryCatalogPage serviceId={serviceId} />;
 }
 
 /** 处理普通用户服务连接管理路由参数。 */
@@ -177,7 +181,25 @@ function UserServiceConnectionRouteComponent() {
 /** 处理普通用户服务快照管理路由参数。 */
 function UserServiceSnapshotRouteComponent() {
   const { serviceId } = userServiceSnapshotRoute.useParams();
-  return <UserServiceSnapshotPage serviceId={serviceId} />;
+  return <UserLibrarySnapshotPage serviceId={serviceId} />;
+}
+
+/** 处理普通用户媒体库设置路由参数。 */
+function UserLibrarySettingsRouteComponent() {
+  const { serviceId } = userLibrarySettingsRoute.useParams();
+  return <UserLibrarySettingsPage serviceId={serviceId} />;
+}
+
+/** 处理普通用户媒体库海报墙路由参数。 */
+function UserLibraryCatalogRouteComponent() {
+  const { serviceId } = userLibraryCatalogRoute.useParams();
+  return <UserLibraryCatalogPage serviceId={serviceId} />;
+}
+
+/** 处理普通用户媒体库快照路由参数。 */
+function UserLibrarySnapshotRouteComponent() {
+  const { serviceId } = userLibrarySnapshotRoute.useParams();
+  return <UserLibrarySnapshotPage serviceId={serviceId} />;
 }
 
 /** 处理管理员服务详情路由参数。 */
@@ -189,7 +211,7 @@ function AdminServiceDetailRouteComponent() {
 /** 处理管理员服务海报墙路由参数。 */
 function AdminServiceCatalogRouteComponent() {
   const { serviceId } = adminServiceCatalogRoute.useParams();
-  return <AdminServiceCatalogPage serviceId={serviceId} />;
+  return <AdminLibraryCatalogPage serviceId={serviceId} />;
 }
 
 /** 处理管理员服务连接管理路由参数。 */
@@ -201,7 +223,25 @@ function AdminServiceConnectionRouteComponent() {
 /** 处理管理员服务快照管理路由参数。 */
 function AdminServiceSnapshotRouteComponent() {
   const { serviceId } = adminServiceSnapshotRoute.useParams();
-  return <AdminServiceSnapshotPage serviceId={serviceId} />;
+  return <AdminLibrarySnapshotPage serviceId={serviceId} />;
+}
+
+/** 处理管理员媒体库设置路由参数。 */
+function AdminLibrarySettingsRouteComponent() {
+  const { serviceId } = adminLibrarySettingsRoute.useParams();
+  return <AdminLibrarySettingsPage serviceId={serviceId} />;
+}
+
+/** 处理管理员媒体库海报墙路由参数。 */
+function AdminLibraryCatalogRouteComponent() {
+  const { serviceId } = adminLibraryCatalogRoute.useParams();
+  return <AdminLibraryCatalogPage serviceId={serviceId} />;
+}
+
+/** 处理管理员媒体库快照路由参数。 */
+function AdminLibrarySnapshotRouteComponent() {
+  const { serviceId } = adminLibrarySnapshotRoute.useParams();
+  return <AdminLibrarySnapshotPage serviceId={serviceId} />;
 }
 
 /** 全局 404 页面。 */
@@ -318,6 +358,24 @@ const userCatalogRoute = createRoute({
   component: UserCatalogPage,
 });
 
+const userLibrarySettingsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "libraries/$serviceId/settings",
+  component: UserLibrarySettingsRouteComponent,
+});
+
+const userLibraryCatalogRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "libraries/$serviceId/catalog",
+  component: UserLibraryCatalogRouteComponent,
+});
+
+const userLibrarySnapshotRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "libraries/$serviceId/snapshots",
+  component: UserLibrarySnapshotRouteComponent,
+});
+
 const adminRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "admin",
@@ -384,6 +442,24 @@ const adminCatalogRoute = createRoute({
   component: AdminCatalogPage,
 });
 
+const adminLibrarySettingsRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "libraries/$serviceId/settings",
+  component: AdminLibrarySettingsRouteComponent,
+});
+
+const adminLibraryCatalogRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "libraries/$serviceId/catalog",
+  component: AdminLibraryCatalogRouteComponent,
+});
+
+const adminLibrarySnapshotRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "libraries/$serviceId/snapshots",
+  component: AdminLibrarySnapshotRouteComponent,
+});
+
 const adminPluginsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "plugins",
@@ -419,6 +495,9 @@ const appRouteTree = appRoute.addChildren([
   userServiceSnapshotRoute,
   userJobsRoute,
   userCatalogRoute,
+  userLibrarySettingsRoute,
+  userLibraryCatalogRoute,
+  userLibrarySnapshotRoute,
 ]);
 
 /** 组合超级管理员后台子路由。 */
@@ -433,6 +512,9 @@ const adminRouteTree = adminRoute.addChildren([
   adminServiceSnapshotRoute,
   adminJobsRoute,
   adminCatalogRoute,
+  adminLibrarySettingsRoute,
+  adminLibraryCatalogRoute,
+  adminLibrarySnapshotRoute,
   adminPluginsRoute,
   adminConfigurationRoute,
   adminSystemRoute,

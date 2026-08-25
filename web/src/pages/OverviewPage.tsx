@@ -106,7 +106,7 @@ export function OverviewPage() {
         </Panel>
       </div>
 
-      <Panel title="我的服务" description="服务连接状态、媒体数量和服务海报墙入口" className="mt-4" action={<Link to="/app/services" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理服务 <ArrowUpRight className="size-3.5" /></Link>}>
+      <Panel title="我的服务" className="mt-4" action={<Link to="/app/services" className="inline-flex items-center gap-1 text-xs text-primary-soft">管理服务 <ArrowUpRight className="size-3.5" /></Link>}>
         <div className="grid gap-3 sm:grid-cols-2">
           {services.map((service) => (
             <div key={service.id} className="rounded-xl border border-border bg-secondary/40 p-4">
@@ -116,8 +116,8 @@ export function OverviewPage() {
               </div>
               <p className="mt-1 font-mono text-[11px] text-muted-foreground">{service.providerType} · {service.id}</p>
               <div className="mt-3 flex items-center justify-between text-[11px] text-muted-foreground">
-                <span>{service.itemCount.toLocaleString()} 条目</span>
-                <Link to="/app/services/$serviceId/catalog" params={{ serviceId: service.id }} className="text-primary-soft">服务海报墙</Link>
+                <span>连接 r{service.credentialRevision} · 扫描 r{service.scanProfileRevision}</span>
+                <Link to="/app/services/$serviceId" params={{ serviceId: service.id }} className="text-primary-soft">服务设置</Link>
               </div>
             </div>
           ))}

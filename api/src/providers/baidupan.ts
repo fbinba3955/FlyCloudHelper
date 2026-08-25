@@ -30,12 +30,11 @@ export class BaiduPanProvider implements ProviderAdapter {
     type: "baidupan",
     displayName: "百度网盘",
     adapterVersion: "1.0.0",
-    credentialSchemaVersion: 1,
+    credentialSchemaVersion: 2,
     capabilities: ["list", "stableResourceId", "playbackLocator", "relay"],
     recommendedScanSettings: createFlymbyRecommendedScanSettings(),
     connectionFields: [
       { name: "accessToken", label: "Access Token", type: "password", required: true, secret: true },
-      { name: "apiBaseUrl", label: "开放接口地址", type: "url", required: false, secret: false },
     ],
   };
 

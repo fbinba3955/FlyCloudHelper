@@ -33,11 +33,11 @@ const providerConnectionGuides: Record<string, ProviderConnectionGuideContent> =
       "打开 OpenList Token 工具，网盘类型选择“阿里云盘 OAuth2 扫码登录”。",
       "勾选“使用 OpenList 提供的参数”，点击获取 Token，并使用阿里云盘 APP 扫码授权。",
       "授权完成后复制 Access Token，返回本页面粘贴到对应输入框。",
-      "填写该账号需要扫描的 Drive ID，然后点击“验证连接并创建服务”。",
+      "点击“验证连接并创建服务”，云助手会自动获取该账号的 Drive ID。",
     ],
     toolUrl: "https://api.oplist.org/",
     toolLabel: "打开 OpenList Token 工具",
-    note: "Access Token 会过期；失效后需要在服务连接页面重新获取并替换。请不要把 Token 提交给不可信的网站。",
+    note: "Drive ID 和开放接口地址由云助手自动处理。Access Token 会过期；失效后需要在服务连接页面重新获取并替换。请不要把 Token 提交给不可信的网站。",
   },
   baidupan: {
     title: "百度网盘授权信息获取说明",
@@ -49,7 +49,7 @@ const providerConnectionGuides: Record<string, ProviderConnectionGuideContent> =
     ],
     toolUrl: "https://api.oplist.org/",
     toolLabel: "打开 OpenList Token 工具",
-    note: "Access Token 会过期；失效后需要在服务连接页面重新获取并替换。请不要把 Token 提交给不可信的网站。",
+    note: "百度网盘目录使用路径和文件 fs_id 定位，开放接口地址由云助手自动使用官方地址。Access Token 会过期；失效后需要在服务连接页面重新获取并替换。",
   },
 };
 

@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { Download, Pause, Play, Radio, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
+import { Download, Images, Pause, Play, Radio, RefreshCw, RotateCcw, Settings2, Square, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
@@ -453,10 +453,21 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
       {resource.error && <Panel className="mb-4"><p className="text-sm text-destructive">{resource.error}</p></Panel>}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         {services.map((service) => (
-          <Link key={service.id} to={admin ? "/admin/services/$serviceId/catalog" : "/app/services/$serviceId/catalog"} params={{ serviceId: service.id }} className="surface block p-5 transition-colors hover:border-primary/40">
-            <div className="flex items-start justify-between gap-3"><div className="min-w-0"><h2 className="truncate text-sm font-semibold">{service.displayName}</h2><p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{service.providerType} · {service.libraryId}</p></div><StatusPill tone={service.status === "active" ? "success" : "warning"}>{service.status === "active" ? "正常" : "需处理"}</StatusPill></div>
-            <div className="mt-5 flex items-center justify-between text-xs text-muted-foreground"><span>{service.itemCount.toLocaleString()} 个顶层条目</span>{admin && <span>{service.ownerUsername}</span>}</div>
-          </Link>
+          <article key={service.id} className="surface p-5">
+            <div className="flex items-start justify-between gap-3"><div className="min-w-0"><h2 className="truncate text-sm font-semibold">{service.displayName}</h2><p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{service.providerType} · {service.libraryId}</p></div><StatusPill tone={service.status === "active" ? "success" : "warning"}>{service.status === "active" ? "来源服务正常" : "来源服务需处理"}</StatusPill></div>
+            <dl className="mt-5 grid grid-cols-2 gap-3 text-center">
+              <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">媒体条目</dt><dd className="mt-1 text-xs font-medium">{service.itemCount.toLocaleString()}</dd></div>
+              <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-[10px] text-muted-foreground">目录版本</dt><dd className="mt-1 text-xs font-medium">v{service.catalogVersion}</dd></div>
+            </dl>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <StatusPill tone={service.jellyfinEnabled ? "success" : "neutral"}>Jellyfin {service.jellyfinEnabled ? "已启用" : "未启用"}</StatusPill>
+              {admin && <StatusPill>{service.ownerUsername}</StatusPill>}
+            </div>
+            <footer className="mt-5 flex flex-wrap gap-2">
+              <Link to={admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog"} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Images className="size-3.5" /> 海报墙</Link>
+              <Link to={admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings"} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 媒体库设置</Link>
+            </footer>
+          </article>
         ))}
       </div>
       {!resource.loading && services.length === 0 && <Panel><p className="py-12 text-center text-sm text-muted-foreground">还没有可用的云端服务</p></Panel>}
