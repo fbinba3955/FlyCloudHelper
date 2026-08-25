@@ -262,11 +262,26 @@ async function batchInsert(
   await transaction.batchInsert(tableName, rows, 25);
 }
 
+/** 把源文件资源 ID 冲突转换为可读且不可盲目重试的迁移错误。 */
+function normalizeMigrationImportError(error: unknown): unknown {
+  const errorMessage = error instanceof Error ? error.message : String(error ?? "");
+  if (/uq_source_files_resource|source_files\.user_id.*source_files\.library_id.*source_files\.provider_resource_id/iu
+    .test(errorMessage)) {
+    return new ApiError(
+      422,
+      "migration_snapshot_duplicate_provider_resource",
+      "本地媒体库快照包含重复网盘文件，云助手无法确定唯一文件归属，请使用新版 APP 重新关联",
+    );
+  }
+  return error;
+}
+
 /** 把本地 Flymby 视频库快照事务性映射到云助手目录表。 */
 async function importSnapshotRows(
   database: FlyCloudHelperDatabase,
   migration: ServiceMigrationRecord,
   snapshot: SnapshotRows,
+  logger: MigrationWorkerLogger,
 ): Promise<ImportStatistics> {
   const now = new Date().toISOString();
   const generationId = migration.id;
@@ -278,7 +293,24 @@ async function importSnapshotRows(
     await transaction("source_files").where({ library_id: migration.libraryId }).delete();
 
     const sourceIdByPath = new Map<string, string>();
+    const canonicalPathBySourcePath = new Map<string, string>(); // 关键变量：旧路径文件关联要改到最新路径。
+    const canonicalSourceByResourceId = new Map<string, Record<string, unknown>>(); // 关键变量：同一网盘文件优先保留更新的路径记录。
     const sourceRows: Array<Record<string, unknown>> = [];
+    let duplicateSourceFileCount = 0;
+    for (const local of snapshot.sourceFiles) {
+      const displayPath = readText(local, "path");
+      const providerResourceId = readText(local, "resourceId") || displayPath;
+      if (!displayPath || !providerResourceId) continue;
+      const currentCanonicalSource = canonicalSourceByResourceId.get(providerResourceId);
+      const currentUpdatedAt = currentCanonicalSource ? readNumber(currentCanonicalSource, "updatedAt") : -1;
+      const currentIndexedAt = currentCanonicalSource ? readNumber(currentCanonicalSource, "indexedAt") : -1;
+      const nextUpdatedAt = readNumber(local, "updatedAt");
+      const nextIndexedAt = readNumber(local, "indexedAt");
+      if (!currentCanonicalSource || nextUpdatedAt > currentUpdatedAt
+        || (nextUpdatedAt === currentUpdatedAt && nextIndexedAt > currentIndexedAt)) {
+        canonicalSourceByResourceId.set(providerResourceId, local);
+      }
+    }
     for (const local of snapshot.sourceFiles) {
       const displayPath = readText(local, "path");
       if (!displayPath || sourceIdByPath.has(displayPath)) continue;
@@ -291,7 +323,16 @@ async function importSnapshotRows(
         );
       }
       const providerResourceId = explicitResourceId || displayPath;
+      const canonicalSource = canonicalSourceByResourceId.get(providerResourceId);
+      const canonicalDisplayPath = canonicalSource ? readText(canonicalSource, "path") : displayPath;
+      canonicalPathBySourcePath.set(displayPath, canonicalDisplayPath || displayPath);
       const sourceId = createStableId("src", migration.userId, migration.libraryId, providerResourceId);
+      if (canonicalSource !== local) {
+        // 重复路径仍映射到已保留的源文件，后续文件关联不会因为去重而丢失。
+        sourceIdByPath.set(displayPath, sourceId);
+        duplicateSourceFileCount += 1;
+        continue;
+      }
       const locator = {
         ...readEmbeddedObject(local, "providerPayloadJson"),
         resourceId: providerResourceId,
@@ -321,6 +362,17 @@ async function importSnapshotRows(
         status: readText(local, "isStale") === "true" ? "missing" : "active",
         created_at: readIsoTime(local, "indexedAt", now),
         updated_at: readIsoTime(local, "updatedAt", now),
+      });
+    }
+    if (duplicateSourceFileCount > 0) {
+      logger.info({
+        日志关键字: "codex-flycloud-migration-source-dedup",
+        事件: "云端导入去除重复网盘文件",
+        用户ID: migration.userId,
+        迁移ID: migration.id,
+        服务ID: migration.serviceId,
+        重复文件数量: duplicateSourceFileCount,
+        保留文件数量: sourceRows.length,
       });
     }
 
@@ -431,20 +483,22 @@ async function importSnapshotRows(
       });
     }
 
-    const fileLinkRows: Array<Record<string, unknown>> = [];
+    const fileLinkRowBySourceId = new Map<string, Record<string, unknown>>();
+    const fileLinkUsesCanonicalPath = new Set<string>(); // 关键变量：同一文件优先保留新路径上的影片关联。
     // 关键变量：初次迁移也必须保持一个源文件只有一个媒体归属，避免把 APP 历史异常数据带入云端主库。
-    const fileLinkKeys = new Set<string>();
     for (const local of snapshot.fileLinks) {
-      const sourceFileId = sourceIdByPath.get(readText(local, "path"));
+      const localPath = readText(local, "path");
+      const sourceFileId = sourceIdByPath.get(localPath);
       const localEpisodeId = readText(local, "episodeId");
       const targetItemId = localEpisodeId
         ? episodeIdByLocalId.get(localEpisodeId)
         : itemIdByLocalId.get(readText(local, "itemId"));
       if (!sourceFileId || !targetItemId) continue;
-      const key = sourceFileId;
-      if (fileLinkKeys.has(key)) continue;
-      fileLinkKeys.add(key);
-      fileLinkRows.push({
+      const canonicalPath = canonicalPathBySourcePath.get(localPath) || localPath;
+      const usesCanonicalPath = canonicalPath === localPath;
+      if (fileLinkRowBySourceId.has(sourceFileId)
+        && (!usesCanonicalPath || fileLinkUsesCanonicalPath.has(sourceFileId))) continue;
+      fileLinkRowBySourceId.set(sourceFileId, {
         id: randomUUID(),
         user_id: migration.userId,
         library_id: migration.libraryId,
@@ -455,7 +509,9 @@ async function importSnapshotRows(
           confidence: readNumber(local, "confidence"),
         }),
       });
+      if (usesCanonicalPath) fileLinkUsesCanonicalPath.add(sourceFileId);
     }
+    const fileLinkRows = Array.from(fileLinkRowBySourceId.values());
 
     await batchInsert(transaction, "source_files", sourceRows);
     await batchInsert(transaction, "media_items", mediaRows);
@@ -631,7 +687,7 @@ export class ServiceMigrationWorker {
         totalCount: totalRows,
         checkpoint: { archiveVerified: true, snapshotParsed: true },
       });
-      const statistics = await importSnapshotRows(this.database, migration, snapshot);
+      const statistics = await importSnapshotRows(this.database, migration, snapshot, this.logger);
       await this.repository.updateActiveStage({
         migrationId: migration.id,
         status: "finalizing",
@@ -679,9 +735,15 @@ export class ServiceMigrationWorker {
         导入耗时毫秒: Date.now() - startedAt,
       });
     } catch (error) {
-      const code = error instanceof ApiError ? error.code : "service_migration_failed";
-      const retryable = !(error instanceof ApiError) || error.statusCode >= 500;
-      await this.repository.fail(migration.id, code, toSafeErrorMessage(error, "服务迁移失败"), retryable);
+      const normalizedError = normalizeMigrationImportError(error); // 关键变量：禁止把完整数据库 SQL 暴露给 APP。
+      const code = normalizedError instanceof ApiError ? normalizedError.code : "service_migration_failed";
+      const retryable = !(normalizedError instanceof ApiError) || normalizedError.statusCode >= 500;
+      await this.repository.fail(
+        migration.id,
+        code,
+        toSafeErrorMessage(normalizedError, "服务迁移失败"),
+        retryable,
+      );
       this.logger.warn({
         日志关键字: "codex-flycloud-migration-import",
         事件: "服务迁移后台处理失败",
@@ -689,7 +751,7 @@ export class ServiceMigrationWorker {
         迁移ID: migration.id,
         服务ID: migration.serviceId,
         错误码: code,
-        错误信息: toSafeErrorMessage(error),
+        错误信息: toSafeErrorMessage(normalizedError),
       });
     }
   }

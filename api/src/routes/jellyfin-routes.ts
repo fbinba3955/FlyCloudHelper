@@ -4,6 +4,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
 import { buildJellyfinPath } from "../jellyfin-path.js";
 import { parseCompletedMediaProbeResult, readJellyfinRunTimeTicks } from "../media/media-probe.js";
+import { hydrateRealtimeVideoDetails } from "../media/realtime-video-details.js";
 import { JellyfinCompatibilityService, type JellyfinContext, type JellyfinLibraryContext } from "../jellyfin-service.js";
 import { providerFetch, providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext } from "../providers/types.js";
@@ -299,13 +300,34 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
   server.get(`${prefix}/UserViews`, async (request) => compatibility.listLibraries(await authenticated(request)));
   server.get(`${prefix}/Users/:userId/Items/Resume`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.listResume(context, readQuery(request)); });
   server.get(`${prefix}/Users/:userId/Items/Latest`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); const result = await compatibility.listItems(context, { ...readQuery(request), SortBy: "DateCreated", SortOrder: "Descending" }); return result.Items; });
-  server.get(`${prefix}/Users/:userId/Items/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); const item = await runtime.repository.getCatalogItem(params.itemId, context.ownerUserId); const parent = item.itemType === "video.episode" ? await runtime.database.query("media_relations").where({ child_item_id: item.id }).first() : null; return compatibility.mapItem(context, item, parent ? await runtime.repository.getCatalogItem(String(parent.parent_item_id), context.ownerUserId) : undefined); });
+  server.get(`${prefix}/Users/:userId/Items/:itemId`, async (request) => {
+    const context = await authenticated(request);
+    const params = request.params as { userId: string; itemId: string };
+    requireProtocolUser(context, params.userId);
+    const sourceItem = await runtime.repository.getCatalogItem(params.itemId, context.ownerUserId);
+    const item = await hydrateRealtimeVideoDetails(runtime, sourceItem);
+    const parent = item.itemType === "video.episode"
+      ? await runtime.database.query("media_relations").where({ child_item_id: item.id }).first()
+      : null;
+    return compatibility.mapItem(
+      context,
+      item,
+      parent ? await runtime.repository.getCatalogItem(String(parent.parent_item_id), context.ownerUserId) : undefined,
+    );
+  });
   server.get(`${prefix}/Users/:userId/Items`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); const query = readQuery(request); return String(query.SortBy ?? "").includes("DatePlayed") || String(query.Filters ?? "").includes("IsPlayed") ? compatibility.listHistory(context, query) : compatibility.listItems(context, query); });
   server.get(`${prefix}/Users/:userId/Items/:itemId/UserData`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); return compatibility.getUserData(context, params.itemId); });
   server.post(`${prefix}/Users/:userId/Items/:itemId/UserData`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); return compatibility.updateUserData(context, params.itemId, (request.body ?? {}) as Record<string, unknown>); });
   server.get(`${prefix}/Items/Counts`, async (request) => compatibility.getItemCounts(await authenticated(request)));
   server.get(`${prefix}/Items/:itemId/Similar`, async (request) => compatibility.listSimilar(await authenticated(request), String((request.params as { itemId: string }).itemId), readQuery(request)));
-  server.get(`${prefix}/Items/:itemId`, async (request) => { const context = await authenticated(request); const item = await runtime.repository.getCatalogItem(String((request.params as { itemId: string }).itemId), context.ownerUserId); return compatibility.mapItem(context, item); });
+  server.get(`${prefix}/Items/:itemId`, async (request) => {
+    const context = await authenticated(request);
+    const sourceItem = await runtime.repository.getCatalogItem(
+      String((request.params as { itemId: string }).itemId),
+      context.ownerUserId,
+    );
+    return compatibility.mapItem(context, await hydrateRealtimeVideoDetails(runtime, sourceItem));
+  });
   server.get(`${prefix}/Items`, async (request) => compatibility.listItems(await authenticated(request), readQuery(request)));
   server.get(`${prefix}/Items/:itemId/Ancestors`, async (request) => {
     const context = await authenticated(request);

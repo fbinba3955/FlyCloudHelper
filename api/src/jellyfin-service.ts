@@ -5,6 +5,7 @@ import { hashSessionToken } from "./auth.js";
 import { parseJsonObject, type CatalogSort, type MediaItemRecord } from "./domain.js";
 import { ApiError } from "./errors.js";
 import type { ApiRuntime } from "./runtime.js";
+import { hydrateRealtimeVideoDetails } from "./media/realtime-video-details.js";
 import {
   parseCompletedMediaProbeResult,
   readJellyfinRunTimeTicks,
@@ -525,8 +526,11 @@ export class JellyfinCompatibilityService {
       const parent = await this.runtime.repository.getCatalogItem(parentId, context.ownerUserId);
       if (parent.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
       const children = await this.runtime.repository.listCatalogChildren(parentId, context.ownerUserId);
-      const mapping = await this.loadItemMappingContext(context, children.map((item) => item.id));
-      const items = await Promise.all(children.map((item) => this.mapItem(context, item, parent, mapping)));
+      const hydratedChildren = await Promise.all(children.map((item) => (
+        item.itemType === "video.episode" ? hydrateRealtimeVideoDetails(this.runtime, item) : item
+      )));
+      const mapping = await this.loadItemMappingContext(context, hydratedChildren.map((item) => item.id));
+      const items = await Promise.all(hydratedChildren.map((item) => this.mapItem(context, item, parent, mapping)));
       return this.paginate(items, query);
     }
     const requestedTypes = include.map((type) => type === "Movie" ? "video.movie" : type === "Series" ? "video.series" : type === "Episode" ? "video.episode" : "")
@@ -689,12 +693,15 @@ export class JellyfinCompatibilityService {
       .filter((item) => seasonNumber === null || Number(item.metadata.seasonNumber ?? 0) === seasonNumber)
       .sort((left, right) => Number(left.metadata.seasonNumber ?? 0) - Number(right.metadata.seasonNumber ?? 0)
         || Number(left.metadata.episodeNumber ?? 0) - Number(right.metadata.episodeNumber ?? 0));
-    const mapping = await this.loadItemMappingContext(context, children.map((item) => item.id));
-    const items = await Promise.all(children.map((item) => this.mapItem(context, item, series, mapping)));
+    // 关键变量：关闭同步刮削详情时，Jellyfin 客户端无法自行访问云助手的实时详情接口，需要在标准单集接口中补全。
+    const hydratedChildren = await Promise.all(children.map((item) => hydrateRealtimeVideoDetails(this.runtime, item)));
+    const mapping = await this.loadItemMappingContext(context, hydratedChildren.map((item) => item.id));
+    const items = await Promise.all(hydratedChildren.map((item) => this.mapItem(context, item, series, mapping)));
     const response = this.paginate(items, query);
     this.runtime.logBusinessEvent("info", {
       日志关键字: "codex-jellyfin-compat", 事件: "返回Jellyfin节目单集列表", 服务ID: context.serviceId,
-      节目ID: actualSeriesId, 季编号: seasonNumber ?? "全部", 返回数量: response.Items.length, 总数量: response.TotalRecordCount,
+      节目ID: actualSeriesId, 季编号: seasonNumber ?? "全部", 返回数量: response.Items.length,
+      总数量: response.TotalRecordCount,
     });
     return response;
   }
@@ -830,7 +837,8 @@ export class JellyfinCompatibilityService {
       .where({ service_id: context.serviceId, account_id: context.accountId }).whereIn("item_id", children.map((item) => item.id));
     const progressById = new Map(progressRows.map((row) => [String(row.item_id), row]));
     const next = children.find((item) => Number(progressById.get(item.id)?.played ?? 0) !== 1);
-    const items = next ? [await this.mapItem(context, next, series)] : [];
+    const hydratedNext = next ? await hydrateRealtimeVideoDetails(this.runtime, next) : undefined;
+    const items = hydratedNext ? [await this.mapItem(context, hydratedNext, series)] : [];
     return { Items: items, TotalRecordCount: items.length, StartIndex: 0 };
   }
 

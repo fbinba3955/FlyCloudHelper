@@ -24,7 +24,7 @@ import { isFlymbyExcludedPath } from "./media/flymby-scan-exclusions.js";
 import { createStableId } from "./media/filename.js";
 import { parseFlymbyVideoName } from "./media/flymby-video-parser.js";
 import { parseMediaProbeResult, type MediaProbeResult } from "./media/media-probe.js";
-import type { TmdbVideoMetadata } from "./metadata/tmdb.js";
+import type { TmdbEpisodeMetadata, TmdbVideoMetadata } from "./metadata/tmdb.js";
 import { ServiceAccessService, type GeneratedServiceAccessCredentials } from "./service-access.js";
 
 interface ServiceRow {
@@ -3532,6 +3532,56 @@ export class ServiceRepository {
         poster_url: input.metadata.posterUrl,
         backdrop_url: input.metadata.backdropUrl,
         external_ids_json: JSON.stringify({ ...currentExternalIds, tmdb: String(input.metadata.id) }),
+        metadata_json: JSON.stringify(nextMetadata),
+        updated_at: now,
+      });
+      await this.recordCatalogItemChanges(transaction, input.userId, String(row.library_id), [input.itemId], now);
+    });
+    return this.getCatalogItem(input.itemId, input.userId);
+  }
+
+  /** 将 Jellyfin 协议实时读取的 TMDB 单集信息合并回单集目录记录。 */
+  public async applyRealtimeEpisodeDetails(input: {
+    itemId: string;
+    userId: string;
+    metadata: TmdbEpisodeMetadata;
+    overviewLanguage: string;
+    overviewFallbackChecked: boolean;
+  }): Promise<MediaItemRecord> {
+    const item = await this.getCatalogItem(input.itemId, input.userId);
+    if (item.mediaType !== "video" || item.itemType !== "video.episode") return item;
+    const now = new Date().toISOString();
+    await this.database.query.transaction(async (transaction) => {
+      const row = await transaction("media_items")
+        .where({ id: input.itemId, user_id: input.userId })
+        .whereNull("deleted_at")
+        .first();
+      if (!row) throw new ApiError(404, "media_item_not_found", "媒体条目不存在");
+      const currentMetadata = parseJsonObject(row.metadata_json);
+      const currentExternalIds = parseJsonObject(row.external_ids_json);
+      // 关键变量：只补全单集刮削字段，保留文件识别结果、节目关系和媒体规格信息。
+      const nextMetadata: Record<string, unknown> = {
+        ...currentMetadata,
+        seasonNumber: input.metadata.seasonNumber,
+        episodeNumber: input.metadata.episodeNumber,
+        airDate: input.metadata.airDate,
+        rating: input.metadata.rating,
+        durationMs: input.metadata.durationMs,
+        tmdbEpisodeId: input.metadata.id,
+        tmdbEpisodeDetailsSynchronized: true,
+        tmdbEpisodeDetailsSynchronizedAt: now,
+        tmdbEpisodeOverviewLanguage: input.overviewLanguage,
+        tmdbEpisodeOverviewFallbackChecked: input.overviewFallbackChecked,
+      };
+      await transaction("media_items").where({ id: input.itemId, user_id: input.userId }).update({
+        title: input.metadata.title || String(row.title),
+        premiere_date: input.metadata.airDate || row.premiere_date || null,
+        overview: input.metadata.overview,
+        poster_url: input.metadata.stillUrl || row.poster_url || null,
+        external_ids_json: JSON.stringify({
+          ...currentExternalIds,
+          ...(input.metadata.id > 0 ? { tmdb: String(input.metadata.id) } : {}),
+        }),
         metadata_json: JSON.stringify(nextMetadata),
         updated_at: now,
       });
