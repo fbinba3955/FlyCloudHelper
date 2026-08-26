@@ -15,6 +15,7 @@ import type { ScanWorker } from "./worker.js";
 import type { PublicAccessService } from "./public-access.js";
 import type { ServiceAccessService } from "./service-access.js";
 import type { MediaProbeWorker } from "./media-probe-worker.js";
+import type { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
 
 /** 后台路由共享的已初始化运行时依赖。 */
 export interface ApiRuntime {
@@ -30,6 +31,8 @@ export interface ApiRuntime {
   musicBrainz: MusicBrainzClient;
   worker: ScanWorker;
   mediaProbeWorker: MediaProbeWorker;
+  scanSchedules: ScanScheduleStore;
+  scanScheduleWorker: ScanScheduleWorker;
   plugins: MetadataPluginManager;
   exports: LibraryExportService;
   failureReports: ScanFailureReportService;

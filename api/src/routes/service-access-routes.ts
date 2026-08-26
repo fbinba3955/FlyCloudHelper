@@ -142,20 +142,11 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         Jellyfin地址后缀: pathSuffix?.value ?? null,
         公开地址来源: publicAccess.source, 是否使用云助手请求地址: !publicAccess.publicBaseUrl,
       });
-      if (changesRegionLibraries) {
-        runtime.logBusinessEvent("info", {
-          日志关键字: "codex-jellyfin-region-library",
-          事件: "更新Jellyfin节目地区分组设置",
-          操作用户ID: operator.id,
-          服务ID: request.params.serviceId,
-          地区分组开关: Boolean(request.body.jellyfinRegionLibrariesEnabled),
-        });
-      }
       return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
     });
 
     server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/library-playback-settings`, async (request) => {
-      const { operator, service } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      const { service } = await requireManagedService(runtime, request, request.params.serviceId, admin);
       const changesAppRelay = request.body.appRelayPlaybackEnabled !== undefined;
       const changesJellyfinRelay = request.body.jellyfinRelayPlaybackEnabled !== undefined;
       if (!changesAppRelay && !changesJellyfinRelay) {
@@ -179,14 +170,6 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         .where({ service_id: request.params.serviceId })
         .update(updateValues);
       if (changed !== 1) throw new ApiError(404, "library_not_found", "媒体库不存在");
-      runtime.logBusinessEvent("info", {
-        日志关键字: "codex-media-library-relay-setting",
-        事件: "更新媒体库独立中转播放设置",
-        操作用户ID: operator.id,
-        服务ID: request.params.serviceId,
-        APP专用中转: changesAppRelay ? Boolean(request.body.appRelayPlaybackEnabled) : null,
-        Jellyfin中转: changesJellyfinRelay ? Boolean(request.body.jellyfinRelayPlaybackEnabled) : null,
-      });
       return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
     });
   };

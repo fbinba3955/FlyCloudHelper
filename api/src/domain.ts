@@ -3,6 +3,7 @@ export type UserStatus = "active" | "disabled" | "pending_delete";
 export type NotificationCategory = "task" | "security" | "system";
 export type NotificationTone = "info" | "success" | "warning" | "danger";
 export type ServiceStatus = "active" | "scanning" | "reauthorization_required" | "disabled";
+export type ScanScheduleType = "interval" | "daily" | "weekly" | "monthly";
 export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "completed" | "failed" | "cancelled";
 export type BackgroundJobType = "scan" | "media_probe";
 export type JobStage = "queued" | "enumerating" | "classifying" | "scraping" | "persisting" | "probing" | "completed";
@@ -136,6 +137,27 @@ export interface ScanJobRecord {
   finishedAt: string | null;
   /** 任务真正处于扫描刮削运行状态的累计时长，不包含排队、暂停和延迟恢复等待。 */
   elapsedMs: number;
+  updatedAt: string;
+}
+
+/** 服务级全量或增量扫描定时计划。 */
+export interface ScanScheduleRecord {
+  id: string;
+  userId: string;
+  serviceId: string;
+  scanMode: "incremental" | "full";
+  enabled: boolean;
+  scheduleType: ScanScheduleType;
+  intervalMinutes: number | null;
+  timeOfDay: string | null;
+  dayOfWeek: number | null;
+  dayOfMonth: number | null;
+  timezoneOffsetMinutes: number;
+  nextRunAt: string | null;
+  lastTriggeredAt: string | null;
+  lastJobId: string | null;
+  lastError: string | null;
+  createdAt: string;
   updatedAt: string;
 }
 

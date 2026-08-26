@@ -1131,6 +1131,9 @@ export class ServiceRepository {
         if (!service) {
           throw new ApiError(404, "service_not_found", "云端服务不存在");
         }
+        if (service.status === "scanning") {
+          throw new ApiError(409, "scan_job_conflict", "当前服务正在扫描，不能重复创建扫描任务");
+        }
         if (service.status !== "active") {
           throw new ApiError(409, "service_not_ready", "云端服务当前不能创建扫描任务");
         }
@@ -1139,7 +1142,7 @@ export class ServiceRepository {
           .whereIn("status", ["queued", "running", "retry_waiting", "paused"])
           .first();
         if (conflicting) {
-          throw new ApiError(409, "scan_job_conflict", "该服务已有未结束的扫描任务");
+          throw new ApiError(409, "scan_job_conflict", "当前服务已有未结束的扫描任务，不能重复创建");
         }
         const now = new Date().toISOString();
         const snapshot = {
@@ -1474,6 +1477,16 @@ export class ServiceRepository {
       items,
       total: Number(countRow?.count ?? 0) + Number(mediaProbeCountRow?.count ?? 0),
     };
+  }
+
+  /** 查询一个服务当前尚未结束的扫描任务，供客户端触发前快速拦截重复请求。 */
+  public async findUnfinishedScanJob(serviceId: string, userId: string): Promise<ScanJobRecord | null> {
+    const row = await this.jobSummaryQuery()
+      .where({ "j.service_id": serviceId, "j.user_id": userId })
+      .whereIn("j.status", ["queued", "running", "retry_waiting", "paused"])
+      .orderBy("j.created_at", "desc")
+      .first() as JobRow | undefined;
+    return row ? mapJob(row) : null;
   }
 
   /** 领取一个排队任务，避免同一进程重复执行。 */

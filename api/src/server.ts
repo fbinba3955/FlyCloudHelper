@@ -1,9 +1,10 @@
 import fs from "node:fs";
+import path from "node:path";
 import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
-import type { ApiConfig } from "./config.js";
+import { projectRoot, type ApiConfig } from "./config.js";
 import { FlyCloudHelperDatabase } from "./database.js";
 import { ApiError } from "./errors.js";
 import { LibraryExportService } from "./export-service.js";
@@ -18,6 +19,7 @@ import { registerCatalogRoutes } from "./routes/catalog-routes.js";
 import { registerGuangyaAuthRoutes } from "./routes/guangya-auth-routes.js";
 import { registerMediaStreamRoutes } from "./routes/media-stream-routes.js";
 import { registerNotificationRoutes } from "./routes/notification-routes.js";
+import { registerScanScheduleRoutes } from "./routes/scan-schedule-routes.js";
 import { registerPluginRoutes } from "./routes/plugin-routes.js";
 import { PublicAccessService } from "./public-access.js";
 import { ServiceAccessService } from "./service-access.js";
@@ -27,6 +29,7 @@ import { registerServiceMigrationRoutes } from "./routes/service-migration-route
 import { registerServiceAccessRoutes } from "./routes/service-access-routes.js";
 import { registerJellyfinRoutes } from "./routes/jellyfin-routes.js";
 import type { ApiRuntime } from "./runtime.js";
+import { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
 import { ScanFailureReportService } from "./scan-failure-report-service.js";
 import { CredentialVault } from "./secrets.js";
 import { ServiceRepository } from "./service-repository.js";
@@ -73,8 +76,24 @@ function createBusinessLogger(server: FastifyInstance) {
   };
 }
 
+/** 从根包清单读取当前服务版本，确保 Docker 与本地部署展示同一版本号。 */
+function readServiceVersion(): string {
+  try {
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(projectRoot, "package.json"), "utf8"),
+    ) as { version?: unknown };
+    return typeof manifest.version === "string" && manifest.version.trim()
+      ? manifest.version.trim()
+      : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 /** 创建并初始化 FlyCloudHelper API、Worker 与全部后台能力。 */
 export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance> {
+  // 关键变量：服务进程启动后版本保持不变，健康检查无需重复读取磁盘。
+  const serviceVersion = readServiceVersion();
   const server = Fastify({
     // Jellyfin 官方 ASP.NET 路由不区分大小写，兼容客户端可能混用 Items/items、Videos/videos。
     caseSensitive: false,
@@ -160,6 +179,14 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     logger: server.log,
     config,
   });
+  const scanSchedules = new ScanScheduleStore(database);
+  const scanScheduleWorker = new ScanScheduleWorker({
+    store: scanSchedules,
+    repository,
+    plugins,
+    tmdb,
+    logger,
+  });
   const migrationWorker = new ServiceMigrationWorker({
     database,
     repository: migrations,
@@ -180,6 +207,8 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     musicBrainz,
     worker,
     mediaProbeWorker,
+    scanSchedules,
+    scanScheduleWorker,
     plugins,
     exports,
     failureReports,
@@ -198,6 +227,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     },
   });
   server.addHook("onClose", async () => {
+    await scanScheduleWorker.stop();
     await migrationWorker.stop();
     await worker.stop();
     await mediaProbeWorker.stop();
@@ -287,6 +317,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
 
   server.get("/api/v1/health", async () => ({
     status: "ok",
+    version: serviceVersion,
     databaseType: config.databaseType,
     worker: worker.getStatus(),
     mediaProbeWorker: mediaProbeWorker.getStatus(),
@@ -298,6 +329,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     const tmdbStatus = tmdb.getStatus();
     return {
       service: "flycloud-helper",
+      version: serviceVersion,
       serviceInstanceId: state.serviceInstanceId,
       protocolVersion: 1,
       status: state.setupRequired
@@ -350,6 +382,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerAuthRoutes(server, { config, database, logBusinessEvent: logger });
   await registerGuangyaAuthRoutes(server, runtime);
   await registerServiceRoutes(server, runtime);
+  await registerScanScheduleRoutes(server, runtime, scanSchedules);
   await registerServiceAccessRoutes(server, runtime);
   await registerServiceMigrationRoutes(server, runtime);
   await registerScanFailureReportRoutes(server, runtime);
@@ -397,5 +430,6 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   migrationWorker.start();
   worker.start();
   mediaProbeWorker.start();
+  scanScheduleWorker.start();
   return server;
 }

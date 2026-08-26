@@ -20,6 +20,7 @@ import { useEffect, useRef, useState, type ButtonHTMLAttributes, type ComponentT
 import {
   clearNotifications,
   deleteNotification,
+  getServiceHealth,
   listNotifications,
   logout,
   type AuthRole,
@@ -166,6 +167,9 @@ export function ConsoleShell({
   // 关键变量：同步占用清除操作，避免 React 按钮状态刷新前重复提交。
   const notificationActionRef = useRef<string | null>(null);
   const notifications = useApiResource(() => listNotifications(30), []);
+  const serviceHealth = useApiResource(() => getServiceHealth(), []);
+  /** 最近一次成功读取服务状态的本地时间。 */
+  const [serviceStatusUpdatedAt, setServiceStatusUpdatedAt] = useState<Date | null>(null);
   const navigationItems = role === "super_admin" ? adminNavigation : userNavigation;
   const notificationItems = notifications.data ?? [];
 
@@ -174,6 +178,16 @@ export function ConsoleShell({
     const timer = window.setInterval(() => void notifications.refresh(), 10_000);
     return () => window.clearInterval(timer);
   }, [notifications.refresh]);
+
+  useEffect(() => {
+    if (serviceHealth.data !== null) setServiceStatusUpdatedAt(new Date());
+  }, [serviceHealth.data]);
+
+  useEffect(() => {
+    // 服务版本很少变化，每 30 秒校验一次即可，同时用于更新连接状态。
+    const timer = window.setInterval(() => void serviceHealth.refresh(), 30_000);
+    return () => window.clearInterval(timer);
+  }, [serviceHealth.refresh]);
 
   useEffect(() => {
     if (!notificationOpen) return;
@@ -251,9 +265,16 @@ export function ConsoleShell({
           <div className="rounded-xl border border-border bg-secondary/50 p-3">
             <div className="flex items-center justify-between gap-2">
               <p className="text-[11px] text-muted-foreground">SSE 实时连接</p>
-              <StatusPill tone="success">正常</StatusPill>
+              <StatusPill tone={serviceHealth.error ? "danger" : serviceHealth.data ? "success" : "warning"}>
+                {serviceHealth.error ? "异常" : serviceHealth.data ? "正常" : "检测中"}
+              </StatusPill>
             </div>
-            <p className="mt-2 font-mono text-[10px] text-muted-foreground">最后更新 14:07:22</p>
+            <p className="mt-2 font-mono text-[10px] text-muted-foreground">
+              服务版本 {serviceHealth.data?.version ? `v${serviceHealth.data.version}` : "读取中"}
+            </p>
+            <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+              最后更新 {serviceStatusUpdatedAt?.toLocaleTimeString("zh-CN", { hour12: false }) ?? "--:--:--"}
+            </p>
           </div>
           {actualRole === "super_admin" && (
             <Link

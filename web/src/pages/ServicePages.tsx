@@ -1,5 +1,5 @@
 import { Link, useNavigate } from "@tanstack/react-router";
-import { Plus, RefreshCw, ScanLine, Settings2, Trash2 } from "lucide-react";
+import { CalendarClock, Plus, RefreshCw, ScanLine, Settings2, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
@@ -890,6 +890,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
             <p className="mt-4 text-xs text-muted-foreground">全量路径 {fullScanRoots.length} 条 · 增量路径 {incrementalScanRoots.length} 条</p>
           </div>
           <div className="rounded-xl border border-border bg-secondary/40 p-4"><p className="text-xs text-muted-foreground">连接管理</p><p className="mt-2 text-sm">重连、重新授权或替换完整连接。</p><Link to={admin ? "/admin/services/$serviceId/connection" : "/app/services/$serviceId/connection"} params={{ serviceId }} className="mt-3 inline-flex items-center gap-1 text-xs text-primary-soft">打开连接管理 <Settings2 className="size-3.5" /></Link></div>
+          <div className="rounded-xl border border-border bg-secondary/40 p-4"><p className="text-xs text-muted-foreground">扫描定时任务</p><p className="mt-2 text-sm">分别设置全量和增量扫描的间隔、每日、每周或每月计划。</p><Link to={admin ? "/admin/services/$serviceId/scan-schedules" : "/app/services/$serviceId/scan-schedules"} params={{ serviceId }} className="mt-3 inline-flex items-center gap-1 text-xs text-primary-soft">打开扫描定时任务 <CalendarClock className="size-3.5" /></Link></div>
         </div>
       </Panel>
       <div className="mt-4 grid gap-4 xl:grid-cols-2">

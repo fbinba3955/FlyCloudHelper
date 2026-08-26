@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 35;
+export const currentSchemaVersion = 36;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -539,6 +539,30 @@ async function createCatalogTables(database: Knex): Promise<void> {
     .where({ status: "running" })
     .whereNull("active_started_at")
     .update({ active_started_at: new Date().toISOString() });
+
+  if (!(await database.schema.hasTable("service_scan_schedules"))) {
+    await database.schema.createTable("service_scan_schedules", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("scan_mode", 32).notNullable();
+      table.integer("enabled").notNullable().defaultTo(0);
+      table.string("schedule_type", 32).notNullable();
+      table.integer("interval_minutes").nullable();
+      table.string("time_of_day", 5).nullable();
+      table.integer("day_of_week").nullable();
+      table.integer("day_of_month").nullable();
+      table.integer("timezone_offset_minutes").notNullable().defaultTo(0);
+      table.string("next_run_at", 40).nullable();
+      table.string("last_triggered_at", 40).nullable();
+      table.string("last_job_id", 64).nullable();
+      table.text("last_error").nullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["user_id", "service_id", "scan_mode"], { indexName: "uq_service_scan_schedules_mode" });
+      table.index(["enabled", "next_run_at"], "idx_service_scan_schedules_due");
+    });
+  }
 
   if (!(await database.schema.hasTable("scan_job_events"))) {
     await database.schema.createTable("scan_job_events", (table) => {

@@ -773,9 +773,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       if (!binding || binding.serviceId !== service.id) {
         throw new ApiError(409, "client_service_binding_required", "只有当前服务已绑定的设备才能发起迁回");
       }
-      if (binding.bindingSource !== "local_migration") {
-        throw new ApiError(409, "service_transfer_source_invalid", "从云端同步到本机的镜像只能从本机移除，不能迁回并删除云端服务");
-      }
+      // 关键变量：无论服务最初由 APP 迁入，还是从云端同步到本机，只要当前设备仍有有效绑定即可完整迁回。
       failureStage = "恢复或复用已有迁回任务";
       const existingTransfer = await runtime.database.query("service_transfer_outs")
         .where({ user_id: user.id, service_id: service.id }).first();
@@ -1455,6 +1453,10 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       throw validationError("scanMode", "扫描模式只支持 incremental 或 full");
     }
     const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+    const unfinishedJob = await runtime.repository.findUnfinishedScanJob(request.params.serviceId, user.id);
+    if (service.status === "scanning" || unfinishedJob) {
+      throw new ApiError(409, "scan_job_conflict", "当前服务正在扫描或已有未结束任务，不能重复启动");
+    }
     if (getScanRootsForMode(service.scanProfile, scanMode).length === 0) {
       throw new ApiError(409, "scan_paths_not_configured", `请先配置${scanMode === "full" ? "全量" : "增量"}扫描路径`);
     }

@@ -343,7 +343,7 @@ export function loadApiConfig(): ApiConfig {
     acoustidApiKey: acoustidSecret.value,
     fpcalcPath: readEnvironmentValue("FLYCLOUDHELPER_FPCALC_PATH") || null,
     workerEnabled: readBoolean("FLYCLOUDHELPER_WORKER_ENABLED", true),
-    workerConcurrency: readPositiveInteger("FLYCLOUDHELPER_WORKER_CONCURRENCY", 2),
+    workerConcurrency: readPositiveInteger("FLYCLOUDHELPER_WORKER_CONCURRENCY", 5),
     workerPollIntervalMs: readPositiveInteger("FLYCLOUDHELPER_WORKER_POLL_INTERVAL_MS", 1000),
     ffprobePath: readEnvironmentValue("FLYCLOUDHELPER_FFPROBE_PATH") || "ffprobe",
     mediaProbeConcurrency: readPositiveInteger("FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY", 1),

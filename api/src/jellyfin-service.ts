@@ -526,13 +526,6 @@ export class JellyfinCompatibilityService {
         ?? result?.items.find((item) => Boolean(item.backdropUrl));
       return this.mapLibrary(context, library, result?.total ?? 0, coverItem);
     });
-    this.runtime.logBusinessEvent("info", {
-      日志关键字: "codex-jellyfin-region-library", 事件: "返回Jellyfin电影节目媒体库", 服务ID: context.serviceId,
-      地区分组开关: context.regionLibrariesEnabled,
-      电影数量: counts[0]?.total ?? 0,
-      节目媒体库数量: libraries.filter((library) => library.collectionType === "tvshows").length,
-      节目数量: counts.slice(1).reduce((sum, result) => sum + (result?.total ?? 0), 0),
-    });
     return { Items: items, TotalRecordCount: items.length, StartIndex: 0 };
   }
 

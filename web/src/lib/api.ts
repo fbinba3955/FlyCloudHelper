@@ -8,6 +8,12 @@ export interface AuthUser {
   createdAt: string;
 }
 
+/** 公共健康接口返回的服务版本与运行状态。 */
+export interface ServiceHealth {
+  status: "ok";
+  version: string;
+}
+
 export type ConsoleNotificationTone = "info" | "success" | "warning" | "danger";
 
 /** 控制台右上角展示的账号通知。 */
@@ -123,6 +129,7 @@ export type MatchState = "matched" | "needs_review" | "unmatched" | "processing"
 export type ServiceStatus = "active" | "scanning" | "disabled" | "reauthorization_required";
 export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "completed" | "failed" | "cancelled";
 export type LibrarySnapshotStatus = "queued" | "running" | "completed" | "failed";
+export type ScanScheduleType = "interval" | "daily" | "weekly" | "monthly";
 
 export interface OverviewResult {
   serviceCount: number;
@@ -285,6 +292,37 @@ export interface ScanJob {
   finishedAt: string | null;
   elapsedMs: number;
   updatedAt: string;
+}
+
+/** 服务级全量或增量扫描定时任务。 */
+export interface ScanSchedule {
+  id: string;
+  userId: string;
+  serviceId: string;
+  scanMode: "incremental" | "full";
+  enabled: boolean;
+  scheduleType: ScanScheduleType;
+  intervalMinutes: number | null;
+  timeOfDay: string | null;
+  dayOfWeek: number | null;
+  dayOfMonth: number | null;
+  timezoneOffsetMinutes: number;
+  nextRunAt: string | null;
+  lastTriggeredAt: string | null;
+  lastJobId: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UpdateScanScheduleInput {
+  enabled: boolean;
+  scheduleType: ScanScheduleType;
+  intervalMinutes: number;
+  timeOfDay: string;
+  dayOfWeek: number;
+  dayOfMonth: number;
+  timezoneOffsetMinutes: number;
 }
 
 /** 视频规格后台任务详情中的失败文件。 */
@@ -519,6 +557,11 @@ export function getOverview(): Promise<OverviewResult> {
   return requestJson("/api/v1/overview");
 }
 
+/** 读取当前 FlyCloudHelper 实例的真实服务版本。 */
+export function getServiceHealth(): Promise<ServiceHealth> {
+  return requestJson("/api/v1/health");
+}
+
 /** 读取用户或管理端服务列表，管理端筛选由服务端作用于完整数据集。 */
 export function listServices(
   admin = false,
@@ -706,6 +749,30 @@ export async function createScanJob(serviceId: string, scanMode: "incremental" |
     },
   );
   return result.job;
+}
+
+/** 读取服务的全量和增量扫描计划。 */
+export async function getServiceScanSchedules(serviceId: string, admin = false): Promise<ScanSchedule[]> {
+  const result = await requestJson<{ schedules: ScanSchedule[] }>(
+    admin ? `/api/v1/admin/services/${serviceId}/scan-schedules` : `/api/v1/services/${serviceId}/scan-schedules`,
+  );
+  return result.schedules;
+}
+
+/** 保存一个扫描模式的定时计划。 */
+export async function updateServiceScanSchedule(
+  serviceId: string,
+  scanMode: "incremental" | "full",
+  input: UpdateScanScheduleInput,
+  admin = false,
+): Promise<ScanSchedule> {
+  const result = await requestJson<{ schedule: ScanSchedule }>(
+    admin
+      ? `/api/v1/admin/services/${serviceId}/scan-schedules/${scanMode}`
+      : `/api/v1/services/${serviceId}/scan-schedules/${scanMode}`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+  return result.schedule;
 }
 
 /** 为失败或已取消任务创建一条保留原扫描模式的新任务。 */

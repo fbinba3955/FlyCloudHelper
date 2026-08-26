@@ -44,6 +44,10 @@ import {
   AdminSystemPage,
   AdminUsersPage,
 } from "@/pages/AdminPages";
+import {
+  AdminServiceScanSchedulePage,
+  UserServiceScanSchedulePage,
+} from "@/pages/ScanSchedulePages";
 
 /** 根路由容器。 */
 function RootRouteComponent() {
@@ -178,6 +182,12 @@ function UserServiceConnectionRouteComponent() {
   return <UserServiceConnectionPage serviceId={serviceId} />;
 }
 
+/** 处理普通用户扫描定时任务路由参数。 */
+function UserServiceScanScheduleRouteComponent() {
+  const { serviceId } = userServiceScanScheduleRoute.useParams();
+  return <UserServiceScanSchedulePage serviceId={serviceId} />;
+}
+
 /** 处理普通用户媒体库设置路由参数。 */
 function UserLibrarySettingsRouteComponent() {
   const { serviceId } = userLibrarySettingsRoute.useParams();
@@ -212,6 +222,12 @@ function AdminServiceCatalogRouteComponent() {
 function AdminServiceConnectionRouteComponent() {
   const { serviceId } = adminServiceConnectionRoute.useParams();
   return <AdminServiceConnectionPage serviceId={serviceId} />;
+}
+
+/** 处理管理员扫描定时任务路由参数。 */
+function AdminServiceScanScheduleRouteComponent() {
+  const { serviceId } = adminServiceScanScheduleRoute.useParams();
+  return <AdminServiceScanSchedulePage serviceId={serviceId} />;
 }
 
 /** 处理管理员媒体库设置路由参数。 */
@@ -328,6 +344,12 @@ const userServiceConnectionRoute = createRoute({
   component: UserServiceConnectionRouteComponent,
 });
 
+const userServiceScanScheduleRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "services/$serviceId/scan-schedules",
+  component: UserServiceScanScheduleRouteComponent,
+});
+
 const userJobsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "jobs",
@@ -406,6 +428,12 @@ const adminServiceConnectionRoute = createRoute({
   component: AdminServiceConnectionRouteComponent,
 });
 
+const adminServiceScanScheduleRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "services/$serviceId/scan-schedules",
+  component: AdminServiceScanScheduleRouteComponent,
+});
+
 const adminJobsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "jobs",
@@ -468,6 +496,7 @@ const appRouteTree = appRoute.addChildren([
   userServiceDetailRoute,
   userServiceCatalogRoute,
   userServiceConnectionRoute,
+  userServiceScanScheduleRoute,
   userJobsRoute,
   userCatalogRoute,
   userLibrarySettingsRoute,
@@ -484,6 +513,7 @@ const adminRouteTree = adminRoute.addChildren([
   adminServiceDetailRoute,
   adminServiceCatalogRoute,
   adminServiceConnectionRoute,
+  adminServiceScanScheduleRoute,
   adminJobsRoute,
   adminCatalogRoute,
   adminLibrarySettingsRoute,
