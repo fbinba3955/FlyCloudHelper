@@ -16,6 +16,7 @@ import {
   type ServiceDetailRecord,
   type ServiceStatus,
   type SourceFileRecord,
+  type VideoRegionGroup,
   parseJsonArray,
   parseJsonObject,
 } from "./domain.js";
@@ -26,6 +27,43 @@ import { parseFlymbyVideoName } from "./media/flymby-video-parser.js";
 import { parseMediaProbeResult, type MediaProbeResult } from "./media/media-probe.js";
 import type { TmdbEpisodeMetadata, TmdbVideoMetadata } from "./metadata/tmdb.js";
 import { ServiceAccessService, type GeneratedServiceAccessCredentials } from "./service-access.js";
+
+type ServiceRepositoryLogger = (
+  level: "info" | "warn",
+  fields: Record<string, string | number | boolean | null>,
+) => void;
+
+interface JellyfinServiceCleanupResult {
+  protocolSessionCount: number;
+  playbackProgressCount: number;
+  playbackSessionCount: number;
+  playbackHistoryCount: number;
+  accessAccountCount: number;
+}
+
+// 关键变量：华语、日韩优先于欧美判断，跨地区合拍节目按更具体的亚洲分组归类。
+const CHINESE_REGION_CODES = new Set(["CN", "HK", "TW", "MO"]);
+const JAPAN_KOREA_REGION_CODES = new Set(["JP", "KR"]);
+const EUROPE_AMERICA_REGION_CODES = new Set(
+  ("US CA MX GL BM PM "
+    + "BZ CR SV GT HN NI PA AI AG AW BS BB BQ VG KY CU CW DM DO GD GP HT JM MQ MS PR BL KN LC MF VC SX TT TC VI "
+    + "AR BO BR CL CO EC FK GF GY PY PE SR UY VE "
+    + "GB IE FR DE IT ES PT NL BE LU AT CH DK NO SE FI IS GR PL CZ SK HU RO BG HR SI RS BA ME MK AL EE LV LT UA BY MD RU CY MT AD MC LI SM VA XK "
+    + "AU NZ")
+    .split(" "),
+);
+
+/** 根据节目 TMDB origin_country 计算稳定地区分组；电影和缺失数据统一归入 other。 */
+function readVideoRegionGroup(itemType: string, metadata: Record<string, unknown>): VideoRegionGroup {
+  if (itemType !== "video.series") return "other";
+  const countries = Array.isArray(metadata.originCountries)
+    ? metadata.originCountries.map((country) => String(country).trim().toUpperCase()).filter(Boolean)
+    : [];
+  if (countries.some((country) => CHINESE_REGION_CODES.has(country))) return "chinese";
+  if (countries.some((country) => JAPAN_KOREA_REGION_CODES.has(country))) return "japan_korea";
+  if (countries.some((country) => EUROPE_AMERICA_REGION_CODES.has(country))) return "europe_america";
+  return "other";
+}
 
 interface ServiceRow {
   id: string;
@@ -511,11 +549,14 @@ function toVideoProviderEntry(row: Record<string, unknown>) {
 /** 提供带用户作用域的云端服务、任务和目录数据访问。 */
 export class ServiceRepository {
   private readonly database: FlyCloudHelperDatabase;
+  private readonly logger?: ServiceRepositoryLogger;
   // 关键变量：阻止同一 API 实例同时执行同一服务的多次清空，跨实例仍由数据库服务行锁兜底。
   private readonly clearingCatalogServiceIds = new Set<string>();
 
-  public constructor(database: FlyCloudHelperDatabase) {
+  /** 初始化服务仓储，并接收用于记录删除清理结果的业务日志。 */
+  public constructor(database: FlyCloudHelperDatabase, logger?: ServiceRepositoryLogger) {
     this.database = database;
+    this.logger = logger;
   }
 
   /** 构造服务摘要公共查询，始终保留用户和媒体库链路。 */
@@ -538,7 +579,7 @@ export class ServiceRepository {
         "s.data_type",
         "s.status",
         "s.connection_status",
-        "s.relay_playback_enabled",
+        "l.app_relay_playback_enabled as relay_playback_enabled",
         "l.jellyfin_enabled as jellyfin_enabled",
         "s.credential_revision",
         "s.scan_profile_revision",
@@ -560,7 +601,7 @@ export class ServiceRepository {
         "s.data_type",
         "s.status",
         "s.connection_status",
-        "s.relay_playback_enabled",
+        "l.app_relay_playback_enabled",
         "l.jellyfin_enabled",
         "s.credential_revision",
         "s.scan_profile_revision",
@@ -614,6 +655,9 @@ export class ServiceRepository {
         service_id: input.serviceId,
         provider_type: input.providerType,
         catalog_version: 0,
+        app_relay_playback_enabled: 0,
+        jellyfin_relay_playback_enabled: 1,
+        jellyfin_region_libraries_enabled: 0,
         jellyfin_enabled: 0,
         jellyfin_path_suffix: input.serviceId,
         jellyfin_path_suffix_lookup: input.serviceId.toLowerCase(),
@@ -657,6 +701,7 @@ export class ServiceRepository {
           client_device_id: input.binding.clientDeviceId,
           client_service_id: input.binding.clientServiceId,
           provider_type: input.providerType,
+          binding_source: "local_migration",
           created_at: now,
           updated_at: now,
         });
@@ -670,13 +715,17 @@ export class ServiceRepository {
   public async listServices(filters: {
     userId?: string;
     providerType?: string;
+    dataType?: MediaType;
     status?: ServiceStatus;
+    jellyfinEnabled?: boolean;
     keyword?: string;
     limit: number;
     offset: number;
   }): Promise<{ items: CloudServiceRecord[]; total: number }> {
     const query = this.serviceSummaryQuery();
-    const countQuery = this.database.query("cloud_services as s").whereNull("s.deleted_at");
+    const countQuery = this.database.query("cloud_services as s")
+      .join("media_libraries as l", "l.id", "s.library_id")
+      .whereNull("s.deleted_at");
     if (filters.userId) {
       query.where("s.user_id", filters.userId);
       countQuery.where("s.user_id", filters.userId);
@@ -685,9 +734,18 @@ export class ServiceRepository {
       query.where("s.provider_type", filters.providerType);
       countQuery.where("s.provider_type", filters.providerType);
     }
+    if (filters.dataType) {
+      query.where("s.data_type", filters.dataType);
+      countQuery.where("s.data_type", filters.dataType);
+    }
     if (filters.status) {
       query.where("s.status", filters.status);
       countQuery.where("s.status", filters.status);
+    }
+    if (filters.jellyfinEnabled !== undefined) {
+      const jellyfinEnabled = filters.jellyfinEnabled ? 1 : 0; // 关键变量：兼容 SQLite、PostgreSQL 和 MySQL 的数值开关字段。
+      query.where("l.jellyfin_enabled", jellyfinEnabled);
+      countQuery.where("l.jellyfin_enabled", jellyfinEnabled);
     }
     if (filters.keyword) {
       query.whereLike("s.display_name", `%${filters.keyword}%`);
@@ -953,10 +1011,10 @@ export class ServiceRepository {
     userId: string,
     clientDeviceId: string,
     clientServiceId: string,
-  ): Promise<{ serviceId: string; libraryId: string } | null> {
+  ): Promise<{ serviceId: string; libraryId: string; bindingSource: string } | null> {
     const row = await this.database.query("client_service_links as b")
       .join("cloud_services as s", "s.id", "b.service_id")
-      .select("b.service_id", "s.library_id")
+      .select("b.service_id", "b.binding_source", "s.library_id")
       .where({
         "b.user_id": userId,
         "b.client_device_id": clientDeviceId,
@@ -964,7 +1022,11 @@ export class ServiceRepository {
       })
       .whereNull("s.deleted_at")
       .first();
-    return row ? { serviceId: String(row.service_id), libraryId: String(row.library_id) } : null;
+    return row ? {
+      serviceId: String(row.service_id),
+      libraryId: String(row.library_id),
+      bindingSource: String(row.binding_source || "local_migration"),
+    } : null;
   }
 
   /** 建立客户端本地服务到既有云端服务的绑定，不改写服务配置。 */
@@ -990,8 +1052,19 @@ export class ServiceRepository {
       throw new ApiError(409, "client_binding_conflict", "该本地服务已经绑定其他云端服务");
     }
     if (existing) {
-      await this.database.query("client_service_links").where({ id: existing.id }).update({ updated_at: now });
+      // 幂等重试只能刷新时间，不能把本地迁入来源改成云端镜像而改变后续删除语义。
+      await this.database.query("client_service_links").where({ id: existing.id }).update({
+        updated_at: now,
+      });
       return { bindingId: String(existing.id), serviceId: service.id, libraryId: service.libraryId, catalogVersion: service.catalogVersion };
+    }
+    const existingForCloudService = await this.database.query("client_service_links").where({
+      user_id: input.userId,
+      service_id: input.serviceId,
+      client_device_id: input.clientDeviceId,
+    }).first();
+    if (existingForCloudService) {
+      throw new ApiError(409, "cloud_service_already_bound_on_device", "该云端服务已经同步到当前设备");
     }
     await this.database.query("client_service_links").insert({
       id: input.bindingId,
@@ -1000,10 +1073,28 @@ export class ServiceRepository {
       client_device_id: input.clientDeviceId,
       client_service_id: input.clientServiceId,
       provider_type: input.providerType,
+      binding_source: "cloud_import",
       created_at: now,
       updated_at: now,
     });
     return { bindingId: input.bindingId, serviceId: service.id, libraryId: service.libraryId, catalogVersion: service.catalogVersion };
+  }
+
+  /** 只解除当前设备的一条客户端绑定，不删除云端服务及其他设备上的绑定。 */
+  public async unbindClientService(input: {
+    userId: string;
+    serviceId: string;
+    clientDeviceId: string;
+    clientServiceId: string;
+  }): Promise<boolean> {
+    await this.getServiceDetail(input.serviceId, input.userId);
+    const deletedCount = await this.database.query("client_service_links").where({
+      user_id: input.userId,
+      service_id: input.serviceId,
+      client_device_id: input.clientDeviceId,
+      client_service_id: input.clientServiceId,
+    }).delete();
+    return deletedCount > 0;
   }
 
   /** 创建具备请求幂等和同服务单写互斥的扫描任务。 */
@@ -1901,24 +1992,62 @@ export class ServiceRepository {
     return this.getServiceDetail(serviceId, userId);
   }
 
-  /** 更新单个服务是否允许媒体流经过 FlyCloudHelper 中转。 */
+  /** 更新单个媒体库是否允许 APP 专用媒体流经过 FlyCloudHelper 中转。 */
   public async updateRelayPlaybackEnabled(
     serviceId: string,
     userId: string | undefined,
     enabled: boolean,
   ): Promise<ServiceDetailRecord> {
-    const query = this.database.query("cloud_services").where({ id: serviceId }).whereNull("deleted_at");
-    if (userId) query.where({ user_id: userId });
-    const changed = await query.update({
-      relay_playback_enabled: enabled ? 1 : 0,
+    await this.getServiceDetail(serviceId, userId);
+    const changed = await this.database.query("media_libraries").where({ service_id: serviceId }).update({
+      app_relay_playback_enabled: enabled ? 1 : 0,
       updated_at: new Date().toISOString(),
     });
-    if (changed !== 1) throw new ApiError(404, "service_not_found", "云端服务不存在");
+    if (changed !== 1) throw new ApiError(404, "library_not_found", "媒体库不存在");
     return this.getServiceDetail(serviceId, userId);
   }
 
-  /** 软删除服务，并同步从活动媒体统计和扫描来源中移除关联数据。 */
+  /** 显式清除服务的 Jellyfin 账号、会话和播放数据，并释放自定义协议地址。 */
+  private async deleteJellyfinServiceData(
+    transaction: Knex.Transaction,
+    serviceId: string,
+    now: string,
+  ): Promise<JellyfinServiceCleanupResult> {
+    // 关键变量：播放表同时关联账号和媒体条目，必须先于服务访问账号删除，不能依赖软删除不会触发的外键级联。
+    const playbackHistoryCount = Number(await transaction("service_playback_history")
+      .where({ service_id: serviceId }).delete());
+    const playbackSessionCount = Number(await transaction("service_playback_sessions")
+      .where({ service_id: serviceId }).delete());
+    const playbackProgressCount = Number(await transaction("service_playback_progress")
+      .where({ service_id: serviceId }).delete());
+    const protocolSessionCount = Number(await transaction("service_protocol_sessions")
+      .where({ service_id: serviceId }).delete());
+    const accessAccountCount = Number(await transaction("service_access_accounts")
+      .where({ service_id: serviceId }).delete());
+    // 关键变量：删除后的占位后缀按服务 ID 唯一，既满足非空唯一约束，也释放用户原来自定义的 Jellyfin 地址。
+    const deletedPathSuffix = `deleted-${serviceId}`;
+    await transaction("media_libraries").where({ service_id: serviceId }).update({
+      app_relay_playback_enabled: 0,
+      jellyfin_relay_playback_enabled: 0,
+      jellyfin_region_libraries_enabled: 0,
+      jellyfin_enabled: 0,
+      jellyfin_path_suffix: deletedPathSuffix,
+      jellyfin_path_suffix_lookup: deletedPathSuffix.toLowerCase(),
+      status: "disabled",
+      updated_at: now,
+    });
+    return {
+      protocolSessionCount,
+      playbackProgressCount,
+      playbackSessionCount,
+      playbackHistoryCount,
+      accessAccountCount,
+    };
+  }
+
+  /** 软删除服务，并同步清除 Jellyfin 数据、活动媒体统计和扫描来源。 */
   public async deleteService(serviceId: string, userId?: string): Promise<void> {
+    let jellyfinCleanupResult: JellyfinServiceCleanupResult | undefined;
     await this.database.query.transaction(async (transaction) => {
       const serviceQuery = transaction("cloud_services").where({ id: serviceId }).whereNull("deleted_at");
       if (userId) serviceQuery.where({ user_id: userId });
@@ -1930,9 +2059,9 @@ export class ServiceRepository {
       ]);
       if (runningScanJob || runningMediaProbeJob) throw new ApiError(409, "service_has_active_job", "服务仍有未结束后台任务");
       const now = new Date().toISOString();
+      jellyfinCleanupResult = await this.deleteJellyfinServiceData(transaction, serviceId, now);
       await transaction("media_items").where({ service_id: serviceId }).whereNull("deleted_at").update({ deleted_at: now, updated_at: now });
       await transaction("source_files").where({ service_id: serviceId }).update({ status: "missing", updated_at: now });
-      await transaction("media_libraries").where({ service_id: serviceId }).update({ status: "disabled", updated_at: now });
       // 关键变量：释放本机服务唯一绑定，删除或取消迁移后允许同一 APP 服务重新关联。
       await transaction("client_service_links").where({ service_id: serviceId }).delete();
       // 关键变量：删除服务时同步清除迁移历史，避免 APP 重新关联时恢复到已经失效的服务 ID。
@@ -1945,6 +2074,96 @@ export class ServiceRepository {
         await transaction("service_migrations").whereIn("id", migrationIds).delete();
       }
       await transaction("cloud_services").where({ id: serviceId }).update({ status: "disabled", deleted_at: now, updated_at: now });
+    });
+    if (jellyfinCleanupResult) {
+      this.logger?.("info", {
+        日志关键字: "codex-jellyfin-service-cleanup",
+        事件: "删除服务时同步清除Jellyfin数据",
+        服务ID: serviceId,
+        删除协议会话数量: jellyfinCleanupResult.protocolSessionCount,
+        删除播放进度数量: jellyfinCleanupResult.playbackProgressCount,
+        删除播放会话数量: jellyfinCleanupResult.playbackSessionCount,
+        删除播放历史数量: jellyfinCleanupResult.playbackHistoryCount,
+        删除访问账号数量: jellyfinCleanupResult.accessAccountCount,
+      });
+    }
+  }
+
+  /** 迁回 APP 完成后物理删除服务、凭据和全部目录数据，不保留软删除占位。 */
+  public async hardDeleteService(serviceId: string, userId: string): Promise<void> {
+    let failureStage = "读取云端服务"; // 关键变量：NAS 上发生数据库约束错误时标识具体删除阶段。
+    try {
+      await this.database.query.transaction(async (transaction) => {
+      const service = await transaction("cloud_services")
+        .where({ id: serviceId, user_id: userId })
+        .first();
+      if (!service) throw new ApiError(404, "service_not_found", "云端服务不存在");
+      const libraryId = String(service.library_id);
+      const [runningScanJob, runningMediaProbeJob] = await Promise.all([
+        transaction("scan_jobs").where({ service_id: serviceId })
+          .whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+        transaction("media_probe_jobs").where({ service_id: serviceId })
+          .whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+      ]);
+      if (runningScanJob || runningMediaProbeJob) {
+        throw new ApiError(409, "service_has_active_job", "服务仍有未结束后台任务");
+      }
+      failureStage = "清理迁移与扫描任务";
+      const migrationRows = await transaction("service_migrations").select("id").where({ service_id: serviceId });
+      const migrationIds = migrationRows.map((row) => String(row.id));
+      if (migrationIds.length > 0) {
+        await transaction("service_migration_chunks").whereIn("migration_id", migrationIds).delete();
+      }
+      const scanJobRows = await transaction("scan_jobs").select("id").where({ service_id: serviceId });
+      const scanJobIds = scanJobRows.map((row) => String(row.id));
+      if (scanJobIds.length > 0) {
+        await transaction("scan_job_events").whereIn("job_id", scanJobIds).delete();
+        await transaction("scan_job_checkpoints").whereIn("job_id", scanJobIds).delete();
+        await transaction("scan_root_runs").whereIn("job_id", scanJobIds).delete();
+      }
+      failureStage = "清理媒体目录与规格数据";
+      await transaction("media_file_probes").where({ service_id: serviceId }).delete();
+      await transaction("media_probe_jobs").where({ service_id: serviceId }).delete();
+      await transaction("file_links").where({ library_id: libraryId }).delete();
+      await transaction("media_relations").where({ library_id: libraryId }).delete();
+      await transaction("catalog_changes").where({ library_id: libraryId }).delete();
+      await transaction("source_files").where({ service_id: serviceId }).delete();
+      await transaction("media_items").where({ service_id: serviceId }).delete();
+      failureStage = "清理播放与协议数据";
+      await transaction("service_playback_history").where({ service_id: serviceId }).delete();
+      await transaction("service_playback_sessions").where({ service_id: serviceId }).delete();
+      await transaction("service_playback_progress").where({ service_id: serviceId }).delete();
+      await transaction("service_protocol_sessions").where({ service_id: serviceId }).delete();
+      await transaction("service_access_accounts").where({ service_id: serviceId }).delete();
+      failureStage = "清理绑定、配置和服务主记录";
+      await transaction("client_service_links").where({ service_id: serviceId }).delete();
+      await transaction("service_transfer_outs").where({ service_id: serviceId }).delete();
+      await transaction("service_migrations").where({ service_id: serviceId }).delete();
+      await transaction("scan_jobs").where({ service_id: serviceId }).delete();
+      await transaction("library_exports").where({ library_id: libraryId }).delete();
+      await transaction("service_metadata_profiles").where({ service_id: serviceId }).delete();
+      await transaction("service_scan_profiles").where({ service_id: serviceId }).delete();
+      await transaction("service_credentials").where({ service_id: serviceId }).delete();
+      await transaction("media_libraries").where({ id: libraryId }).delete();
+      await transaction("cloud_services").where({ id: serviceId, user_id: userId }).delete();
+      });
+    } catch (error) {
+      this.logger?.("warn", {
+        日志关键字: "codex-flycloud-hard-delete",
+        事件: "迁回APP后彻底删除云端服务失败",
+        阶段: failureStage,
+        用户ID: userId,
+        服务ID: serviceId,
+        错误码: error instanceof ApiError ? error.code : "internal_error",
+        错误信息: error instanceof Error ? error.message : "未知错误",
+      });
+      throw error;
+    }
+    this.logger?.("info", {
+      日志关键字: "codex-flycloud-hard-delete",
+      事件: "迁回APP后彻底删除云端服务",
+      用户ID: userId,
+      服务ID: serviceId,
     });
   }
 
@@ -2724,11 +2943,13 @@ export class ServiceRepository {
     } : input;
     const externalIdsJson = JSON.stringify(effectiveInput.externalIds);
     const metadataJson = JSON.stringify(effectiveInput.metadata);
+    const regionGroup = readVideoRegionGroup(effectiveInput.itemType, effectiveInput.metadata);
     const premiereDate = readMediaPremiereDate(effectiveInput.metadata);
     const changed = !existing
       || existing.deleted_at !== null
       || String(existing.media_type) !== effectiveInput.mediaType
       || String(existing.item_type) !== effectiveInput.itemType
+      || String(existing.region_group ?? "other") !== regionGroup
       || String(existing.title) !== effectiveInput.title
       || String(existing.sort_title) !== effectiveInput.sortTitle
       || String(existing.subtitle) !== effectiveInput.subtitle
@@ -2750,6 +2971,7 @@ export class ServiceRepository {
         identity_key: input.identityKey,
         media_type: effectiveInput.mediaType,
         item_type: effectiveInput.itemType,
+        region_group: regionGroup,
         title: effectiveInput.title,
         sort_title: effectiveInput.sortTitle,
         subtitle: effectiveInput.subtitle,
@@ -2770,6 +2992,7 @@ export class ServiceRepository {
       .merge({
         media_type: effectiveInput.mediaType,
         item_type: effectiveInput.itemType,
+        region_group: regionGroup,
         title: effectiveInput.title,
         sort_title: effectiveInput.sortTitle,
         subtitle: effectiveInput.subtitle,
@@ -3195,6 +3418,7 @@ export class ServiceRepository {
     categoryKey?: string;
     genre?: string;
     genres?: string[];
+    regionGroup?: VideoRegionGroup;
     search?: string;
     sort: CatalogSort;
     limit: number;
@@ -3217,6 +3441,7 @@ export class ServiceRepository {
       // 海报墙只展示电影、节目、专辑和有声书等顶层条目；单集通过父条目的 children 接口读取。
       base.whereNot("m.item_type", "video.episode");
     }
+    if (filters.regionGroup) base.where("m.region_group", filters.regionGroup);
     if (filters.matchState) base.where("m.match_state", filters.matchState);
     if (filters.categoryKey === "unrecognized") base.whereNot("m.match_state", "matched");
     if (filters.genre) base.whereLike("m.metadata_json", `%${filters.genre}%`);
@@ -3416,6 +3641,7 @@ export class ServiceRepository {
       libraryId: String(row.library_id),
       mediaType: row.media_type as MediaType,
       itemType: String(row.item_type),
+      regionGroup: String(row.region_group ?? "other") as VideoRegionGroup,
       title: String(row.title),
       sortTitle: String(row.sort_title),
       subtitle: String(row.subtitle),
@@ -3518,6 +3744,7 @@ export class ServiceRepository {
         genres: input.metadata.genres,
         people: input.metadata.people,
         episodeCount: input.metadata.episodeCount,
+        originCountries: input.metadata.originCountries,
         matchedQuery: input.metadata.matchedQuery,
         candidateCount: input.metadata.candidateCount,
         tmdbDetailsSynchronized: true,
@@ -3533,6 +3760,7 @@ export class ServiceRepository {
         backdrop_url: input.metadata.backdropUrl,
         external_ids_json: JSON.stringify({ ...currentExternalIds, tmdb: String(input.metadata.id) }),
         metadata_json: JSON.stringify(nextMetadata),
+        region_group: readVideoRegionGroup(String(row.item_type), nextMetadata),
         updated_at: now,
       });
       await this.recordCatalogItemChanges(transaction, input.userId, String(row.library_id), [input.itemId], now);
@@ -3626,6 +3854,7 @@ export class ServiceRepository {
         genres: input.metadata.genres,
         people: input.metadata.people,
         episodeCount: input.metadata.episodeCount,
+        originCountries: input.metadata.originCountries,
         matchedQuery: input.metadata.matchedQuery,
         candidateCount: input.metadata.candidateCount,
         tmdbDetailsSynchronized: input.metadata.detailsSynchronized,
@@ -3650,6 +3879,7 @@ export class ServiceRepository {
         match_state: "matched",
         external_ids_json: JSON.stringify({ tmdb: String(input.metadata.id) }),
         metadata_json: JSON.stringify(nextMetadata),
+        region_group: readVideoRegionGroup(nextItemType, nextMetadata),
         updated_at: now,
       });
       await this.recordCatalogItemChanges(transaction, input.userId, String(row.library_id), [input.itemId, ...changedItemIds], now);
@@ -3693,6 +3923,7 @@ export class ServiceRepository {
         match_state: "unmatched",
         external_ids_json: "{}",
         metadata_json: JSON.stringify(original.metadata),
+        region_group: readVideoRegionGroup(original.itemType, original.metadata),
         updated_at: now,
       });
       await this.recordCatalogItemChanges(transaction, userId, String(row.library_id), [itemId, ...changedItemIds], now);

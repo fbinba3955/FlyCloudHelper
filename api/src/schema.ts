@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 30;
+export const currentSchemaVersion = 35;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -188,7 +188,6 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.integer("relay_playback_enabled").notNullable().defaultTo(0);
     });
   }
-
   if (!(await database.schema.hasTable("media_libraries"))) {
     await database.schema.createTable("media_libraries", (table) => {
       table.string("id", 64).primary();
@@ -196,6 +195,9 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("service_id", 64).notNullable().unique().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.string("provider_type", 64).notNullable();
       table.bigInteger("catalog_version").notNullable().defaultTo(0);
+      table.integer("app_relay_playback_enabled").notNullable().defaultTo(0);
+      table.integer("jellyfin_relay_playback_enabled").notNullable().defaultTo(1);
+      table.integer("jellyfin_region_libraries_enabled").notNullable().defaultTo(0);
       table.integer("jellyfin_enabled").notNullable().defaultTo(0);
       table.string("jellyfin_path_suffix", 255).notNullable();
       table.string("jellyfin_path_suffix_lookup", 255).notNullable();
@@ -206,6 +208,15 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.unique(["jellyfin_path_suffix_lookup"], { indexName: "uq_media_libraries_jellyfin_path_suffix" });
     });
   } else {
+    await addColumnIfMissing(database, "media_libraries", "app_relay_playback_enabled", (table) => {
+      table.integer("app_relay_playback_enabled").notNullable().defaultTo(0);
+    });
+    await addColumnIfMissing(database, "media_libraries", "jellyfin_relay_playback_enabled", (table) => {
+      table.integer("jellyfin_relay_playback_enabled").notNullable().defaultTo(1);
+    });
+    await addColumnIfMissing(database, "media_libraries", "jellyfin_region_libraries_enabled", (table) => {
+      table.integer("jellyfin_region_libraries_enabled").notNullable().defaultTo(0);
+    });
     await addColumnIfMissing(database, "media_libraries", "jellyfin_enabled", (table) => {
       table.integer("jellyfin_enabled").notNullable().defaultTo(0);
     });
@@ -264,9 +275,16 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("client_device_id", 200).notNullable();
       table.string("client_service_id", 200).notNullable();
       table.string("provider_type", 64).notNullable();
+      table.string("binding_source", 32).notNullable().defaultTo("local_migration");
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
       table.unique(["user_id", "client_device_id", "client_service_id"], { indexName: "uq_client_service_links_device" });
+      table.unique(["user_id", "service_id", "client_device_id"], { indexName: "uq_client_service_links_cloud_device" });
+    });
+  } else {
+    await addColumnIfMissing(database, "client_service_links", "binding_source", (table) => {
+      // 历史绑定均来自 APP 本地服务上行，升级时按 local_migration 回填。
+      table.string("binding_source", 32).notNullable().defaultTo("local_migration");
     });
   }
 
@@ -280,6 +298,8 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("client_device_id", 200).notNullable();
       table.string("client_service_id", 200).notNullable();
       table.string("provider_type", 64).notNullable();
+      // 关键变量：区分旧版一体迁移与新版向已关联服务迁移，取消时据此决定是否删服务。
+      table.integer("owns_service").notNullable().defaultTo(1);
       table.string("status", 32).notNullable();
       table.string("stage", 32).notNullable();
       table.integer("progress_percent").notNullable().defaultTo(0);
@@ -308,6 +328,35 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.index(["user_id", "created_at"], "idx_service_migrations_user_created");
       table.index(["status", "updated_at"], "idx_service_migrations_status_updated");
       table.index(["user_id", "client_device_id", "client_service_id"], "idx_service_migrations_client_service");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_transfer_outs"))) {
+    await database.schema.createTable("service_transfer_outs", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.string("client_device_id", 200).notNullable();
+      table.string("client_service_id", 200).notNullable();
+      table.string("export_id", 64).notNullable();
+      table.string("status", 32).notNullable();
+      table.string("previous_status", 32).notNullable().defaultTo("active");
+      table.integer("credential_claimed").notNullable().defaultTo(0);
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["service_id"], { indexName: "uq_service_transfer_outs_service" });
+      table.index(["user_id", "updated_at"], "idx_service_transfer_outs_user_updated");
+    });
+  }
+  await addColumnIfMissing(database, "service_transfer_outs", "previous_status", (table) => {
+    // 关键变量：早期迁回表没有保存冻结前状态，升级后按正常启用状态恢复，避免迁回任务插入失败。
+    table.string("previous_status", 32).notNullable().defaultTo("active");
+  });
+  if (!(await database.schema.hasColumn("service_migrations", "owns_service"))) {
+    await database.schema.alterTable("service_migrations", (table) => {
+      // 历史迁移均由旧协议创建并拥有对应服务，升级时按 true 回填。
+      table.integer("owns_service").notNullable().defaultTo(1);
     });
   }
 
@@ -674,6 +723,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("identity_key", 128).notNullable();
       table.string("media_type", 32).notNullable();
       table.string("item_type", 64).notNullable();
+      table.string("region_group", 32).notNullable().defaultTo("other");
       table.text("title").notNullable();
       table.text("sort_title").notNullable();
       table.text("subtitle").notNullable();
@@ -693,6 +743,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.index(["user_id", "library_id", "media_type"], "idx_media_items_library_type");
       table.index(["library_id"], "idx_media_items_library");
       table.index(["service_id", "media_type"], "idx_media_items_service_type");
+      table.index(["service_id", "item_type", "region_group", "deleted_at"], "idx_media_items_service_region");
       table.index(["user_id", "library_id", "deleted_at", "created_at"], "idx_media_items_catalog_created");
       table.index(["user_id", "library_id", "deleted_at", "sort_title"], "idx_media_items_catalog_title");
       table.index(["user_id", "library_id", "deleted_at", "year"], "idx_media_items_catalog_year");
@@ -700,6 +751,16 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.index(["user_id", "deleted_at", "match_state"], "idx_media_items_user_match");
     });
   }
+  await addColumnIfMissing(database, "media_items", "region_group", (table) => {
+    // 关键变量：历史节目不执行地区补全，升级后统一留在“其他节目”。
+    table.string("region_group", 32).notNullable().defaultTo("other");
+  });
+  await addIndexIfMissing(
+    database,
+    "media_items",
+    ["service_id", "item_type", "region_group", "deleted_at"],
+    "idx_media_items_service_region",
+  );
 
   if (!(await database.schema.hasTable("media_relations"))) {
     await database.schema.createTable("media_relations", (table) => {
@@ -1032,6 +1093,41 @@ async function migrateLibraryJellyfinPathSuffix(database: Knex): Promise<void> {
   await addUniqueIfMissing(database, "media_libraries", ["jellyfin_path_suffix_lookup"], "uq_media_libraries_jellyfin_path_suffix");
 }
 
+/** 将旧服务级中转开关迁移为媒体库 APP 中转开关，并保留 Jellyfin 原有中转能力。 */
+async function migrateLibraryRelayPlaybackSettings(database: Knex): Promise<void> {
+  const services = await database("cloud_services")
+    .select("id", "relay_playback_enabled", "deleted_at");
+  for (const service of services) {
+    // 关键变量：APP 中转沿用升级前的服务开关，Jellyfin 中转默认启用以保持升级前行为。
+    const serviceDeleted = Boolean(service.deleted_at);
+    await database("media_libraries").where({ service_id: service.id }).update({
+      app_relay_playback_enabled: !serviceDeleted && Number(service.relay_playback_enabled) === 1 ? 1 : 0,
+      jellyfin_relay_playback_enabled: serviceDeleted ? 0 : 1,
+    });
+  }
+}
+
+/** 每台设备只保留一个指向同一云端服务的本地卡片绑定。 */
+async function migrateUniqueCloudServiceDeviceBinding(database: Knex): Promise<void> {
+  const bindings = await database("client_service_links")
+    .select("id", "user_id", "service_id", "client_device_id", "updated_at")
+    .orderBy("updated_at", "desc");
+  const seen = new Set<string>(); // 关键变量：排序后第一条是需要保留的最新绑定。
+  const duplicateIds: string[] = [];
+  for (const binding of bindings) {
+    const key = `${binding.user_id}:${binding.service_id}:${binding.client_device_id}`;
+    if (seen.has(key)) duplicateIds.push(String(binding.id));
+    else seen.add(key);
+  }
+  if (duplicateIds.length > 0) await database("client_service_links").whereIn("id", duplicateIds).delete();
+  await addUniqueIfMissing(
+    database,
+    "client_service_links",
+    ["user_id", "service_id", "client_device_id"],
+    "uq_client_service_links_cloud_device",
+  );
+}
+
 /** 创建或升级 FlyCloudHelper 全部后台表。 */
 export async function migrateDatabase(database: Knex): Promise<void> {
   await createIdentityTables(database);
@@ -1075,6 +1171,12 @@ export async function migrateDatabase(database: Knex): Promise<void> {
     }
     if (Number(existingState.schema_version ?? 0) < 30) {
       await migrateLibraryJellyfinPathSuffix(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 31) {
+      await migrateLibraryRelayPlaybackSettings(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 32) {
+      await migrateUniqueCloudServiceDeviceBinding(database);
     }
     await database("system_state").where({ singleton_id: 1 }).update({
       service_instance_id: existingState.service_instance_id || randomUUID(),

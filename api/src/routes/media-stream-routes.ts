@@ -28,7 +28,7 @@ function requireAppBearer(request: FastifyRequest): void {
   }
 }
 
-/** 判断数据库中的服务级中转播放开关是否已经启用。 */
+/** 判断数据库中的媒体库中转播放开关是否已经启用。 */
 function isRelayPlaybackEnabled(value: RelayLibraryRow["relay_playback_enabled"]): boolean {
   return value === true || Number(value) === 1;
 }
@@ -187,7 +187,7 @@ export async function registerMediaStreamRoutes(server: FastifyInstance, runtime
           "l.service_id",
           "l.provider_type",
           "s.status as service_status",
-          "s.relay_playback_enabled",
+          "l.app_relay_playback_enabled as relay_playback_enabled",
           "s.credential_revision",
         )
         .where("l.id", request.params.libraryId)
@@ -196,7 +196,7 @@ export async function registerMediaStreamRoutes(server: FastifyInstance, runtime
         .first() as RelayLibraryRow | undefined;
       if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
       if (!isRelayPlaybackEnabled(library.relay_playback_enabled)) {
-        throw new ApiError(409, "relay_playback_disabled", "当前服务未启用中转播放");
+        throw new ApiError(409, "relay_playback_disabled", "当前媒体库未启用 APP 专用中转播放");
       }
       if (library.service_status === "disabled") {
         throw new ApiError(409, "service_disabled", "当前服务已停用，不能中转播放");

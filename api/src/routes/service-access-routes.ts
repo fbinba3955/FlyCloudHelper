@@ -13,18 +13,33 @@ async function requireManagedService(runtime: ApiRuntime, request: FastifyReques
   return { operator, service };
 }
 
+/** 判断 Provider 是否具备媒体中转能力，兼容现有两种能力标识。 */
+function supportsRelayPlayback(runtime: ApiRuntime, providerType: string): boolean {
+  const capabilities = runtime.providers.get(providerType).descriptor.capabilities;
+  return capabilities.includes("relayPlayback") || capabilities.includes("relay");
+}
+
 /** 构造媒体库协议配置。 */
 async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string) {
   const service = await runtime.repository.getServiceDetail(serviceId);
   const account = await runtime.serviceAccess.getByService(serviceId);
   const library = await runtime.database.query("media_libraries")
-    .select("jellyfin_path_suffix")
+    .select(
+      "jellyfin_path_suffix",
+      "app_relay_playback_enabled",
+      "jellyfin_relay_playback_enabled",
+      "jellyfin_region_libraries_enabled",
+    )
     .where({ service_id: serviceId })
     .first();
   // 关键变量：数据库升级尚未完成时临时回退服务 ID，保证设置页仍可读取。
   const jellyfinPathSuffix = String(library?.jellyfin_path_suffix ?? "").trim() || serviceId;
   const jellyfinPath = buildJellyfinPath(jellyfinPathSuffix);
   return {
+    relayPlaybackSupported: supportsRelayPlayback(runtime, service.providerType),
+    appRelayPlaybackEnabled: Number(library?.app_relay_playback_enabled) === 1,
+    jellyfinRelayPlaybackEnabled: Number(library?.jellyfin_relay_playback_enabled) === 1,
+    jellyfinRegionLibrariesEnabled: Number(library?.jellyfin_region_libraries_enabled) === 1,
     jellyfinEnabled: service.jellyfinEnabled,
     jellyfinUrl: await runtime.publicAccess.buildJellyfinUrl(jellyfinPathSuffix),
     jellyfinPath,
@@ -79,9 +94,15 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
       const changesJellyfinEnabled = request.body.jellyfinEnabled !== undefined;
       const changesPathSuffix = request.body.jellyfinPathSuffix !== undefined;
-      if (!changesJellyfinEnabled && !changesPathSuffix) throw new ApiError(422, "jellyfin_settings_empty", "没有需要保存的 Jellyfin 设置");
+      const changesRegionLibraries = request.body.jellyfinRegionLibrariesEnabled !== undefined;
+      if (!changesJellyfinEnabled && !changesPathSuffix && !changesRegionLibraries) {
+        throw new ApiError(422, "jellyfin_settings_empty", "没有需要保存的 Jellyfin 设置");
+      }
       if (changesJellyfinEnabled && typeof request.body.jellyfinEnabled !== "boolean") {
         throw new ApiError(422, "jellyfin_enabled_invalid", "Jellyfin 开关必须是布尔值");
+      }
+      if (changesRegionLibraries && typeof request.body.jellyfinRegionLibrariesEnabled !== "boolean") {
+        throw new ApiError(422, "jellyfin_region_libraries_invalid", "Jellyfin 节目地区分组开关必须是布尔值");
       }
       const pathSuffix = changesPathSuffix ? validateJellyfinPathSuffix(request.body.jellyfinPathSuffix) : null;
       const publicAccess = await runtime.publicAccess.getStatus();
@@ -96,6 +117,9 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       }
       const updateValues: Record<string, unknown> = { updated_at: now };
       if (changesJellyfinEnabled) updateValues.jellyfin_enabled = request.body.jellyfinEnabled ? 1 : 0;
+      if (changesRegionLibraries) {
+        updateValues.jellyfin_region_libraries_enabled = request.body.jellyfinRegionLibrariesEnabled ? 1 : 0;
+      }
       if (pathSuffix) {
         updateValues.jellyfin_path_suffix = pathSuffix.value;
         updateValues.jellyfin_path_suffix_lookup = pathSuffix.lookup;
@@ -117,6 +141,51 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
         操作用户ID: operator.id, 基础服务ID: request.params.serviceId, 撤销会话数: revokedCount,
         Jellyfin地址后缀: pathSuffix?.value ?? null,
         公开地址来源: publicAccess.source, 是否使用云助手请求地址: !publicAccess.publicBaseUrl,
+      });
+      if (changesRegionLibraries) {
+        runtime.logBusinessEvent("info", {
+          日志关键字: "codex-jellyfin-region-library",
+          事件: "更新Jellyfin节目地区分组设置",
+          操作用户ID: operator.id,
+          服务ID: request.params.serviceId,
+          地区分组开关: Boolean(request.body.jellyfinRegionLibrariesEnabled),
+        });
+      }
+      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
+    });
+
+    server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/library-playback-settings`, async (request) => {
+      const { operator, service } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      const changesAppRelay = request.body.appRelayPlaybackEnabled !== undefined;
+      const changesJellyfinRelay = request.body.jellyfinRelayPlaybackEnabled !== undefined;
+      if (!changesAppRelay && !changesJellyfinRelay) {
+        throw new ApiError(422, "library_playback_settings_empty", "没有需要保存的媒体库播放设置");
+      }
+      if (changesAppRelay && typeof request.body.appRelayPlaybackEnabled !== "boolean") {
+        throw new ApiError(422, "app_relay_playback_invalid", "APP 专用中转开关必须是布尔值");
+      }
+      if (changesJellyfinRelay && typeof request.body.jellyfinRelayPlaybackEnabled !== "boolean") {
+        throw new ApiError(422, "jellyfin_relay_playback_invalid", "Jellyfin 中转开关必须是布尔值");
+      }
+      const enablesRelay = request.body.appRelayPlaybackEnabled === true
+        || request.body.jellyfinRelayPlaybackEnabled === true;
+      if (enablesRelay && !supportsRelayPlayback(runtime, service.providerType)) {
+        throw new ApiError(422, "provider_relay_playback_unsupported", "当前网盘类型暂不支持中转播放");
+      }
+      const updateValues: Record<string, unknown> = { updated_at: new Date().toISOString() };
+      if (changesAppRelay) updateValues.app_relay_playback_enabled = request.body.appRelayPlaybackEnabled ? 1 : 0;
+      if (changesJellyfinRelay) updateValues.jellyfin_relay_playback_enabled = request.body.jellyfinRelayPlaybackEnabled ? 1 : 0;
+      const changed = await runtime.database.query("media_libraries")
+        .where({ service_id: request.params.serviceId })
+        .update(updateValues);
+      if (changed !== 1) throw new ApiError(404, "library_not_found", "媒体库不存在");
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-media-library-relay-setting",
+        事件: "更新媒体库独立中转播放设置",
+        操作用户ID: operator.id,
+        服务ID: request.params.serviceId,
+        APP专用中转: changesAppRelay ? Boolean(request.body.appRelayPlaybackEnabled) : null,
+        Jellyfin中转: changesJellyfinRelay ? Boolean(request.body.jellyfinRelayPlaybackEnabled) : null,
       });
       return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
     });

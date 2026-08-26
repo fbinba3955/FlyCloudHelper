@@ -2,6 +2,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { Plus, RefreshCw, ScanLine, Settings2, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
+import { AdminServiceFilters } from "@/components/AdminServiceFilters";
 import { GuangyaAuthorizationPanel } from "@/components/GuangyaAuthorizationPanel";
 import { ProviderConnectionGuide } from "@/components/ProviderConnectionGuide";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
@@ -19,7 +20,6 @@ import {
   reconnectServiceConnection,
   updateServiceConnection,
   updateServiceMetadataProfile,
-  updateServiceRelayPlayback,
   updateServiceScanProfile,
   updateServiceStatus,
   type CloudService,
@@ -30,6 +30,7 @@ import {
   type ProviderDirectory,
   type ProviderDescriptor,
   type ServiceStatus,
+  type ServiceListFilters,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 
@@ -230,8 +231,11 @@ function getScanRootLabel(root: ScanRootValue): string {
 }
 
 /** 渲染单个云端服务卡片。 */
-function ServiceCard({ service, admin, onScanned }: { service: CloudService; admin: boolean; onScanned: () => void }) {
+function ServiceCard({ service, admin, onChanged }: { service: CloudService; admin: boolean; onChanged: () => Promise<void> }) {
   const [message, setMessage] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  // 关键变量：同步阻止连续点击在状态刷新前重复发送删除请求。
+  const deletingRef = useRef(false);
   const detailPath = admin ? "/admin/services/$serviceId" : "/app/services/$serviceId";
 
   /** 创建默认增量扫描任务。 */
@@ -240,9 +244,57 @@ function ServiceCard({ service, admin, onScanned }: { service: CloudService; adm
     try {
       const job = await createScanJob(service.id, "incremental", admin);
       setMessage(`任务 ${job.id} 已进入队列`);
-      onScanned();
+      await onChanged();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "扫描任务创建失败");
+    }
+  }
+
+  /** 二次确认后从服务卡片删除服务，并同步刷新服务列表。 */
+  async function deleteCardService(): Promise<void> {
+    if (deletingRef.current) {
+      console.warn("codex-flycloud-helper-service-delete", {
+        事件: "服务卡片拦截重复删除请求",
+        服务ID: service.id,
+      });
+      return;
+    }
+    const confirmed = window.confirm(
+      `确定删除“${service.displayName}”吗？该服务、媒体库以及对应的 Jellyfin 账号、会话和播放记录都会被删除，此操作无法撤销。`,
+    );
+    if (!confirmed) return;
+
+    deletingRef.current = true;
+    setDeleting(true);
+    setMessage("正在删除服务…");
+    console.info("codex-flycloud-helper-service-delete", {
+      事件: "服务卡片开始删除服务",
+      服务ID: service.id,
+      服务名称: service.displayName,
+      操作入口: admin ? "管理员服务卡片" : "用户服务卡片",
+    });
+    try {
+      await deleteCloudService(service.id, admin);
+      console.info("codex-flycloud-helper-service-delete", {
+        事件: "服务卡片删除服务成功",
+        服务ID: service.id,
+        操作入口: admin ? "管理员服务卡片" : "用户服务卡片",
+      });
+      await onChanged();
+    } catch (error) {
+      const errorMessage = error instanceof ApiClientError && error.code === "service_has_active_job"
+        ? "服务仍有未结束的后台任务，请先终止任务后再删除"
+        : error instanceof Error ? error.message : "删除服务失败";
+      console.warn("codex-flycloud-helper-service-delete", {
+        事件: "服务卡片删除服务失败",
+        服务ID: service.id,
+        错误码: error instanceof ApiClientError ? error.code : "service_delete_failed",
+        错误信息: errorMessage,
+      });
+      setMessage(errorMessage);
+    } finally {
+      deletingRef.current = false;
+      setDeleting(false);
     }
   }
 
@@ -272,11 +324,14 @@ function ServiceCard({ service, admin, onScanned }: { service: CloudService; adm
         <StatusPill>刮削 r{service.metadataProfileRevision}</StatusPill>
       </div>
 
-      <footer className="mt-5 flex flex-wrap gap-2">
+      <footer className="mt-5 flex flex-wrap items-center gap-2">
         <button type="button" onClick={() => void triggerScan()} className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-2 text-xs text-primary-soft">
           <ScanLine className="size-3.5" /> 触发增量扫描
         </button>
         <Link to={detailPath} params={{ serviceId: service.id }} className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"><Settings2 className="size-3.5" /> 服务详情与配置</Link>
+        <button type="button" onClick={() => void deleteCardService()} disabled={deleting} className="ml-auto inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-destructive bg-destructive px-3 py-2 text-xs font-semibold text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50">
+          <Trash2 className="size-3.5" /> {deleting ? "正在删除…" : "删除服务"}
+        </button>
       </footer>
       {message && <p className="mt-3 text-xs text-muted-foreground">{message}</p>}
     </article>
@@ -285,16 +340,26 @@ function ServiceCard({ service, admin, onScanned }: { service: CloudService; adm
 
 /** 渲染用户或管理员作用域的服务列表。 */
 function ServicesListPage({ admin }: { admin: boolean }) {
-  const resource = useApiResource(() => listServices(admin), [admin]);
+  const [filters, setFilters] = useState<ServiceListFilters>({});
+  const resource = useApiResource(
+    () => listServices(admin, admin ? filters : {}),
+    [admin, filters.search, filters.userId, filters.providerType, filters.dataType, filters.status, filters.jellyfinEnabled],
+  );
+  const filterOptions = useApiResource(async () => {
+    if (!admin) return { users: [], providers: [] };
+    const [users, providers] = await Promise.all([listAdminUsers(), listProviders()]);
+    return { users: users.items, providers };
+  }, [admin]);
   return (
     <>
       <PageHeader
         title={admin ? "全部服务" : "我的服务"}
         actions={<Link to={admin ? "/admin/services/new" : "/app/services/new"}><PrimaryButton><Plus className="size-4" /> 创建云端服务</PrimaryButton></Link>}
       />
+      {admin && <AdminServiceFilters value={filters} users={filterOptions.data?.users ?? []} providers={filterOptions.data?.providers ?? []} resultCount={resource.data?.total ?? 0} onChange={setFilters} />}
       {resource.error && <Panel><p className="text-sm text-destructive">{resource.error}</p></Panel>}
       <div className="grid gap-4 lg:grid-cols-2">
-        {resource.data?.items.map((service) => <ServiceCard key={service.id} service={service} admin={admin} onScanned={() => void resource.refresh()} />)}
+        {resource.data?.items.map((service) => <ServiceCard key={service.id} service={service} admin={admin} onChanged={async () => { await resource.refresh(); }} />)}
       </div>
       {!resource.loading && resource.data?.items.length === 0 && <Panel><p className="py-10 text-center text-sm text-muted-foreground">还没有云端服务</p></Panel>}
     </>
@@ -543,9 +608,6 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   const [message, setMessage] = useState<string | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState(false);
   const updatingStatusRef = useRef(false);
-  const [updatingRelayPlayback, setUpdatingRelayPlayback] = useState(false);
-  // 关键变量：同步占用播放开关，避免 React 刷新前连续点击产生相反请求。
-  const updatingRelayPlaybackRef = useRef(false);
   const [deletingService, setDeletingService] = useState(false);
   // 关键变量：同步占用删除操作，避免 React 按钮状态尚未刷新时重复提交。
   const deletingServiceRef = useRef(false);
@@ -729,25 +791,6 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     }
   }
 
-  /** 立即保存当前服务的中转播放开关。 */
-  async function toggleRelayPlayback(): Promise<void> {
-    if (updatingRelayPlaybackRef.current) return;
-    const nextEnabled = !activeService.relayPlaybackEnabled;
-    updatingRelayPlaybackRef.current = true;
-    setUpdatingRelayPlayback(true);
-    setMessage(`正在${nextEnabled ? "启用" : "关闭"}中转播放…`);
-    try {
-      await updateServiceRelayPlayback(serviceId, nextEnabled, admin);
-      setMessage(nextEnabled ? "中转播放已启用" : "中转播放已关闭");
-      await resource.refresh();
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "中转播放设置保存失败");
-    } finally {
-      updatingRelayPlaybackRef.current = false;
-      setUpdatingRelayPlayback(false);
-    }
-  }
-
   /** 二次确认后删除当前云端服务，并返回对应的服务列表。 */
   async function deleteCurrentService(): Promise<void> {
     if (deletingServiceRef.current) {
@@ -794,7 +837,6 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   }
 
   const providerDescriptor = providers.data?.find((item) => item.type === service.providerType);
-  const relayPlaybackSupported = providerDescriptor?.capabilities.includes("relayPlayback") === true;
   const recommendedScanSettings = providerDescriptor?.recommendedScanSettings;
   const scanConcurrencyOptions = buildConcurrencyOptions(
     recommendedScanSettings?.scanDirectoryConcurrency.min ?? 1,
@@ -851,33 +893,6 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         </div>
       </Panel>
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <Panel title="中转播放设置">
-          <div className="rounded-xl border border-border bg-secondary/35 p-4">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <p className="text-sm font-medium">启用中转播放</p>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {!relayPlaybackSupported
-                    ? "当前网盘类型暂不支持中转播放。"
-                    : service.relayPlaybackEnabled
-                      ? "FlyCloudHelper APP 可以让媒体流经过服务器；Jellyfin 标准视频接口始终由服务器提供。"
-                      : "FlyCloudHelper APP 不使用专用中转；Jellyfin 标准视频接口不受此开关影响。"}
-                </p>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={service.relayPlaybackEnabled}
-                aria-label="启用中转播放"
-                disabled={!relayPlaybackSupported || updatingRelayPlayback}
-                onClick={() => void toggleRelayPlayback()}
-                className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40 ${service.relayPlaybackEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}
-              >
-                <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${service.relayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} />
-              </button>
-            </div>
-          </div>
-        </Panel>
         <Panel title="扫描路径" description="全量和增量任务分别选择网盘目录，不需要手动输入路径。" className="xl:col-span-2">
           <div key={service.scanProfileRevision} className="grid gap-4 lg:grid-cols-2">
             <ServicePathPicker serviceId={serviceId} admin={admin} label="全量扫描目录" value={fullScanRoots} onConfirm={(directories) => saveScanPaths("full", directories)} />

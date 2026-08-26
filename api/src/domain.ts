@@ -7,6 +7,7 @@ export type JobStatus = "queued" | "running" | "retry_waiting" | "paused" | "com
 export type BackgroundJobType = "scan" | "media_probe";
 export type JobStage = "queued" | "enumerating" | "classifying" | "scraping" | "persisting" | "probing" | "completed";
 export type MediaType = "video" | "music" | "audiobook";
+export type VideoRegionGroup = "chinese" | "japan_korea" | "europe_america" | "other";
 export type CatalogSort =
   | "created_desc"
   | "created_asc"
@@ -73,7 +74,7 @@ export interface CloudServiceRecord {
   dataType: MediaType;
   status: ServiceStatus;
   connectionStatus: string;
-  /** 当前服务是否允许 APP 通过 FlyCloudHelper 中转媒体文件。 */
+  /** 当前媒体库是否允许 APP 通过 FlyCloudHelper 专用接口中转媒体文件。 */
   relayPlaybackEnabled: boolean;
   /** 当前服务是否对外提供 Jellyfin 兼容接口。 */
   jellyfinEnabled: boolean;
@@ -156,6 +157,8 @@ export interface ServiceMigrationRecord {
   clientDeviceId: string;
   clientServiceId: string;
   providerType: string;
+  /** 当前迁移取消时是否需要同时回收由迁移创建的云端服务。 */
+  ownsService: boolean;
   status: ServiceMigrationStatus;
   stage: ServiceMigrationStatus;
   progressPercent: number;
@@ -204,6 +207,8 @@ export interface MediaItemRecord {
   libraryId: string;
   mediaType: MediaType;
   itemType: string;
+  /** 节目的 Jellyfin 地区分组；电影和缺少地区数据的条目为 other。 */
+  regionGroup: VideoRegionGroup;
   title: string;
   sortTitle: string;
   subtitle: string;

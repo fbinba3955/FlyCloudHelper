@@ -200,6 +200,16 @@ export interface CloudService {
   updatedAt: string;
 }
 
+/** 管理端全部服务和全部媒体库共用的服务摘要筛选条件。 */
+export interface ServiceListFilters {
+  search?: string;
+  userId?: string;
+  providerType?: string;
+  dataType?: MediaType;
+  status?: ServiceStatus;
+  jellyfinEnabled?: boolean;
+}
+
 /** 创建云端服务时由 Web 端提交的完整配置。 */
 export interface CreateCloudServiceInput {
   displayName: string;
@@ -214,6 +224,11 @@ export interface CreateCloudServiceInput {
 }
 
 export interface ServiceAccessSettings {
+  relayPlaybackSupported: boolean;
+  appRelayPlaybackEnabled: boolean;
+  jellyfinRelayPlaybackEnabled: boolean;
+  /** 是否将 Jellyfin 节目媒体库按地区拆分。 */
+  jellyfinRegionLibrariesEnabled: boolean;
   jellyfinEnabled: boolean;
   jellyfinUrl: string | null;
   jellyfinPath: string;
@@ -504,9 +519,20 @@ export function getOverview(): Promise<OverviewResult> {
   return requestJson("/api/v1/overview");
 }
 
-/** 读取用户或管理端服务列表。 */
-export function listServices(admin = false): Promise<{ items: CloudService[]; total: number }> {
-  return requestJson(admin ? "/api/v1/admin/services?limit=200" : "/api/v1/services?limit=200");
+/** 读取用户或管理端服务列表，管理端筛选由服务端作用于完整数据集。 */
+export function listServices(
+  admin = false,
+  filters: ServiceListFilters = {},
+): Promise<{ items: CloudService[]; total: number }> {
+  return requestJson(withQuery(admin ? "/api/v1/admin/services" : "/api/v1/services", {
+    search: filters.search,
+    userId: admin ? filters.userId : undefined,
+    providerType: filters.providerType,
+    dataType: filters.dataType,
+    status: filters.status,
+    jellyfinEnabled: filters.jellyfinEnabled === undefined ? undefined : String(filters.jellyfinEnabled),
+    limit: 200,
+  }));
 }
 
 /** 读取用户或管理端服务详情。 */
@@ -864,7 +890,7 @@ export async function updateServiceStatus(
   return result.service;
 }
 
-/** 开启或关闭单个服务的媒体中转播放。 */
+/** 兼容旧版 APP：开启或关闭单个媒体库的 APP 专用中转播放。 */
 export async function updateServiceRelayPlayback(
   serviceId: string,
   relayPlaybackEnabled: boolean,
@@ -901,13 +927,28 @@ export function revokeServiceAccessSessions(serviceId: string, admin = false): P
   return requestJson(admin ? `/api/v1/admin/services/${serviceId}/access-account/revoke-sessions` : `/api/v1/services/${serviceId}/access-account/revoke-sessions`, { method: "POST", body: "{}" });
 }
 
-/** 修改单个媒体库的 Jellyfin 开关或自定义地址后缀。 */
+/** 修改单个媒体库的 Jellyfin 开关、自定义地址后缀或节目地区分组。 */
 export async function updateServiceJellyfinSettings(
   serviceId: string,
-  input: { jellyfinEnabled?: boolean; jellyfinPathSuffix?: string },
+  input: { jellyfinEnabled?: boolean; jellyfinPathSuffix?: string; jellyfinRegionLibrariesEnabled?: boolean },
   admin = false,
 ): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/jellyfin-settings` : `/api/v1/services/${serviceId}/jellyfin-settings`, { method: "PATCH", body: JSON.stringify(input) });
+  return result.settings;
+}
+
+/** 分别修改媒体库的 APP 专用中转与 Jellyfin 中转开关。 */
+export async function updateLibraryPlaybackSettings(
+  serviceId: string,
+  input: { appRelayPlaybackEnabled?: boolean; jellyfinRelayPlaybackEnabled?: boolean },
+  admin = false,
+): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(
+    admin
+      ? `/api/v1/admin/services/${serviceId}/library-playback-settings`
+      : `/api/v1/services/${serviceId}/library-playback-settings`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
   return result.settings;
 }
 

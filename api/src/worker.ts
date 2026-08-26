@@ -1286,8 +1286,8 @@ export class ScanWorker {
           encryptedConnection: this.vault.encrypt(nextConnection),
         });
         this.logger.info({
-          日志关键字: "codex-flycloud-helper-guangya-token-refresh",
-          事件: "扫描期间保存光鸭刷新令牌",
+          日志关键字: "codex-flycloud-provider-token-refresh",
+          事件: "扫描期间保存Provider刷新令牌",
           任务ID: job.id,
           服务ID: job.serviceId,
           凭据修订: credentialRevision,
@@ -2292,6 +2292,7 @@ export class ScanWorker {
         releaseDate: result.releaseDate,
         rating: result.rating,
         genres: result.genres,
+        originCountries: result.originCountries,
         people: result.people,
         episodeCount: result.episodeCount,
         matchedQuery: result.matchedQuery,

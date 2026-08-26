@@ -428,10 +428,15 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
 
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/services", async (request) => {
     await requireSuperAdmin(request, runtime.database);
+    const jellyfinFilter = request.query.jellyfinEnabled === "true"
+      ? true
+      : request.query.jellyfinEnabled === "false" ? false : undefined;
     const result = await runtime.repository.listServices({
       userId: typeof request.query.userId === "string" ? request.query.userId : undefined,
       providerType: typeof request.query.providerType === "string" ? request.query.providerType : undefined,
+      dataType: typeof request.query.dataType === "string" ? request.query.dataType as MediaType : undefined,
       status: typeof request.query.status === "string" ? request.query.status as ServiceStatus : undefined,
+      jellyfinEnabled: jellyfinFilter,
       keyword: typeof request.query.search === "string" ? request.query.search : undefined,
       ...readPagination(request.query),
     });
@@ -611,8 +616,8 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
             encryptedConnection: runtime.vault.encrypt(nextConnection),
           });
           runtime.logBusinessEvent("info", {
-            日志关键字: "codex-flycloud-helper-guangya-token-refresh",
-            事件: "管理员目录浏览期间保存光鸭刷新令牌",
+            日志关键字: "codex-flycloud-provider-token-refresh",
+            事件: "管理员目录浏览期间保存Provider刷新令牌",
             管理员ID: operator.id,
             服务ID: service.id,
             凭据修订: service.credentialRevision,
@@ -703,8 +708,8 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
             encryptedConnection: runtime.vault.encrypt(nextConnection),
           });
           runtime.logBusinessEvent("info", {
-            日志关键字: "codex-flycloud-helper-guangya-token-refresh",
-            事件: "管理员重连期间保存光鸭刷新令牌",
+            日志关键字: "codex-flycloud-provider-token-refresh",
+            事件: "管理员重连期间保存Provider刷新令牌",
             管理员ID: operator.id,
             服务ID: service.id,
             凭据修订: service.credentialRevision,
@@ -758,8 +763,8 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
           encryptedConnection: runtime.vault.encrypt(nextConnection),
         });
         runtime.logBusinessEvent("info", {
-          日志关键字: "codex-flycloud-helper-guangya-token-refresh",
-          事件: "管理员扫描路径验证期间保存光鸭刷新令牌",
+          日志关键字: "codex-flycloud-provider-token-refresh",
+          事件: "管理员扫描路径验证期间保存Provider刷新令牌",
           管理员ID: operator.id,
           服务ID: service.id,
           凭据修订: service.credentialRevision,
@@ -846,11 +851,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/playback-settings", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     if (typeof request.body.relayPlaybackEnabled !== "boolean") {
-      throw validationError("relayPlaybackEnabled", "中转播放开关必须是布尔值");
+      throw validationError("relayPlaybackEnabled", "APP 专用中转播放开关必须是布尔值");
     }
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
     if (request.body.relayPlaybackEnabled
-      && !runtime.providers.get(service.providerType).descriptor.capabilities.includes("relayPlayback")) {
+      && !runtime.providers.get(service.providerType).descriptor.capabilities.some((capability) => capability === "relayPlayback" || capability === "relay")) {
       throw new ApiError(422, "provider_relay_playback_unsupported", "当前网盘类型暂不支持中转播放");
     }
     const updated = await runtime.repository.updateRelayPlaybackEnabled(
@@ -860,13 +865,13 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-relay-playback-setting",
-      事件: "管理员更新服务中转播放开关",
+      事件: "管理员通过兼容接口更新媒体库APP专用中转开关",
       管理员ID: operator.id,
       服务ID: service.id,
-      是否启用中转播放: updated.relayPlaybackEnabled,
+      是否启用APP专用中转: updated.relayPlaybackEnabled,
     });
     await audit(runtime, operator, "update_service_relay_playback", "service", service.id, {
-      是否启用中转播放: updated.relayPlaybackEnabled,
+      是否启用APP专用中转: updated.relayPlaybackEnabled,
     });
     return { service: updated };
   });

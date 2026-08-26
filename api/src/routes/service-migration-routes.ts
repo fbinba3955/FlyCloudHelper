@@ -139,6 +139,28 @@ function normalizeWebdavMigrationScanProfile(
   };
 }
 
+/**
+ * 确认第二步的目标仍是未扫描空服务。
+ * 影片数量为零时仍可能存在未匹配源文件，因此必须同时检查目录表和活动后台任务。
+ */
+async function requireEmptyMigrationTarget(
+  runtime: ApiRuntime,
+  serviceId: string,
+  libraryId: string,
+): Promise<void> {
+  const [mediaItem, sourceFile, activeScanJob, activeMediaProbeJob] = await Promise.all([
+    runtime.database.query("media_items").select("id").where({ library_id: libraryId }).first(),
+    runtime.database.query("source_files").select("id").where({ library_id: libraryId }).first(),
+    runtime.database.query("scan_jobs").select("id").where({ service_id: serviceId })
+      .whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+    runtime.database.query("media_probe_jobs").select("id").where({ service_id: serviceId })
+      .whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+  ]);
+  if (mediaItem || sourceFile || activeScanJob || activeMediaProbeJob) {
+    throw new ApiError(409, "migration_target_catalog_not_empty", "云端服务已经包含媒体数据或正在扫描，不能再用本地旧库覆盖");
+  }
+}
+
 /** 注册 APP 本地服务迁移、分片上传和后台状态查询接口。 */
 export async function registerServiceMigrationRoutes(
   server: FastifyInstance,
@@ -150,7 +172,7 @@ export async function registerServiceMigrationRoutes(
       snapshotFormatVersion: 1,
       chunkMaxBytes: runtime.config.migrationChunkMaxBytes,
       snapshotMaxBytes: runtime.config.migrationSnapshotMaxBytes,
-      supportedProviderTypes: ["webdav", "guangya"],
+      supportedProviderTypes: ["webdav", "guangya", "aliyundrive", "baidupan"],
       supportedDataTypes: ["video"],
     };
   });
@@ -187,11 +209,13 @@ export async function registerServiceMigrationRoutes(
       return reply.status(200).send({ migration: existingForService });
     }
     if (existingForService) {
-      // 失败或取消任务对应的服务从未正式启用，释放旧绑定后允许 APP 用新请求重新关联。
-      try {
-        await runtime.repository.deleteService(existingForService.serviceId, user.id);
-      } catch (error) {
-        if (!(error instanceof ApiError) || error.code !== "service_not_found") throw error;
+      // 只有旧版一体迁移创建的临时服务才能回收，不得删除新版第一步已关联的空服务。
+      if (existingForService.ownsService) {
+        try {
+          await runtime.repository.deleteService(existingForService.serviceId, user.id);
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.code !== "service_not_found") throw error;
+        }
       }
     }
     const existingBinding = await runtime.repository.findClientServiceBinding(
@@ -211,8 +235,8 @@ export async function registerServiceMigrationRoutes(
     const dataType = validateServiceDataType(request.body.dataType);
     const provider = requireObject(request.body, "provider", "Provider");
     const providerType = requireString(provider, "type", "Provider 类型", 64);
-    if (providerType !== "webdav" && providerType !== "guangya") {
-      throw new ApiError(422, "migration_provider_unsupported", "当前只支持迁移 WebDAV 和光鸭影视库");
+    if (!["webdav", "guangya", "aliyundrive", "baidupan"].includes(providerType)) {
+      throw new ApiError(422, "migration_provider_unsupported", "当前只支持迁移 WebDAV、光鸭、阿里云盘和百度网盘视频库");
     }
     const resolvedConnection = resolveProviderConnection(
       runtime,
@@ -287,6 +311,7 @@ export async function registerServiceMigrationRoutes(
         clientDeviceId,
         clientServiceId,
         providerType,
+        ownsService: true,
         expectedBytes,
         expectedChunkCount,
         snapshotSha256,
@@ -309,6 +334,74 @@ export async function registerServiceMigrationRoutes(
       throw error;
     }
   });
+
+  /** 为第一步已经创建并绑定的空服务建立可选本地数据迁移。 */
+  server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/services/:serviceId/migrations",
+    async (request, reply) => {
+      const user = await requireRequestUser(request, runtime.database);
+      const requestId = requireString(request.body, "requestId", "请求 ID", 200);
+      const clientDeviceId = requireString(request.body, "clientDeviceId", "客户端设备 ID", 200);
+      const clientServiceId = requireString(request.body, "clientServiceId", "客户端服务 ID", 200);
+      const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+      if (!["webdav", "guangya", "aliyundrive", "baidupan"].includes(service.providerType)) {
+        throw new ApiError(422, "migration_provider_unsupported", "当前只支持迁移 WebDAV、光鸭、阿里云盘和百度网盘视频库");
+      }
+      const binding = await runtime.repository.findClientServiceBinding(user.id, clientDeviceId, clientServiceId);
+      if (!binding || binding.serviceId !== service.id) {
+        throw new ApiError(409, "client_service_binding_required", "请先完成本地服务与云端服务的关联");
+      }
+      const existingByRequest = await runtime.migrations.findByRequest(user.id, clientDeviceId, requestId);
+      if (existingByRequest) {
+        if (existingByRequest.serviceId !== service.id) {
+          throw new ApiError(409, "migration_request_service_conflict", "该请求 ID 已用于其他云端服务");
+        }
+        return reply.status(200).send({ migration: existingByRequest });
+      }
+      const existingForService = await runtime.migrations.findLatestForClientService(
+        user.id,
+        clientDeviceId,
+        clientServiceId,
+      );
+      if (existingForService && existingForService.status !== "cancelled" && existingForService.status !== "failed") {
+        return reply.status(200).send({ migration: existingForService });
+      }
+      await requireEmptyMigrationTarget(runtime, service.id, service.libraryId);
+      const snapshot = requireObject(request.body, "snapshot", "迁移快照信息");
+      const expectedBytes = readSnapshotBytes(snapshot.totalBytes, runtime.config.migrationSnapshotMaxBytes);
+      const expectedChunkCount = readSnapshotChunkCount(snapshot.totalChunks);
+      const snapshotSha256 = readSha256(snapshot.sha256, "snapshot.sha256");
+      const snapshotFormatVersion = Number(snapshot.formatVersion ?? 1);
+      if (snapshotFormatVersion !== 1) {
+        throw new ApiError(422, "migration_snapshot_version_unsupported", "当前只支持第 1 版迁移快照");
+      }
+      const migration = await runtime.migrations.create({
+        migrationId: randomUUID(),
+        userId: user.id,
+        serviceId: service.id,
+        libraryId: service.libraryId,
+        requestId,
+        clientDeviceId,
+        clientServiceId,
+        providerType: service.providerType,
+        ownsService: false,
+        expectedBytes,
+        expectedChunkCount,
+        snapshotSha256,
+        snapshotFormatVersion,
+      });
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-service-migration",
+        事件: "为已关联空服务创建本地数据迁移",
+        用户ID: user.id,
+        迁移ID: migration.id,
+        服务ID: service.id,
+        客户端服务ID: clientServiceId,
+        网盘类型: service.providerType,
+      });
+      return reply.status(201).send({ migration });
+    },
+  );
 
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/service-migrations", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
@@ -427,7 +520,7 @@ export async function registerServiceMigrationRoutes(
       const user = await requireRequestUser(request, runtime.database);
       const beforeCancel = await runtime.migrations.get(request.params.migrationId, user.id);
       const migration = await runtime.migrations.cancel(request.params.migrationId, user.id);
-      if (migration.status === "cancelled" && beforeCancel.status !== "cancelled") {
+      if (migration.ownsService && migration.status === "cancelled" && beforeCancel.status !== "cancelled") {
         await runtime.repository.deleteService(migration.serviceId, user.id);
       }
       return { migration };

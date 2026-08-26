@@ -30,11 +30,11 @@ import {
 } from "@/pages/JobCatalogPages";
 import {
   AdminLibraryCatalogPage,
+  AdminLibraryJellyfinSettingsPage,
   AdminLibrarySettingsPage,
-  AdminLibrarySnapshotPage,
   UserLibraryCatalogPage,
+  UserLibraryJellyfinSettingsPage,
   UserLibrarySettingsPage,
-  UserLibrarySnapshotPage,
 } from "@/pages/LibraryPages";
 import {
   AdminAuditPage,
@@ -178,12 +178,6 @@ function UserServiceConnectionRouteComponent() {
   return <UserServiceConnectionPage serviceId={serviceId} />;
 }
 
-/** 处理普通用户服务快照管理路由参数。 */
-function UserServiceSnapshotRouteComponent() {
-  const { serviceId } = userServiceSnapshotRoute.useParams();
-  return <UserLibrarySnapshotPage serviceId={serviceId} />;
-}
-
 /** 处理普通用户媒体库设置路由参数。 */
 function UserLibrarySettingsRouteComponent() {
   const { serviceId } = userLibrarySettingsRoute.useParams();
@@ -196,10 +190,10 @@ function UserLibraryCatalogRouteComponent() {
   return <UserLibraryCatalogPage serviceId={serviceId} />;
 }
 
-/** 处理普通用户媒体库快照路由参数。 */
-function UserLibrarySnapshotRouteComponent() {
-  const { serviceId } = userLibrarySnapshotRoute.useParams();
-  return <UserLibrarySnapshotPage serviceId={serviceId} />;
+/** 处理普通用户媒体库 Jellyfin 配置路由参数。 */
+function UserLibraryJellyfinSettingsRouteComponent() {
+  const { serviceId } = userLibraryJellyfinSettingsRoute.useParams();
+  return <UserLibraryJellyfinSettingsPage serviceId={serviceId} />;
 }
 
 /** 处理管理员服务详情路由参数。 */
@@ -220,12 +214,6 @@ function AdminServiceConnectionRouteComponent() {
   return <AdminServiceConnectionPage serviceId={serviceId} />;
 }
 
-/** 处理管理员服务快照管理路由参数。 */
-function AdminServiceSnapshotRouteComponent() {
-  const { serviceId } = adminServiceSnapshotRoute.useParams();
-  return <AdminLibrarySnapshotPage serviceId={serviceId} />;
-}
-
 /** 处理管理员媒体库设置路由参数。 */
 function AdminLibrarySettingsRouteComponent() {
   const { serviceId } = adminLibrarySettingsRoute.useParams();
@@ -238,10 +226,10 @@ function AdminLibraryCatalogRouteComponent() {
   return <AdminLibraryCatalogPage serviceId={serviceId} />;
 }
 
-/** 处理管理员媒体库快照路由参数。 */
-function AdminLibrarySnapshotRouteComponent() {
-  const { serviceId } = adminLibrarySnapshotRoute.useParams();
-  return <AdminLibrarySnapshotPage serviceId={serviceId} />;
+/** 处理管理员媒体库 Jellyfin 配置路由参数。 */
+function AdminLibraryJellyfinSettingsRouteComponent() {
+  const { serviceId } = adminLibraryJellyfinSettingsRoute.useParams();
+  return <AdminLibraryJellyfinSettingsPage serviceId={serviceId} />;
 }
 
 /** 全局 404 页面。 */
@@ -340,12 +328,6 @@ const userServiceConnectionRoute = createRoute({
   component: UserServiceConnectionRouteComponent,
 });
 
-const userServiceSnapshotRoute = createRoute({
-  getParentRoute: () => appRoute,
-  path: "services/$serviceId/snapshots",
-  component: UserServiceSnapshotRouteComponent,
-});
-
 const userJobsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "jobs",
@@ -370,10 +352,10 @@ const userLibraryCatalogRoute = createRoute({
   component: UserLibraryCatalogRouteComponent,
 });
 
-const userLibrarySnapshotRoute = createRoute({
+const userLibraryJellyfinSettingsRoute = createRoute({
   getParentRoute: () => appRoute,
-  path: "libraries/$serviceId/snapshots",
-  component: UserLibrarySnapshotRouteComponent,
+  path: "libraries/$serviceId/jellyfin",
+  component: UserLibraryJellyfinSettingsRouteComponent,
 });
 
 const adminRoute = createRoute({
@@ -424,12 +406,6 @@ const adminServiceConnectionRoute = createRoute({
   component: AdminServiceConnectionRouteComponent,
 });
 
-const adminServiceSnapshotRoute = createRoute({
-  getParentRoute: () => adminRoute,
-  path: "services/$serviceId/snapshots",
-  component: AdminServiceSnapshotRouteComponent,
-});
-
 const adminJobsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "jobs",
@@ -454,10 +430,10 @@ const adminLibraryCatalogRoute = createRoute({
   component: AdminLibraryCatalogRouteComponent,
 });
 
-const adminLibrarySnapshotRoute = createRoute({
+const adminLibraryJellyfinSettingsRoute = createRoute({
   getParentRoute: () => adminRoute,
-  path: "libraries/$serviceId/snapshots",
-  component: AdminLibrarySnapshotRouteComponent,
+  path: "libraries/$serviceId/jellyfin",
+  component: AdminLibraryJellyfinSettingsRouteComponent,
 });
 
 const adminPluginsRoute = createRoute({
@@ -492,12 +468,11 @@ const appRouteTree = appRoute.addChildren([
   userServiceDetailRoute,
   userServiceCatalogRoute,
   userServiceConnectionRoute,
-  userServiceSnapshotRoute,
   userJobsRoute,
   userCatalogRoute,
   userLibrarySettingsRoute,
   userLibraryCatalogRoute,
-  userLibrarySnapshotRoute,
+  userLibraryJellyfinSettingsRoute,
 ]);
 
 /** 组合超级管理员后台子路由。 */
@@ -509,12 +484,11 @@ const adminRouteTree = adminRoute.addChildren([
   adminServiceDetailRoute,
   adminServiceCatalogRoute,
   adminServiceConnectionRoute,
-  adminServiceSnapshotRoute,
   adminJobsRoute,
   adminCatalogRoute,
   adminLibrarySettingsRoute,
   adminLibraryCatalogRoute,
-  adminLibrarySnapshotRoute,
+  adminLibraryJellyfinSettingsRoute,
   adminPluginsRoute,
   adminConfigurationRoute,
   adminSystemRoute,

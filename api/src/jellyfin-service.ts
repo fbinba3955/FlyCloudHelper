@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { FastifyRequest } from "fastify";
 import type { Knex } from "knex";
 import { hashSessionToken } from "./auth.js";
-import { parseJsonObject, type CatalogSort, type MediaItemRecord } from "./domain.js";
+import { parseJsonObject, type CatalogSort, type MediaItemRecord, type VideoRegionGroup } from "./domain.js";
 import { ApiError } from "./errors.js";
 import type { ApiRuntime } from "./runtime.js";
 import { hydrateRealtimeVideoDetails } from "./media/realtime-video-details.js";
@@ -17,6 +17,8 @@ export interface JellyfinLibraryContext {
   serviceId: string;
   ownerUserId: string;
   libraryId: string;
+  /** 是否按节目地区拆分 Jellyfin 虚拟媒体库。 */
+  regionLibrariesEnabled: boolean;
 }
 
 export interface JellyfinContext extends JellyfinLibraryContext {
@@ -49,6 +51,7 @@ interface JellyfinLibraryDefinition {
   name: string;
   collectionType: JellyfinCollectionType;
   itemType: "video.movie" | "video.series";
+  regionGroup?: VideoRegionGroup;
 }
 
 interface JellyfinGenreSummary {
@@ -164,7 +167,7 @@ export class JellyfinCompatibilityService {
   public async requireEnabledService(serviceId: string) {
     const row = await this.runtime.database.query("cloud_services as s")
       .join("media_libraries as l", "l.id", "s.library_id")
-      .select("s.id", "s.user_id", "s.library_id", "s.display_name", "s.status", "l.jellyfin_enabled", "s.relay_playback_enabled", "s.provider_type", "s.credential_revision")
+      .select("s.id", "s.user_id", "s.library_id", "s.display_name", "s.status", "l.jellyfin_enabled", "l.jellyfin_relay_playback_enabled", "l.jellyfin_region_libraries_enabled", "s.provider_type", "s.credential_revision")
       .where("s.id", serviceId).whereNull("s.deleted_at").first();
     if (!row) throw new ApiError(404, "jellyfin_service_not_found", "Jellyfin 服务不存在");
     if (Number(row.jellyfin_enabled) !== 1 || row.status === "disabled") throw new ApiError(404, "jellyfin_service_disabled", "Jellyfin 服务未启用");
@@ -178,6 +181,7 @@ export class JellyfinCompatibilityService {
       serviceId,
       ownerUserId: String(service.user_id),
       libraryId: String(service.library_id),
+      regionLibrariesEnabled: Number(service.jellyfin_region_libraries_enabled) === 1,
     };
   }
 
@@ -236,7 +240,7 @@ export class JellyfinCompatibilityService {
       .select(
         "ps.*", "a.username", "a.password_required", "a.credential_revision as account_revision",
         "a.status as account_status", "s.user_id", "s.library_id", "s.status as service_status",
-        "l.jellyfin_enabled", "mp.configuration_json as metadata_profile_json",
+        "l.jellyfin_enabled", "l.jellyfin_region_libraries_enabled", "mp.configuration_json as metadata_profile_json",
       )
       .where("ps.token_hash", hashSessionToken(token)).where("ps.service_id", serviceId).where("ps.protocol", "jellyfin").whereNull("ps.revoked_at").whereNull("s.deleted_at").first();
     if (!row || String(row.expires_at) <= new Date().toISOString() || Number(row.credential_revision) !== Number(row.account_revision)
@@ -249,6 +253,7 @@ export class JellyfinCompatibilityService {
     }
     return {
       serviceId, ownerUserId: String(row.user_id), libraryId: String(row.library_id),
+      regionLibrariesEnabled: Number(row.jellyfin_region_libraries_enabled) === 1,
       accountId: String(row.account_id), accountUsername: String(row.username),
       accountHasPassword: Number(row.password_required ?? 1) !== 0,
       mediaSpecsEnabled: isJellyfinMediaSpecsEnabled(row.metadata_profile_json),
@@ -278,11 +283,22 @@ export class JellyfinCompatibilityService {
     };
   }
 
-  /** 返回当前服务固定的电影、节目两个虚拟媒体库定义。 */
+  /** 根据媒体库开关返回电影和节目虚拟媒体库定义。 */
   private getLibraryDefinitions(context: JellyfinLibraryContext): JellyfinLibraryDefinition[] {
+    const movieLibrary: JellyfinLibraryDefinition = {
+      id: `${context.libraryId}:movies`, name: "电影", collectionType: "movies", itemType: "video.movie",
+    };
+    if (!context.regionLibrariesEnabled) {
+      return [movieLibrary, {
+        id: `${context.libraryId}:tvshows`, name: "节目", collectionType: "tvshows", itemType: "video.series",
+      }];
+    }
     return [
-      { id: `${context.libraryId}:movies`, name: "电影", collectionType: "movies", itemType: "video.movie" },
-      { id: `${context.libraryId}:tvshows`, name: "节目", collectionType: "tvshows", itemType: "video.series" },
+      movieLibrary,
+      { id: `${context.libraryId}:tvshows:chinese`, name: "华语节目", collectionType: "tvshows", itemType: "video.series", regionGroup: "chinese" },
+      { id: `${context.libraryId}:tvshows:japan-korea`, name: "日韩节目", collectionType: "tvshows", itemType: "video.series", regionGroup: "japan_korea" },
+      { id: `${context.libraryId}:tvshows:europe-america`, name: "欧美节目", collectionType: "tvshows", itemType: "video.series", regionGroup: "europe_america" },
+      { id: `${context.libraryId}:tvshows:other`, name: "其他节目", collectionType: "tvshows", itemType: "video.series", regionGroup: "other" },
     ];
   }
 
@@ -347,7 +363,8 @@ export class JellyfinCompatibilityService {
   /** 获取媒体条目在 Jellyfin 中所属的电影或节目媒体库。 */
   private getItemLibraryDefinition(context: JellyfinContext, item: MediaItemRecord): JellyfinLibraryDefinition {
     const collectionType: JellyfinCollectionType = item.itemType === "video.movie" ? "movies" : "tvshows";
-    return this.getLibraryDefinitions(context).find((library) => library.collectionType === collectionType)
+    return this.getLibraryDefinitions(context).find((library) => library.collectionType === collectionType
+      && (collectionType === "movies" || !context.regionLibrariesEnabled || library.regionGroup === item.regionGroup))
       ?? this.getLibraryDefinitions(context)[0]!;
   }
 
@@ -494,11 +511,12 @@ export class JellyfinCompatibilityService {
     return this.mapLibrary(context, this.getItemLibraryDefinition(context, item), 0, item);
   }
 
-  /** 返回当前服务的电影、节目两个媒体库及各自条目数量。 */
+  /** 返回当前服务的电影媒体库，以及按开关决定是否拆分地区的节目媒体库。 */
   public async listLibraries(context: JellyfinContext) {
     const libraries = this.getLibraryDefinitions(context);
     const counts = await Promise.all(libraries.map((library) => this.runtime.repository.listCatalogItems({
       userId: context.ownerUserId, serviceId: context.serviceId, mediaType: "video", itemType: library.itemType,
+      regionGroup: library.regionGroup,
       sort: "updated_desc", limit: 60, offset: 0, includeFileCounts: false,
     })));
     const items = libraries.map((library, index) => {
@@ -509,8 +527,11 @@ export class JellyfinCompatibilityService {
       return this.mapLibrary(context, library, result?.total ?? 0, coverItem);
     });
     this.runtime.logBusinessEvent("info", {
-      日志关键字: "codex-jellyfin-compat", 事件: "返回Jellyfin电影节目媒体库", 服务ID: context.serviceId,
-      电影数量: counts[0]?.total ?? 0, 节目数量: counts[1]?.total ?? 0,
+      日志关键字: "codex-jellyfin-region-library", 事件: "返回Jellyfin电影节目媒体库", 服务ID: context.serviceId,
+      地区分组开关: context.regionLibrariesEnabled,
+      电影数量: counts[0]?.total ?? 0,
+      节目媒体库数量: libraries.filter((library) => library.collectionType === "tvshows").length,
+      节目数量: counts.slice(1).reduce((sum, result) => sum + (result?.total ?? 0), 0),
     });
     return { Items: items, TotalRecordCount: items.length, StartIndex: 0 };
   }
@@ -552,7 +573,7 @@ export class JellyfinCompatibilityService {
     if (effectiveTypes.length > 1) {
       const results = await Promise.all(effectiveTypes.map((requestedType) => this.runtime.repository.listCatalogItems({
         userId: context.ownerUserId, serviceId: context.serviceId, mediaType: "video", itemType: requestedType,
-        genres, search, sort, limit: 500, offset: 0, includeFileCounts: false,
+        regionGroup: virtualLibrary?.regionGroup, genres, search, sort, limit: 500, offset: 0, includeFileCounts: false,
       })));
       const combined = results.flatMap((result) => result.items);
       combined.sort((left, right) => this.compareCatalogItems(left, right, sort));
@@ -561,7 +582,7 @@ export class JellyfinCompatibilityService {
     } else {
       const result = await this.runtime.repository.listCatalogItems({
         userId: context.ownerUserId, serviceId: context.serviceId, mediaType: "video", itemType,
-        genres, search, sort, limit, offset, includeFileCounts: false,
+        regionGroup: virtualLibrary?.regionGroup, genres, search, sort, limit, offset, includeFileCounts: false,
       });
       records = result.items;
       total = result.total;
@@ -589,9 +610,11 @@ export class JellyfinCompatibilityService {
       ? requestedTypes.length === 0 || requestedTypes.includes(virtualLibrary.itemType) ? [virtualLibrary.itemType] : []
       : requestedTypes.length > 0 ? requestedTypes : ["video.movie", "video.series"];
     if (effectiveTypes.length === 0) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
-    const rows = await this.runtime.database.query("media_items")
+    const rowsQuery = this.runtime.database.query("media_items")
       .select("metadata_json").where({ user_id: context.ownerUserId, service_id: context.serviceId, media_type: "video" })
       .whereIn("item_type", effectiveTypes).whereNull("deleted_at");
+    if (virtualLibrary?.regionGroup) rowsQuery.where("region_group", virtualLibrary.regionGroup);
+    const rows = await rowsQuery;
     const counts = new Map<string, number>();
     rows.forEach((row) => {
       const metadata = parseJsonObject(row.metadata_json);
@@ -712,6 +735,7 @@ export class JellyfinCompatibilityService {
     if (library) {
       const result = await this.runtime.repository.listCatalogItems({
         userId: context.ownerUserId, serviceId: context.serviceId, mediaType: "video", itemType: library.itemType,
+        regionGroup: library.regionGroup,
         sort: "updated_desc", limit: 60, offset: 0, includeFileCounts: false,
       });
       const prefersBackdrop = imageType.toLowerCase() === "backdrop";

@@ -65,7 +65,10 @@ export interface ProviderDirectoryListing {
   items: ProviderDirectory[];
 }
 
-/** Provider 返回给 APP 的临时文件访问结果，严禁包含服务端访问令牌。 */
+/**
+ * Provider 返回给 APP 或 Jellyfin 客户端的临时文件访问结果。
+ * 部分网盘协议允许在单次播放 URL 中携带即时访问令牌，客户端只能临时使用，不能持久化或写入日志。
+ */
 export interface ProviderFileAccess {
   url: string;
   expiresAt: string | null;

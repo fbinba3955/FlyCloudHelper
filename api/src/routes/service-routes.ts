@@ -22,6 +22,37 @@ import { streamJobEvents } from "./event-stream.js";
 /** 当前版本允许创建的服务数据类型；保留 MediaType 联合类型便于后续扩展。 */
 const supportedServiceDataTypes = new Set<MediaType>(["video"]);
 
+/** 记录迁回接口的失败阶段，不输出连接配置、Token 或导出文件路径。 */
+function logTransferOutFailure(
+  runtime: ApiRuntime,
+  stage: string,
+  userId: string,
+  serviceId: string,
+  transferId: string,
+  error: unknown,
+): void {
+  runtime.logBusinessEvent("warn", {
+    日志关键字: "codex-flycloud-transfer-out",
+    事件: "服务迁回接口失败",
+    阶段: stage,
+    用户ID: userId,
+    服务ID: serviceId,
+    迁回任务ID: transferId,
+    错误码: error instanceof ApiError ? error.code : "internal_error",
+    错误信息: error instanceof Error ? error.message : "未知错误",
+  });
+}
+
+/** 保留明确业务错误，并把未知异常转换成包含安全阶段信息的迁回错误。 */
+function toTransferOutApiError(stage: string, error: unknown): ApiError {
+  if (error instanceof ApiError) return error;
+  return new ApiError(
+    500,
+    "service_transfer_internal_error",
+    `服务迁回处理失败（阶段：${stage}），请查看云助手日志`,
+  );
+}
+
 /** 校验服务级数据类型，本阶段只开放影视。 */
 export function validateServiceDataType(value: unknown): MediaType {
   if (typeof value !== "string" || !supportedServiceDataTypes.has(value as MediaType)) {
@@ -129,9 +160,42 @@ export function resolveProviderConnection(
   providerType: string,
   connectionInput: Record<string, unknown>,
 ): { connection: Record<string, unknown>; authorizationSessionId: string | null } {
+  if (providerType === "aliyundrive" || providerType === "baidupan") {
+    const refreshUrl = typeof connectionInput.refreshUrl === "string" ? connectionInput.refreshUrl.trim() : "";
+    if (refreshUrl) {
+      let parsedRefreshUrl: URL;
+      try {
+        parsedRefreshUrl = new URL(refreshUrl);
+      } catch (_error) {
+        throw validationError("connection.refreshUrl", "Token 刷新地址格式无效");
+      }
+      if (parsedRefreshUrl.protocol !== "https:") {
+        throw validationError("connection.refreshUrl", "Token 刷新地址必须使用 HTTPS");
+      }
+    }
+    return { connection: connectionInput, authorizationSessionId: null };
+  }
   if (providerType !== "guangya") return { connection: connectionInput, authorizationSessionId: null };
   if (connectionInput.authMode === "official_api") {
     return { connection: resolveGuangyaOfficialApiConnection(connectionInput), authorizationSessionId: null };
+  }
+  if ((connectionInput.authMode === "web_sms" || connectionInput.authMode === "web_qr")
+    && typeof connectionInput.accessToken === "string" && connectionInput.accessToken.trim()
+    && typeof connectionInput.refreshToken === "string" && connectionInput.refreshToken.trim()) {
+    // APP 迁移边界允许交接当前有效网页令牌；普通网页登录仍使用一次性授权会话。
+    const rawExpiresAt = Number(connectionInput.expiresAt ?? 0); // 关键变量：拒绝把 NaN 序列化成空有效期。
+    return {
+      connection: {
+        authMode: connectionInput.authMode,
+        deviceId: readGuangyaOfficialApiText(connectionInput, ["deviceId"], "设备 ID", false, 500),
+        accessToken: readGuangyaOfficialApiText(connectionInput, ["accessToken"], "Access Token", true),
+        refreshToken: readGuangyaOfficialApiText(connectionInput, ["refreshToken"], "Refresh Token", true),
+        tokenType: readGuangyaOfficialApiText(connectionInput, ["tokenType"], "Token 类型", false, 100) || "Bearer",
+        expiresAt: Number.isFinite(rawExpiresAt) ? Math.max(0, rawExpiresAt) : 0,
+        userId: readGuangyaOfficialApiText(connectionInput, ["userId"], "用户 ID", false, 500),
+      },
+      authorizationSessionId: null,
+    };
   }
   const authorizationSessionId = requireString(
     connectionInput,
@@ -502,6 +566,26 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     const dataType = validateServiceDataType(request.body.dataType);
     const provider = requireObject(request.body, "provider", "Provider");
     const providerType = requireString(provider, "type", "Provider 类型", 64);
+    const clientDeviceId = typeof request.body.clientDeviceId === "string" ? request.body.clientDeviceId.trim() : "";
+    const clientServiceId = typeof request.body.clientServiceId === "string" ? request.body.clientServiceId.trim() : "";
+    if (clientDeviceId && clientServiceId) {
+      const existingBinding = await runtime.repository.findClientServiceBinding(user.id, clientDeviceId, clientServiceId);
+      if (existingBinding) {
+        const existingService = await runtime.repository.getServiceDetail(existingBinding.serviceId, user.id);
+        if (existingService.providerType !== providerType) {
+          throw new ApiError(409, "provider_type_conflict", "本地服务已经关联其他 Provider 类型的云端服务");
+        }
+        runtime.logBusinessEvent("info", {
+          日志关键字: "codex-flycloud-service-association",
+          事件: "复用本地服务已有云端关联",
+          用户ID: user.id,
+          服务ID: existingService.id,
+          客户端服务ID: clientServiceId,
+          网盘类型: providerType,
+        });
+        return reply.status(200).send({ service: existingService, serviceAccessCredentials: null });
+      }
+    }
     const resolvedConnection = resolveProviderConnection(
       runtime,
       user.id,
@@ -524,8 +608,6 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       dataType,
     );
     await validateProviderAccess(adapter, connection, scanProfile);
-    const clientDeviceId = typeof request.body.clientDeviceId === "string" ? request.body.clientDeviceId.trim() : "";
-    const clientServiceId = typeof request.body.clientServiceId === "string" ? request.body.clientServiceId.trim() : "";
     const creation = await runtime.repository.createService({
       serviceId: randomUUID(),
       libraryId: randomUUID(),
@@ -618,8 +700,8 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
             encryptedConnection: runtime.vault.encrypt(nextConnection),
           });
           runtime.logBusinessEvent("info", {
-            日志关键字: "codex-flycloud-helper-guangya-token-refresh",
-            事件: "目录浏览期间保存光鸭刷新令牌",
+            日志关键字: "codex-flycloud-provider-token-refresh",
+            事件: "目录浏览期间保存Provider刷新令牌",
             用户ID: user.id,
             服务ID: service.id,
             凭据修订: service.credentialRevision,
@@ -650,6 +732,310 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     });
     return reply.status(201).send(result);
   });
+
+  /** 仅移除当前设备上的镜像绑定，云端服务和其他设备保持不变。 */
+  server.delete<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/services/:serviceId/client-bindings",
+    async (request) => {
+      const user = await requireRequestUser(request, runtime.database);
+      const clientDeviceId = requireString(request.body, "clientDeviceId", "客户端设备 ID", 200);
+      const clientServiceId = requireString(request.body, "clientServiceId", "客户端服务 ID", 200);
+      const removed = await runtime.repository.unbindClientService({
+        userId: user.id,
+        serviceId: request.params.serviceId,
+        clientDeviceId,
+        clientServiceId,
+      });
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-client-binding",
+        事件: "移除当前设备服务绑定",
+        用户ID: user.id,
+        云端服务ID: request.params.serviceId,
+        客户端设备ID: clientDeviceId,
+        客户端服务ID: clientServiceId,
+        是否移除: removed,
+      });
+      return { removed };
+    },
+  );
+
+  /** 冻结服务并创建迁回 APP 所需的完整目录导出任务。 */
+  server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/services/:serviceId/transfer-outs",
+    async (request, reply) => {
+      const user = await requireRequestUser(request, runtime.database);
+      let failureStage = "读取服务和设备绑定"; // 关键变量：NAS 日志据此定位创建迁回任务的失败边界。
+      try {
+      const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+      const clientDeviceId = requireString(request.body, "clientDeviceId", "客户端设备 ID", 200);
+      const clientServiceId = requireString(request.body, "clientServiceId", "客户端服务 ID", 200);
+      const binding = await runtime.repository.findClientServiceBinding(user.id, clientDeviceId, clientServiceId);
+      if (!binding || binding.serviceId !== service.id) {
+        throw new ApiError(409, "client_service_binding_required", "只有当前服务已绑定的设备才能发起迁回");
+      }
+      if (binding.bindingSource !== "local_migration") {
+        throw new ApiError(409, "service_transfer_source_invalid", "从云端同步到本机的镜像只能从本机移除，不能迁回并删除云端服务");
+      }
+      failureStage = "恢复或复用已有迁回任务";
+      const existingTransfer = await runtime.database.query("service_transfer_outs")
+        .where({ user_id: user.id, service_id: service.id }).first();
+      let previousStatus: string = service.status; // 关键变量：导出失败重建任务时仍恢复最初的服务状态。
+      if (existingTransfer) {
+        const existingExport = await runtime.exports.getExport(String(existingTransfer.export_id), user.id);
+        if (existingExport.status !== "failed") {
+          return reply.status(200).send({
+            transfer: {
+              id: String(existingTransfer.id),
+              serviceId: service.id,
+              libraryId: service.libraryId,
+              status: existingExport.status === "completed" ? "ready" : String(existingTransfer.status),
+              exportId: String(existingTransfer.export_id),
+              export: { ...existingExport, filePath: undefined },
+              credentialClaimed: Number(existingTransfer.credential_claimed) === 1,
+            },
+          });
+        }
+        previousStatus = String(existingTransfer.previous_status || "active");
+        await runtime.exports.deleteExport(existingExport.id, user.id);
+        await runtime.database.query("service_transfer_outs").where({ id: existingTransfer.id }).delete();
+        await runtime.database.query("cloud_services").where({ id: service.id, user_id: user.id }).update({
+          status: previousStatus,
+          updated_at: new Date().toISOString(),
+        });
+      }
+      const [activeScanJob, activeMediaProbeJob] = await Promise.all([
+        runtime.database.query("scan_jobs").where({ service_id: service.id })
+          .whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+        runtime.database.query("media_probe_jobs").where({ service_id: service.id })
+          .whereIn("status", ["queued", "running", "retry_waiting", "paused"]).first(),
+      ]);
+      if (activeScanJob || activeMediaProbeJob) {
+        throw new ApiError(409, "service_has_active_job", "请先结束当前服务的扫描或规格分析任务");
+      }
+      failureStage = "创建云端目录导出任务";
+      const exportRecord = await runtime.exports.createSnapshotTask(user.id, service.libraryId);
+      const transferId = randomUUID();
+      const now = new Date().toISOString();
+      failureStage = "冻结服务并保存迁回任务";
+      await runtime.database.query.transaction(async (transaction) => {
+        await transaction("cloud_services").where({ id: service.id, user_id: user.id }).update({
+          status: "disabled",
+          updated_at: now,
+        });
+        await transaction("service_transfer_outs").insert({
+          id: transferId,
+          user_id: user.id,
+          service_id: service.id,
+          library_id: service.libraryId,
+          client_device_id: clientDeviceId,
+          client_service_id: clientServiceId,
+          export_id: exportRecord.id,
+          status: "exporting",
+          previous_status: previousStatus,
+          credential_claimed: 0,
+          created_at: now,
+          updated_at: now,
+        });
+      });
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-transfer-out",
+        事件: "创建服务迁回任务",
+        用户ID: user.id,
+        服务ID: service.id,
+        迁回任务ID: transferId,
+        客户端设备ID: clientDeviceId,
+      });
+      return reply.status(202).send({
+        transfer: {
+          id: transferId,
+          serviceId: service.id,
+          libraryId: service.libraryId,
+          status: "exporting",
+          exportId: exportRecord.id,
+          export: { ...exportRecord, filePath: undefined },
+          credentialClaimed: false,
+        },
+      });
+      } catch (error) {
+        logTransferOutFailure(runtime, failureStage, user.id, request.params.serviceId, "", error);
+        throw toTransferOutApiError(failureStage, error);
+      }
+    },
+  );
+
+  /** 查询迁回任务和底层目录导出的实时状态。 */
+  server.get<{ Params: { serviceId: string; transferId: string } }>(
+    "/api/v1/services/:serviceId/transfer-outs/:transferId",
+    async (request) => {
+      const user = await requireRequestUser(request, runtime.database);
+      let failureStage = "读取迁回任务"; // 关键变量：轮询失败时区分任务读取、导出读取和状态保存。
+      try {
+        const transfer = await runtime.database.query("service_transfer_outs").where({
+          id: request.params.transferId,
+          user_id: user.id,
+          service_id: request.params.serviceId,
+        }).first();
+        if (!transfer) throw new ApiError(404, "service_transfer_not_found", "迁回任务不存在");
+        failureStage = "读取云端目录导出状态";
+        const exportRecord = await runtime.exports.getExport(String(transfer.export_id), user.id);
+        const status = exportRecord.status === "completed" ? "ready"
+          : exportRecord.status === "failed" ? "failed" : "exporting";
+        if (status !== String(transfer.status)) {
+          failureStage = "保存迁回任务状态";
+          await runtime.database.query("service_transfer_outs").where({ id: transfer.id }).update({
+            status,
+            updated_at: new Date().toISOString(),
+          });
+        }
+        return {
+          transfer: {
+            id: String(transfer.id),
+            serviceId: String(transfer.service_id),
+            libraryId: String(transfer.library_id),
+            status,
+            exportId: String(transfer.export_id),
+            export: { ...exportRecord, filePath: undefined },
+            credentialClaimed: Number(transfer.credential_claimed) === 1,
+          },
+        };
+      } catch (error) {
+        logTransferOutFailure(
+          runtime, failureStage, user.id, request.params.serviceId, request.params.transferId, error,
+        );
+        throw toTransferOutApiError(failureStage, error);
+      }
+    },
+  );
+
+  /** 目录准备完成后只向发起设备交接冻结后的最新 Provider 凭据与配置。 */
+  server.post<{ Params: { serviceId: string; transferId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/services/:serviceId/transfer-outs/:transferId/credentials/claim",
+    async (request, reply) => {
+      const user = await requireRequestUser(request, runtime.database);
+      let failureStage = "读取迁回任务"; // 关键变量：区分任务、凭据读取和解密阶段。
+      try {
+      const clientDeviceId = requireString(request.body, "clientDeviceId", "客户端设备 ID", 200);
+      const clientServiceId = requireString(request.body, "clientServiceId", "客户端服务 ID", 200);
+      const transfer = await runtime.database.query("service_transfer_outs").where({
+        id: request.params.transferId,
+        user_id: user.id,
+        service_id: request.params.serviceId,
+        client_device_id: clientDeviceId,
+        client_service_id: clientServiceId,
+      }).first();
+      if (!transfer) throw new ApiError(404, "service_transfer_not_found", "迁回任务不存在或不属于当前设备");
+      const exportRecord = await runtime.exports.getExport(String(transfer.export_id), user.id);
+      if (exportRecord.status !== "completed") {
+        throw new ApiError(409, "service_transfer_catalog_not_ready", "云端目录尚未完成导出");
+      }
+      failureStage = "读取并解密Provider凭据";
+      const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+      const encryptedConnection = await runtime.repository.getActiveEncryptedConnection(service.id, user.id);
+      const connection = runtime.vault.decrypt(encryptedConnection); // 关键变量：先完成解密再写已领取标记。
+      failureStage = "保存凭据领取状态";
+      await runtime.database.query("service_transfer_outs").where({ id: transfer.id }).update({
+        credential_claimed: 1,
+        status: "claimed",
+        updated_at: new Date().toISOString(),
+      });
+      // Provider 凭据只能用于本次迁回，不允许浏览器、代理或系统缓存响应正文。
+      return reply.header("Cache-Control", "no-store").header("Pragma", "no-cache").send({
+        transferId: String(transfer.id),
+        providerType: service.providerType,
+        connection,
+        scanProfile: service.scanProfile,
+        metadataProfile: service.metadataProfile,
+        credentialRevision: service.credentialRevision,
+        scanProfileRevision: service.scanProfileRevision,
+        metadataProfileRevision: service.metadataProfileRevision,
+      });
+      } catch (error) {
+        logTransferOutFailure(
+          runtime, failureStage, user.id, request.params.serviceId, request.params.transferId, error,
+        );
+        throw toTransferOutApiError(failureStage, error);
+      }
+    },
+  );
+
+  /** APP 确认目录和凭据均已落盘后，物理删除云端服务及所有设备绑定。 */
+  server.post<{ Params: { serviceId: string; transferId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/services/:serviceId/transfer-outs/:transferId/complete",
+    async (request) => {
+      const user = await requireRequestUser(request, runtime.database);
+      let failureStage = "校验迁回完成请求"; // 关键变量：物理删除失败时记录最后完成的安全阶段。
+      try {
+      requireConfirmation(request.body, request.params.transferId);
+      const transfer = await runtime.database.query("service_transfer_outs").where({
+        id: request.params.transferId,
+        user_id: user.id,
+        service_id: request.params.serviceId,
+      }).first();
+      if (!transfer) {
+        // 云端物理删除成功但响应丢失时，APP 会重试完成请求；服务和任务都不存在即视为已经完成。
+        const remainingService = await runtime.database.query("cloud_services").select("id").where({
+          id: request.params.serviceId,
+          user_id: user.id,
+        }).first();
+        if (!remainingService) {
+          runtime.logBusinessEvent("info", {
+            日志关键字: "codex-flycloud-transfer-out",
+            事件: "迁回完成请求幂等命中",
+            用户ID: user.id,
+            服务ID: request.params.serviceId,
+            迁回任务ID: request.params.transferId,
+          });
+          return {
+            completed: true,
+            alreadyCompleted: true,
+            serviceId: request.params.serviceId,
+            transferId: request.params.transferId,
+          };
+        }
+        throw new ApiError(404, "service_transfer_not_found", "迁回任务不存在");
+      }
+      if (Number(transfer.credential_claimed) !== 1) {
+        throw new ApiError(409, "service_transfer_credential_not_claimed", "APP 尚未接收 Provider 凭据");
+      }
+      try {
+        failureStage = "确认云端目录导出完成";
+        const completedExport = await runtime.exports.getExport(String(transfer.export_id), user.id);
+        if (completedExport.status !== "completed") {
+          throw new ApiError(409, "service_transfer_catalog_not_ready", "云端目录尚未完成导出");
+        }
+      } catch (error) {
+        // 上次完成请求可能已清理导出文件但在物理删除服务前中断，此时允许幂等继续。
+        if (!(error instanceof ApiError) || error.code !== "export_not_found") throw error;
+      }
+      failureStage = "清理云端目录导出文件";
+      while (true) {
+        const exports = await runtime.exports.listExports(user.id, String(transfer.library_id), 100);
+        if (exports.length === 0) break;
+        for (const record of exports) {
+          if (record.status === "queued" || record.status === "running") {
+            throw new ApiError(409, "service_transfer_export_active", "服务仍有未结束的目录导出任务");
+          }
+          await runtime.exports.deleteExport(record.id, user.id);
+        }
+      }
+      failureStage = "物理删除云端服务数据";
+      await runtime.repository.hardDeleteService(request.params.serviceId, user.id);
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-transfer-out",
+        事件: "服务迁回云端清理完成",
+        用户ID: user.id,
+        服务ID: request.params.serviceId,
+        迁回任务ID: request.params.transferId,
+      });
+      return { completed: true, serviceId: request.params.serviceId, transferId: request.params.transferId };
+      } catch (error) {
+        logTransferOutFailure(
+          runtime, failureStage, user.id, request.params.serviceId, request.params.transferId, error,
+        );
+        throw toTransferOutApiError(failureStage, error);
+      }
+    },
+  );
 
   server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/connection/validate", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
@@ -683,6 +1069,14 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       encryptedConnection: runtime.vault.encrypt(connection),
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
       expectedRevision: readExpectedRevision(request.body.expectedRevision),
+    });
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-provider-sync",
+      事件: "更新托管服务登录状态",
+      用户ID: user.id,
+      服务ID: service.id,
+      网盘类型: service.providerType,
+      凭据修订: updated.credentialRevision,
     });
     consumeProviderAuthorization(runtime, user.id, resolvedConnection.authorizationSessionId);
     logCloudDriveAutomaticConfig(runtime, service.providerType, "更新连接", service.id, user.id);
@@ -786,8 +1180,8 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
             encryptedConnection: runtime.vault.encrypt(nextConnection),
           });
           runtime.logBusinessEvent("info", {
-            日志关键字: "codex-flycloud-helper-guangya-token-refresh",
-            事件: "重连期间保存光鸭刷新令牌",
+            日志关键字: "codex-flycloud-provider-token-refresh",
+            事件: "重连期间保存Provider刷新令牌",
             用户ID: user.id,
             服务ID: service.id,
             凭据修订: service.credentialRevision,
@@ -838,8 +1232,8 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
           encryptedConnection: runtime.vault.encrypt(nextConnection),
         });
         runtime.logBusinessEvent("info", {
-          日志关键字: "codex-flycloud-helper-guangya-token-refresh",
-          事件: "扫描路径验证期间保存光鸭刷新令牌",
+          日志关键字: "codex-flycloud-provider-token-refresh",
+          事件: "扫描路径验证期间保存Provider刷新令牌",
           用户ID: user.id,
           服务ID: service.id,
           凭据修订: service.credentialRevision,
@@ -923,11 +1317,11 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/playback-settings", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     if (typeof request.body.relayPlaybackEnabled !== "boolean") {
-      throw validationError("relayPlaybackEnabled", "中转播放开关必须是布尔值");
+      throw validationError("relayPlaybackEnabled", "APP 专用中转播放开关必须是布尔值");
     }
     const currentService = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
     if (request.body.relayPlaybackEnabled
-      && !runtime.providers.get(currentService.providerType).descriptor.capabilities.includes("relayPlayback")) {
+      && !runtime.providers.get(currentService.providerType).descriptor.capabilities.some((capability) => capability === "relayPlayback" || capability === "relay")) {
       throw new ApiError(422, "provider_relay_playback_unsupported", "当前网盘类型暂不支持中转播放");
     }
     const service = await runtime.repository.updateRelayPlaybackEnabled(
@@ -937,10 +1331,10 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-relay-playback-setting",
-      事件: "用户更新服务中转播放开关",
+      事件: "用户通过兼容接口更新媒体库APP专用中转开关",
       用户ID: user.id,
       服务ID: service.id,
-      是否启用中转播放: service.relayPlaybackEnabled,
+      是否启用APP专用中转: service.relayPlaybackEnabled,
     });
     return { service };
   });

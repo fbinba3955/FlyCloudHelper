@@ -2,19 +2,23 @@ import { Link } from "@tanstack/react-router";
 import { Download, Images, Pause, Play, Radio, RefreshCw, RotateCcw, Settings2, Square, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
+import { AdminServiceFilters } from "@/components/AdminServiceFilters";
 import { Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   cancelScanJob,
   deleteScanJob,
   downloadScanFailureReport,
   listJobs,
+  listAdminUsers,
   listMediaProbeJobFailures,
+  listProviders,
   listServices,
   pauseScanJob,
   resumeScanJob,
   retryScanJob,
   type JobStatus,
   type MediaProbeFailure,
+  type ServiceListFilters,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
 import { formatJobDuration, getJobDurationLabel } from "@/lib/job-duration";
@@ -445,11 +449,21 @@ export function AdminJobsPage() { return <JobsView admin />; }
 
 /** 按服务选择独立媒体库，不把不同服务的条目合并到同一个海报墙。 */
 function CatalogServiceSelector({ admin }: { admin: boolean }) {
-  const resource = useApiResource(() => listServices(admin), [admin]);
+  const [filters, setFilters] = useState<ServiceListFilters>({});
+  const resource = useApiResource(
+    () => listServices(admin, admin ? filters : {}),
+    [admin, filters.search, filters.userId, filters.providerType, filters.dataType, filters.status, filters.jellyfinEnabled],
+  );
+  const filterOptions = useApiResource(async () => {
+    if (!admin) return { users: [], providers: [] };
+    const [users, providers] = await Promise.all([listAdminUsers(), listProviders()]);
+    return { users: users.items, providers };
+  }, [admin]);
   const services = resource.data?.items ?? [];
   return (
     <>
       <PageHeader title={admin ? "媒体库管理" : "我的媒体库"} actions={<SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新</SecondaryButton>} />
+      {admin && <AdminServiceFilters value={filters} users={filterOptions.data?.users ?? []} providers={filterOptions.data?.providers ?? []} resultCount={resource.data?.total ?? 0} onChange={setFilters} />}
       {resource.error && <Panel className="mb-4"><p className="text-sm text-destructive">{resource.error}</p></Panel>}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         {services.map((service) => (

@@ -36,6 +36,7 @@ function mapMigration(row: Record<string, unknown>): ServiceMigrationRecord {
     clientDeviceId: String(row.client_device_id),
     clientServiceId: String(row.client_service_id),
     providerType: String(row.provider_type),
+    ownsService: Number(row.owns_service ?? 1) === 1,
     status,
     stage: String(row.stage) as ServiceMigrationStatus,
     progressPercent: Number(row.progress_percent ?? 0),
@@ -154,6 +155,7 @@ export class ServiceMigrationRepository {
     clientDeviceId: string;
     clientServiceId: string;
     providerType: string;
+    ownsService?: boolean;
     expectedBytes: number;
     expectedChunkCount: number;
     snapshotSha256: string;
@@ -169,6 +171,7 @@ export class ServiceMigrationRepository {
       client_device_id: input.clientDeviceId,
       client_service_id: input.clientServiceId,
       provider_type: input.providerType,
+      owns_service: input.ownsService === false ? 0 : 1,
       status: "uploading",
       stage: "uploading",
       progress_percent: 0,

@@ -264,6 +264,14 @@ async function batchInsert(
 
 /** 把源文件资源 ID 冲突转换为可读且不可盲目重试的迁移错误。 */
 function normalizeMigrationImportError(error: unknown): unknown {
+  const fileError = error as NodeJS.ErrnoException;
+  if (fileError?.code === "ENOENT") {
+    return new ApiError(
+      409,
+      "migration_chunk_file_missing",
+      "云助手迁移分片已经丢失，请从 APP 重新同步本地数据",
+    );
+  }
   const errorMessage = error instanceof Error ? error.message : String(error ?? "");
   if (/uq_source_files_resource|source_files\.user_id.*source_files\.library_id.*source_files\.provider_resource_id/iu
     .test(errorMessage)) {
@@ -299,34 +307,55 @@ async function importSnapshotRows(
     let duplicateSourceFileCount = 0;
     for (const local of snapshot.sourceFiles) {
       const displayPath = readText(local, "path");
-      const providerResourceId = readText(local, "resourceId") || displayPath;
+      const providerPayload = readEmbeddedObject(local, "providerPayloadJson");
+      const explicitResourceId = readText(local, "resourceId");
+      const providerResourceId = migration.providerType === "aliyundrive"
+        ? readText(providerPayload, "fileId") || explicitResourceId
+        : migration.providerType === "baidupan"
+          ? readText(providerPayload, "fsId") || explicitResourceId
+          : explicitResourceId || displayPath;
       if (!displayPath || !providerResourceId) continue;
-      const currentCanonicalSource = canonicalSourceByResourceId.get(providerResourceId);
+      const providerIdentity = migration.providerType === "aliyundrive"
+        ? `${readText(providerPayload, "driveId")}:${providerResourceId}`
+        : providerResourceId; // 关键变量：阿里不同盘的相同 fileId 不能被错误去重。
+      const currentCanonicalSource = canonicalSourceByResourceId.get(providerIdentity);
       const currentUpdatedAt = currentCanonicalSource ? readNumber(currentCanonicalSource, "updatedAt") : -1;
       const currentIndexedAt = currentCanonicalSource ? readNumber(currentCanonicalSource, "indexedAt") : -1;
       const nextUpdatedAt = readNumber(local, "updatedAt");
       const nextIndexedAt = readNumber(local, "indexedAt");
       if (!currentCanonicalSource || nextUpdatedAt > currentUpdatedAt
         || (nextUpdatedAt === currentUpdatedAt && nextIndexedAt > currentIndexedAt)) {
-        canonicalSourceByResourceId.set(providerResourceId, local);
+        canonicalSourceByResourceId.set(providerIdentity, local);
       }
     }
     for (const local of snapshot.sourceFiles) {
       const displayPath = readText(local, "path");
       if (!displayPath || sourceIdByPath.has(displayPath)) continue;
       const explicitResourceId = readText(local, "resourceId");
-      if (migration.providerType === "guangya" && !explicitResourceId) {
+      if (migration.providerType !== "webdav" && !explicitResourceId) {
         throw new ApiError(
           422,
-          "guangya_snapshot_locator_missing",
-          "光鸭本地快照缺少 fileId，需由新版 APP 重新生成迁移快照",
+          "migration_snapshot_locator_missing",
+          "网盘本地快照缺少稳定资源 ID，需由新版 APP 重新生成迁移快照",
         );
       }
-      const providerResourceId = explicitResourceId || displayPath;
-      const canonicalSource = canonicalSourceByResourceId.get(providerResourceId);
+      const providerPayload = readEmbeddedObject(local, "providerPayloadJson");
+      const providerResourceId = migration.providerType === "aliyundrive"
+        ? readText(providerPayload, "fileId") || explicitResourceId
+        : migration.providerType === "baidupan"
+          ? readText(providerPayload, "fsId") || explicitResourceId
+          : explicitResourceId || displayPath;
+      const driveId = readText(providerPayload, "driveId") || readText(local, "driveId");
+      const providerIdentity = migration.providerType === "aliyundrive"
+        ? `${driveId}:${providerResourceId}`
+        : providerResourceId;
+      if (migration.providerType === "aliyundrive" && (!driveId || !providerResourceId)) {
+        throw new ApiError(422, "aliyundrive_snapshot_locator_missing", "阿里云盘快照缺少 driveId 或 fileId");
+      }
+      const canonicalSource = canonicalSourceByResourceId.get(providerIdentity);
       const canonicalDisplayPath = canonicalSource ? readText(canonicalSource, "path") : displayPath;
       canonicalPathBySourcePath.set(displayPath, canonicalDisplayPath || displayPath);
-      const sourceId = createStableId("src", migration.userId, migration.libraryId, providerResourceId);
+      const sourceId = createStableId("src", migration.userId, migration.libraryId, providerIdentity);
       if (canonicalSource !== local) {
         // 重复路径仍映射到已保留的源文件，后续文件关联不会因为去重而丢失。
         sourceIdByPath.set(displayPath, sourceId);
@@ -334,11 +363,12 @@ async function importSnapshotRows(
         continue;
       }
       const locator = {
-        ...readEmbeddedObject(local, "providerPayloadJson"),
+        ...providerPayload,
         resourceId: providerResourceId,
         ...(migration.providerType === "guangya" ? { fileId: providerResourceId } : {}),
+        ...(migration.providerType === "aliyundrive" ? { driveId, fileId: providerResourceId } : {}),
+        ...(migration.providerType === "baidupan" ? { fsId: providerResourceId, path: displayPath } : {}),
         displayPath,
-        ...(readText(local, "driveId") ? { driveId: readText(local, "driveId") } : {}),
       };
       sourceIdByPath.set(displayPath, sourceId);
       sourceRows.push({
@@ -346,7 +376,7 @@ async function importSnapshotRows(
         user_id: migration.userId,
         service_id: migration.serviceId,
         library_id: migration.libraryId,
-        provider_resource_id: providerResourceId,
+        provider_resource_id: providerIdentity,
         parent_resource_id: readText(local, "parentResourceId") || readText(local, "parentPath") || null,
         path: displayPath,
         name: readText(local, "name") || path.posix.basename(displayPath),
@@ -545,13 +575,55 @@ async function importSnapshotRows(
 async function assembleSnapshot(
   chunks: Array<{ filePath: string; sizeBytes: number; sha256: string }>,
   targetPath: string,
+  logger: MigrationWorkerLogger,
+  migrationId: string,
 ): Promise<{ sha256: string; sizeBytes: number }> {
   const fileHandle = await fsPromises.open(targetPath, "w", 0o600);
   const digest = createHash("sha256");
   let writtenBytes = 0;
   try {
-    for (const chunk of chunks) {
-      const payload = await fsPromises.readFile(chunk.filePath);
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+      const chunk = chunks[chunkIndex];
+      if (!chunk) continue;
+      let payload: Buffer | null = null; // 关键变量：NAS 卷偶发延迟可见时，在后台内部短暂等待而不立即判失败。
+      for (let attempt = 1; attempt <= 6; attempt += 1) {
+        try {
+          payload = await fsPromises.readFile(chunk.filePath);
+          if (attempt > 1) {
+            logger.info({
+              日志关键字: "codex-flycloud-migration-import",
+              事件: "迁移分片延迟可见后读取成功",
+              迁移ID: migrationId,
+              分片序号: chunkIndex,
+              读取次数: attempt,
+            });
+          }
+          break;
+        } catch (error) {
+          const fileError = error as NodeJS.ErrnoException;
+          if (fileError.code !== "ENOENT") throw error;
+          if (attempt >= 6) {
+            throw new ApiError(
+              409,
+              "migration_chunk_file_missing",
+              "云助手迁移分片已经丢失，请从 APP 重新同步本地数据",
+            );
+          }
+          if (attempt === 1) {
+            logger.warn({
+              日志关键字: "codex-flycloud-migration-import",
+              事件: "迁移分片首次读取不可见",
+              迁移ID: migrationId,
+              分片序号: chunkIndex,
+              后续操作: "后台短暂等待后重读",
+            });
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 500));
+        }
+      }
+      if (payload === null) {
+        throw new ApiError(409, "migration_chunk_file_missing", "云助手迁移分片已经丢失，请从 APP 重新同步本地数据");
+      }
       const chunkHash = createHash("sha256").update(payload).digest("hex");
       if (payload.length !== chunk.sizeBytes || chunkHash !== chunk.sha256) {
         throw new ApiError(422, "migration_chunk_storage_mismatch", "迁移分片存储校验失败，请重新上传");
@@ -664,7 +736,7 @@ export class ServiceMigrationWorker {
         this.repository.getSnapshotExpectation(migration.id),
       ]);
       await fsPromises.mkdir(migrationDirectory, { recursive: true, mode: 0o700 });
-      const assembled = await assembleSnapshot(chunks, archivePath);
+      const assembled = await assembleSnapshot(chunks, archivePath, this.logger, migration.id);
       if (assembled.sizeBytes !== expectation.totalBytes || assembled.sha256 !== expectation.sha256) {
         throw new ApiError(422, "migration_snapshot_hash_mismatch", "迁移快照总校验失败，请重新上传");
       }

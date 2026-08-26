@@ -1,5 +1,10 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { ApiError } from "../errors.js";
+import {
+  PROVIDER_RATE_LIMIT_MAX_RETRIES,
+  readProviderRateLimitDelayMs,
+  waitForProviderRateLimit,
+} from "./network.js";
 
 const GUANGYA_AUTH_BASE_URL = "https://account.guangyapan.com/v1/auth";
 const GUANGYA_CAPTCHA_INIT_URL = "https://account.guangyapan.com/v1/shield/captcha/init";
@@ -426,11 +431,11 @@ export class GuangyaWebApiClient {
       needSubFolderStat: true,
     };
     const path = "/userres/v1/file/get_file_list";
-    let response = await this.requestBusinessJson(path, requestBody, connection, signal);
+    let response = await this.requestBusinessJsonWithRateLimitRetry(path, requestBody, connection, signal);
     if (this.requiresTokenRefresh(response)) {
       await this.refreshConnection(connection, persistConnection, signal, true);
       await this.reserveListRequestSlot();
-      response = await this.requestBusinessJson(path, requestBody, connection, signal);
+      response = await this.requestBusinessJsonWithRateLimitRetry(path, requestBody, connection, signal);
     }
     this.requireSuccessfulBusinessResponse(response, path);
     return response.body;
@@ -446,10 +451,10 @@ export class GuangyaWebApiClient {
     if (!fileId.trim()) throw new ApiError(422, "provider_file_locator_invalid", "光鸭文件定位无效");
     await this.ensureValidToken(connection, persistConnection, signal);
     const path = "/userres/v1/get_res_download_url";
-    let response = await this.requestBusinessJson(path, { fileId }, connection, signal);
+    let response = await this.requestBusinessJsonWithRateLimitRetry(path, { fileId }, connection, signal);
     if (this.requiresTokenRefresh(response)) {
       await this.refreshConnection(connection, persistConnection, signal, true);
-      response = await this.requestBusinessJson(path, { fileId }, connection, signal);
+      response = await this.requestBusinessJsonWithRateLimitRetry(path, { fileId }, connection, signal);
     }
     this.requireSuccessfulBusinessResponse(response, path);
     const data = resolveDataRecord(response.body);
@@ -591,6 +596,42 @@ export class GuangyaWebApiClient {
     });
   }
 
+  /** 对光鸭网页 API 的目录和下载地址请求执行有限限流退避。 */
+  private async requestBusinessJsonWithRateLimitRetry(
+    path: string,
+    body: JsonRecord,
+    connection: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; status: number; body: JsonRecord }> {
+    let retryCount = 0;
+    while (true) {
+      const response = await this.requestBusinessJson(path, body, connection, signal);
+      // 关键变量：验证码和扫码服务最终共用此网页 API，统一识别两种429响应形式。
+      const isRateLimited = response.status === 429 || Number(response.body.code ?? 0) === 429;
+      if (!isRateLimited || signal?.aborted) return response;
+      if (retryCount >= PROVIDER_RATE_LIMIT_MAX_RETRIES) {
+        this.logDiagnostic?.({
+          日志关键字: "codex-flycloud-provider-rate-limit",
+          事件: "光鸭网页API限流重试后仍未恢复",
+          请求路径: path,
+          已重试次数: retryCount,
+        });
+        return response;
+      }
+      const retryDelayMs = readProviderRateLimitDelayMs(null, retryCount);
+      retryCount += 1;
+      this.logDiagnostic?.({
+        日志关键字: "codex-flycloud-provider-rate-limit",
+        事件: "光鸭网页API请求被限流后等待重试",
+        请求路径: path,
+        当前重试次数: retryCount,
+        最大重试次数: PROVIDER_RATE_LIMIT_MAX_RETRIES,
+        等待毫秒: retryDelayMs,
+      });
+      await waitForProviderRateLimit(retryDelayMs, signal);
+    }
+  }
+
   /** 判断业务响应是否要求刷新 Token。 */
   private requiresTokenRefresh(response: { status: number; body: JsonRecord }): boolean {
     return response.status === 401 || Number(response.body.code ?? 0) === GUANGYA_TOKEN_EXPIRED_CODE;
@@ -609,7 +650,9 @@ export class GuangyaWebApiClient {
       });
     }
     if (response.status === 403) throw new ApiError(403, "provider_permission_denied", "当前光鸭账号没有文件访问权限");
-    if (response.status === 429) throw new ApiError(503, "provider_rate_limited", "光鸭接口访问频率过高，请稍后重试");
+    if (response.status === 429 || code === 429) {
+      throw new ApiError(503, "provider_rate_limited", "光鸭接口访问频率过高，自动重试后仍未恢复，请稍后重试");
+    }
     if (response.status === 401 || code === GUANGYA_TOKEN_EXPIRED_CODE) {
       throw new ApiError(410, "provider_authentication_failed", "光鸭登录已失效，请重新登录");
     }

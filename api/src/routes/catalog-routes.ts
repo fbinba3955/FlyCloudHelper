@@ -378,14 +378,26 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
             encryptedConnection: runtime.vault.encrypt(nextConnection),
           });
           runtime.logBusinessEvent("info", {
-            日志关键字: "codex-flycloud-helper-guangya-token-refresh",
-            事件: "文件访问期间保存光鸭刷新令牌",
+            日志关键字: "codex-flycloud-provider-token-refresh",
+            事件: "文件访问期间保存Provider刷新令牌",
             用户ID: user.id,
             服务ID: service.id,
             凭据修订: service.credentialRevision,
           });
         },
       });
+      if (String(library.provider_type) === "baidupan") {
+        runtime.logBusinessEvent("info", {
+          日志关键字: "codex-baidupan-cloud-playback",
+          事件: "百度网盘直连播放地址下发成功",
+          用户ID: user.id,
+          服务ID: service.id,
+          媒体条目ID: request.params.itemId,
+          源文件ID: request.params.fileId,
+          播放地址是否包含临时令牌: true,
+          请求头名称: "User-Agent",
+        });
+      }
       return {
         schemaVersion: 1,
         accessType: "temporary_url",

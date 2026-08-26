@@ -15,6 +15,44 @@ interface ResolvedProviderUrl {
   family: 4 | 6;
 }
 
+export const PROVIDER_RATE_LIMIT_MAX_RETRIES = 3;
+const PROVIDER_RATE_LIMIT_BASE_DELAY_MS = 2_000;
+const PROVIDER_RATE_LIMIT_MAX_DELAY_MS = 8_000;
+
+/** 读取 Provider 的 Retry-After，并在缺失时使用 2、4、8 秒指数退避。 */
+export function readProviderRateLimitDelayMs(value: string | null, retryCount: number): number {
+  const fallbackDelayMs = PROVIDER_RATE_LIMIT_BASE_DELAY_MS * (2 ** retryCount);
+  const numericSeconds = Number(value);
+  if (Number.isFinite(numericSeconds) && numericSeconds > 0) {
+    return Math.min(PROVIDER_RATE_LIMIT_MAX_DELAY_MS, Math.max(1_000, Math.ceil(numericSeconds * 1_000)));
+  }
+  if (value) {
+    const retryTimestamp = Date.parse(value);
+    if (Number.isFinite(retryTimestamp)) {
+      return Math.min(PROVIDER_RATE_LIMIT_MAX_DELAY_MS,
+        Math.max(1_000, Math.ceil(retryTimestamp - Date.now())));
+    }
+  }
+  return Math.min(PROVIDER_RATE_LIMIT_MAX_DELAY_MS, fallbackDelayMs);
+}
+
+/** 等待 Provider 限流冷却时间；任务取消或请求超时时立即结束等待。 */
+export async function waitForProviderRateLimit(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    }, delayMs);
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    signal?.addEventListener("abort", finish, { once: true });
+  });
+}
+
 /**
  * 创建固定到本次 DNS 结果的 Node lookup 回调。
  * Node 20 开启自动地址族选择时会传入 all=true，此时回调必须返回地址数组。
@@ -263,11 +301,33 @@ export async function providerFetch(
     let currentUrl: string | URL = url instanceof URL ? new URL(url.href) : url;
     let currentInit = init;
     let redirectCount = 0;
+    let rateLimitRetryCount = 0;
     let response: Response;
     while (true) {
       resolvedTarget = await resolveProviderUrl(currentUrl, options);
       response = await requestResolvedProvider(resolvedTarget, currentInit, timeoutController.signal);
       const requestMethod = String(currentInit.method ?? "GET").toUpperCase();
+      if (response.status === 429 && rateLimitRetryCount < PROVIDER_RATE_LIMIT_MAX_RETRIES) {
+        // 关键变量：优先服从上游 Retry-After，缺失时按当前重试次数指数退避。
+        const retryDelayMs = readProviderRateLimitDelayMs(
+          response.headers.get("retry-after"),
+          rateLimitRetryCount,
+        );
+        rateLimitRetryCount += 1;
+        options.logConnectionFailure?.({
+          日志关键字: "codex-flycloud-provider-rate-limit",
+          事件: "Provider请求被限流后等待重试",
+          请求方法: requestMethod,
+          请求路径: resolvedTarget.url.pathname,
+          响应状态码: response.status,
+          当前重试次数: rateLimitRetryCount,
+          最大重试次数: PROVIDER_RATE_LIMIT_MAX_RETRIES,
+          等待毫秒: retryDelayMs,
+        });
+        await response.body?.cancel();
+        await waitForProviderRateLimit(retryDelayMs, timeoutController.signal);
+        continue;
+      }
       const location = response.headers.get("location");
       if (!isProviderRedirectStatus(response.status) || !location || !["GET", "HEAD"].includes(requestMethod)) {
         break;
@@ -312,6 +372,17 @@ export async function providerFetch(
         响应状态码: response.status,
       });
       throw new ApiError(404, "provider_resource_not_found", "网盘目录或文件不存在，可能已经被移动或删除");
+    }
+    if (response.status === 429) {
+      options.logConnectionFailure?.({
+        日志关键字: "codex-flycloud-provider-rate-limit",
+        事件: "Provider限流重试后仍未恢复",
+        请求方法: init.method ?? "GET",
+        请求路径: resolvedTarget.url.pathname,
+        响应状态码: response.status,
+        已重试次数: rateLimitRetryCount,
+      });
+      throw new ApiError(503, "provider_rate_limited", "网盘访问频率受限，自动重试后仍未恢复，请稍后重新扫描");
     }
     if (!response.ok && response.status !== 207) {
       options.logConnectionFailure?.({

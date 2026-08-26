@@ -54,7 +54,14 @@ function readVideoMetadata(payload: unknown): TmdbVideoMetadata | null {
     || typeof metadata.title !== "string") {
     return null;
   }
-  return metadata as TmdbVideoMetadata;
+  // 关键变量：旧节目缓存没有地区字段，正常重新扫描时让它自然失效并重新读取 TMDB，不建立补全任务。
+  if (metadata.mediaType === "tv" && !Array.isArray(metadata.originCountries)) return null;
+  return {
+    ...metadata,
+    originCountries: Array.isArray(metadata.originCountries)
+      ? metadata.originCountries.map((country) => String(country).toUpperCase()).filter(Boolean)
+      : [],
+  } as TmdbVideoMetadata;
 }
 
 /** 判断数据库中的节目季缓存是否包含有效单集数组。 */

@@ -25,6 +25,7 @@ interface TmdbSearchCandidate {
   voteAverage: number;
   popularity: number;
   genreIds: number[];
+  originCountries: string[];
 }
 
 type TmdbDiagnosticLogger = (fields: Record<string, unknown>) => void;
@@ -102,6 +103,8 @@ export interface TmdbVideoMetadata {
   releaseDate: string;
   rating: number;
   genres: string[];
+  /** 节目的 TMDB origin_country；电影不参与地区媒体库分类。 */
+  originCountries: string[];
   posterUrl: string | null;
   backdropUrl: string | null;
   episodeCount: number;
@@ -651,6 +654,7 @@ export class TmdbKeyPool {
         voteAverage: toNumber(item.vote_average),
         popularity: toNumber(item.popularity),
         genreIds: toNumberArray(item.genre_ids),
+        originCountries: isMovie ? [] : readCountryCodes(item.origin_country),
       }];
     });
   }
@@ -730,6 +734,8 @@ export class TmdbKeyPool {
     const posterPath = toText(details.poster_path) || fallbackCandidate?.posterPath || "";
     const backdropPath = toText(details.backdrop_path) || fallbackCandidate?.backdropPath || "";
     const genreIds = fallbackCandidate?.genreIds ?? [];
+    // 关键变量：节目详情缺少地区时继续沿用搜索结果，电影始终不参与地区分类。
+    const detailOriginCountries = isMovie ? [] : readCountryCodes(details.origin_country);
     return {
       id,
       mediaType,
@@ -740,6 +746,11 @@ export class TmdbKeyPool {
       releaseDate: date,
       rating: toNumber(details.vote_average) || fallbackCandidate?.voteAverage || 0,
       genres: readGenres(details.genres, genreIds, mediaType),
+      originCountries: isMovie
+        ? []
+        : detailOriginCountries.length > 0
+          ? detailOriginCountries
+          : fallbackCandidate?.originCountries ?? [],
       posterUrl: buildImageUrl(posterPath, "w500"),
       backdropUrl: buildImageUrl(backdropPath, "w1280"),
       episodeCount: isMovie ? 0 : toPositiveNumber(details.number_of_episodes),
@@ -767,6 +778,7 @@ export class TmdbKeyPool {
       releaseDate: candidate.date,
       rating: candidate.voteAverage,
       genres: readGenres(undefined, candidate.genreIds, mediaType),
+      originCountries: mediaType === "tv" ? candidate.originCountries : [],
       posterUrl: buildImageUrl(candidate.posterPath, "w500"),
       backdropUrl: buildImageUrl(candidate.backdropPath, "w1280"),
       episodeCount: 0,
@@ -991,6 +1003,15 @@ function toNonNegativeNumber(value: unknown, fallback: number): number {
 /** 将未知数组转换为数字数组。 */
 function toNumberArray(value: unknown): number[] {
   return Array.isArray(value) ? value.map(toNumber).filter((item) => item > 0) : [];
+}
+
+/** 读取 TMDB 国家或地区代码数组，只保留非空 ISO 代码。 */
+function readCountryCodes(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => {
+    if (typeof item === "string") return item.trim().toUpperCase();
+    return toText(asRecord(item).iso_3166_1).trim().toUpperCase();
+  }).filter(Boolean))];
 }
 
 /** 将 TMDB 图片路径转换为公开图片地址。 */
