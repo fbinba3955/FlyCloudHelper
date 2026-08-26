@@ -10,6 +10,7 @@ import {
   type JobStatus,
   type ServiceStatus,
 } from "@/lib/api";
+import { formatJobDateTime } from "@/lib/job-duration";
 import { useApiResource } from "@/lib/use-api-resource";
 
 const serviceStatusLabels: Record<ServiceStatus, string> = {
@@ -94,6 +95,10 @@ export function OverviewPage() {
                     <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">{job.id} · {job.jobType === "media_probe" ? "视频规格分析" : `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`} · {job.stage}</p>
                   </div>
                   <StatusPill tone={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : job.status === "retry_waiting" || job.status === "paused" || job.status === "queued" ? "warning" : "primary"}>{job.status === "retry_waiting" && job.jobType === "media_probe" ? "等待重试" : jobStatusLabels[job.status]}</StatusPill>
+                </div>
+                <div className="mt-1.5 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2">
+                  <span>开始时间：{formatJobDateTime(job.startedAt)}</span>
+                  <span>结束时间：{formatJobDateTime(job.finishedAt)}</span>
                 </div>
                 <div className="mt-2.5 flex items-center gap-3">
                   <ProgressMeter value={job.processedCount} total={job.totalCount} />

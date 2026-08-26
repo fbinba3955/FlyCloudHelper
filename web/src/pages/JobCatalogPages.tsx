@@ -21,7 +21,7 @@ import {
   type ServiceListFilters,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
-import { formatJobDuration, getJobDurationLabel } from "@/lib/job-duration";
+import { formatJobDateTime, formatJobDuration, getJobDurationLabel } from "@/lib/job-duration";
 
 // 关键变量：后台任务页固定每 5 秒读取一次进度，避免轮询和 SSE 同时触发重复请求。
 const JOB_PROGRESS_REFRESH_INTERVAL_MS = 5_000;
@@ -435,7 +435,7 @@ function JobsView({ admin }: { admin: boolean }) {
           </Panel>
           <Panel title="任务列表" description={`共 ${resource.data?.total ?? 0} 个任务`}>
             <ul className="space-y-2">
-              {jobs.map((job) => <li key={job.id}><button type="button" onClick={() => setSelectedJobId(job.id)} className="w-full rounded-xl border border-border bg-secondary/40 p-3.5 text-left"><div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div className="min-w-0"><p className="truncate font-mono text-xs">{job.id}</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.serviceName} · {backgroundJobTypeLabels[job.jobType]} · {job.jobType === "scan" ? `${job.scanMode === "full" ? "全量" : "增量"} · ` : ""}{getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p><p className="mt-1 text-[11px] text-muted-foreground">{getJobDurationLabel(job.status)}：{formatJobDuration(job.elapsedMs)}</p></div><StatusPill tone={getJobTone(job.status)}>{getJobStatusLabel(job)}</StatusPill></div><div className="mt-2.5"><ProgressMeter value={job.status === "completed" ? 1 : job.processedCount} total={job.status === "completed" ? 1 : job.totalCount} /></div></button></li>)}
+              {jobs.map((job) => <li key={job.id}><button type="button" onClick={() => setSelectedJobId(job.id)} className="w-full rounded-xl border border-border bg-secondary/40 p-3.5 text-left"><div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div className="min-w-0"><p className="truncate font-mono text-xs">{job.id}</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.serviceName} · {backgroundJobTypeLabels[job.jobType]} · {job.jobType === "scan" ? `${job.scanMode === "full" ? "全量" : "增量"} · ` : ""}{getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p><p className="mt-1 text-[11px] text-muted-foreground">{getJobDurationLabel(job.status)}：{formatJobDuration(job.elapsedMs)}</p><div className="mt-1 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2"><span>开始时间：{formatJobDateTime(job.startedAt)}</span><span>结束时间：{formatJobDateTime(job.finishedAt)}</span></div></div><StatusPill tone={getJobTone(job.status)}>{getJobStatusLabel(job)}</StatusPill></div><div className="mt-2.5"><ProgressMeter value={job.status === "completed" ? 1 : job.processedCount} total={job.status === "completed" ? 1 : job.totalCount} /></div></button></li>)}
             </ul>
           </Panel>
         </div>
