@@ -587,10 +587,14 @@ export function ServiceConnectionPage({ serviceId, admin = false }: { serviceId:
         <Panel title="替换连接" description={providerDescriptor?.authenticationMode === "web_qr" ? "三方光鸭可使用扫码或验证码重新登录；官方光鸭由 Flymby APP 同步。" : "Secret 不回显，保存时必须提交一套完整新连接。"}>
           {providers.loading && <p className="text-sm text-muted-foreground">正在读取网盘连接配置…</p>}
           {providerDescriptor?.authenticationMode === "web_qr" ? (
-            <GuangyaAuthorizationPanel admin={admin} targetUserId={admin ? service.userId : undefined} resetKey={`${service.id}:${service.credentialRevision}`} initialLoginMode={service.connectionAuthMode ?? "web_qr"} onAuthorizationChange={(authorization) => void saveGuangyaConnection(authorization)} />
+            <>
+              <GuangyaAuthorizationPanel admin={admin} targetUserId={admin ? service.userId : undefined} resetKey={`${service.id}:${service.credentialRevision}`} initialLoginMode={service.connectionAuthMode ?? "web_qr"} onAuthorizationChange={(authorization) => void saveGuangyaConnection(authorization)} />
+              <ProviderConnectionGuide providerType={providerDescriptor.type} mode="replace" />
+            </>
           ) : providerDescriptor ? (
             <form onSubmit={(event) => void saveConnection(event)} className="grid gap-3">
               {providerDescriptor.connectionFields.map((field) => <label key={field.name}><span className="text-xs text-muted-foreground">{field.label}</span><input name={field.name} type={field.type === "password" ? "password" : field.type} required={field.required} autoComplete="off" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>)}
+              <ProviderConnectionGuide providerType={providerDescriptor.type} mode="replace" />
               <PrimaryButton type="submit">验证并保存连接</PrimaryButton>
             </form>
           ) : !providers.loading && <p className="text-sm text-destructive">当前网盘类型缺少连接描述</p>}
