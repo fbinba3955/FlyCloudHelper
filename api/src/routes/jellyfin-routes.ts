@@ -134,15 +134,18 @@ async function resolveFileAccess(runtime: ApiRuntime, service: Record<string, un
 /** 生成不包含转码能力的 PlaybackInfo。 */
 async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, context: JellyfinContext, request: FastifyRequest, itemId: string) {
   const service = await compatibility.requireEnabledService(context.serviceId);
-  const item = await runtime.repository.getCatalogItem(itemId, context.ownerUserId);
+  const internalItemId = compatibility.toInternalItemId(itemId);
+  const protocolItemId = compatibility.toProtocolItemId(internalItemId);
+  const item = await runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
   if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
-  const files = await runtime.repository.listItemFiles(itemId, context.ownerUserId);
+  const files = await runtime.repository.listItemFiles(internalItemId, context.ownerUserId);
   const requestedSource = readMediaSourceId(request);
+  const internalRequestedSource = compatibility.toInternalMediaSourceId(internalItemId, requestedSource);
   // 关键变量：节目查询可能连带返回所有单集文件，PlaybackInfo 只能暴露当前电影或单集自身的多版本文件。
-  const itemFiles = files.filter((candidate) => String(candidate.itemId) === itemId);
+  const itemFiles = files.filter((candidate) => String(candidate.itemId) === internalItemId);
   const playableFiles = itemFiles;
   const requestedFile = requestedSource
-    ? findPlaybackFile(playableFiles, itemId, requestedSource)
+    ? findPlaybackFile(playableFiles, internalItemId, internalRequestedSource)
     : undefined;
   if (requestedSource && !requestedFile) throw new ApiError(404, "jellyfin_media_source_not_found", "指定媒体源不存在");
   // 客户端带 MediaSourceId 重试时只解析指定版本；首次请求则返回当前条目的全部实际文件版本。
@@ -166,7 +169,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   const mediaSources: Array<Record<string, unknown>> = [];
   for (const file of candidateFiles) {
     const protocolMediaSourceId = toProtocolMediaSourceId(
-      itemId,
+      protocolItemId,
       String(playableFiles[0]?.fileId ?? ""),
       String(file.fileId),
     );
@@ -195,7 +198,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
       if (originAccess && !/^https?:\/\//iu.test(originAccess.url)) originAccess = null;
     }
     if (selectedRoute === "origin" && !originAccess) continue;
-    const directStreamUrl = buildJellyfinStreamUrl(itemId, protocolMediaSourceId, preference);
+    const directStreamUrl = buildJellyfinStreamUrl(protocolItemId, protocolMediaSourceId, preference);
     routeNames.add(selectedRoute === "origin" ? "Jellyfin原始跳转" : "服务器中转");
     mediaSources.push({
       ...buildStandardMediaSourceDefaults(),
@@ -219,19 +222,29 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   if (mediaSources.length === 0) throw new ApiError(409, "jellyfin_direct_play_unavailable", "当前媒体文件没有可用的直放地址");
   const playbackQuery = readQuery(request);
   const playSessionId = String(playbackQuery.playSessionId ?? playbackQuery.PlaySessionId ?? "") || randomUUID();
-  const selectedSourceId = requestedSource || String(mediaSources[0]?.Id ?? "");
+  const selectedSourceId = requestedSource
+    ? internalRequestedSource
+    : compatibility.toInternalMediaSourceId(internalItemId, String(mediaSources[0]?.Id ?? ""));
   const now = new Date().toISOString();
   // PlaybackInfo 先登记 created 会话；Playing、Progress、Stopped 将在相同会话上继续更新。
   await runtime.database.query("service_playback_sessions").insert({
-    id: playSessionId, service_id: context.serviceId, account_id: context.accountId, item_id: itemId,
+    id: playSessionId, service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId,
     media_source_id: selectedSourceId || null, status: "created", position_ticks: 0, paused: 0,
     started_at: now, updated_at: now, stopped_at: null,
   }).onConflict("id").ignore();
   runtime.logBusinessEvent("info", {
     日志关键字: "codex-jellyfin-compat", 事件: "生成Jellyfin直放信息", 服务ID: context.serviceId,
-    媒体条目ID: itemId, 播放路由: [...routeNames].join("+"), 路由偏好: preference, 媒体源数量: mediaSources.length,
+    媒体条目ID: internalItemId, 播放路由: [...routeNames].join("+"), 路由偏好: preference, 媒体源数量: mediaSources.length,
     影片规格是否全部完成: mediaSpecsReady,
     包含已完成规格媒体源数量: candidateFiles.filter((file) => mediaProbeByFileId.get(String(file.fileId)) !== null).length,
+  });
+  runtime.logBusinessEvent("info", {
+    日志关键字: "codex-jellyfin-standard-id",
+    事件: "标准UUID播放信息反向解析成功",
+    服务ID: context.serviceId,
+    协议条目ID: protocolItemId,
+    内部条目ID: internalItemId,
+    协议媒体源ID: String(mediaSources[0]?.Id ?? "无"),
   });
   return {
     MediaSources: mediaSources, PlaySessionId: playSessionId, ErrorCode: null,
@@ -286,12 +299,13 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompa
   const effectiveRoute = requestedRoute === "auto"
     ? jellyfinRelayPlaybackEnabled ? "server" : "origin"
     : requestedRoute;
-  const item = await runtime.repository.getCatalogItem(itemId, context.ownerUserId);
+  const internalItemId = compatibility.toInternalItemId(itemId);
+  const item = await runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
   if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
-  const files = await runtime.repository.listItemFiles(itemId, context.ownerUserId);
-  const fileId = readMediaSourceId(request);
-  const itemFiles = files.filter((candidate) => String(candidate.itemId) === itemId);
-  const file = findPlaybackFile(itemFiles, itemId, fileId);
+  const files = await runtime.repository.listItemFiles(internalItemId, context.ownerUserId);
+  const fileId = compatibility.toInternalMediaSourceId(internalItemId, readMediaSourceId(request));
+  const itemFiles = files.filter((candidate) => String(candidate.itemId) === internalItemId);
+  const file = findPlaybackFile(itemFiles, internalItemId, fileId);
   if (!file) throw new ApiError(404, "jellyfin_media_source_not_found", "媒体源不存在");
   const locator = file.playbackLocator && typeof file.playbackLocator === "object"
     ? file.playbackLocator as Record<string, unknown>
@@ -340,7 +354,7 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompa
     reply.status(upstream.statusCode);
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-jellyfin-compat", 事件: "建立Jellyfin服务器直放连接", 服务ID: context.serviceId,
-      媒体条目ID: itemId, 源文件ID: String(file.fileId), 是否Range请求: Boolean(request.headers.range), 上游状态码: upstream.statusCode,
+      媒体条目ID: internalItemId, 源文件ID: String(file.fileId), 是否Range请求: Boolean(request.headers.range), 上游状态码: upstream.statusCode,
     });
     return reply.send(upstream.body);
   } finally {
@@ -399,7 +413,10 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
     const context = await authenticated(request);
     const params = request.params as { userId: string; itemId: string };
     requireProtocolUser(context, params.userId);
-    const sourceItem = await runtime.repository.getCatalogItem(params.itemId, context.ownerUserId);
+    const sourceItem = await runtime.repository.getCatalogItem(
+      compatibility.toInternalItemId(params.itemId),
+      context.ownerUserId,
+    );
     const item = await hydrateRealtimeVideoDetails(runtime, sourceItem);
     const parent = item.itemType === "video.episode"
       ? await runtime.database.query("media_relations").where({ child_item_id: item.id }).first()
@@ -418,7 +435,7 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
   server.get(`${prefix}/Items/:itemId`, async (request) => {
     const context = await authenticated(request);
     const sourceItem = await runtime.repository.getCatalogItem(
-      String((request.params as { itemId: string }).itemId),
+      compatibility.toInternalItemId(String((request.params as { itemId: string }).itemId)),
       context.ownerUserId,
     );
     return compatibility.mapItem(context, await hydrateRealtimeVideoDetails(runtime, sourceItem));
@@ -426,7 +443,8 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
   server.get(`${prefix}/Items`, async (request) => compatibility.listItems(await authenticated(request), readQuery(request)));
   server.get(`${prefix}/Items/:itemId/Ancestors`, async (request) => {
     const context = await authenticated(request);
-    const item = await runtime.repository.getCatalogItem(String((request.params as { itemId: string }).itemId), context.ownerUserId);
+    const protocolItemId = String((request.params as { itemId: string }).itemId);
+    const item = await runtime.repository.getCatalogItem(compatibility.toInternalItemId(protocolItemId), context.ownerUserId);
     if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
     if (item.itemType !== "video.episode") return [compatibility.mapItemLibrary(context, item)];
     const relation = await runtime.database.query("media_relations").where({ child_item_id: item.id }).first();
