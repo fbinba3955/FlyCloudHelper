@@ -81,10 +81,55 @@ export class ServiceAccessService {
     };
   }
 
+  /** 按创建时间读取一个服务的全部协议账号，历史账号始终排在第一位。 */
+  public async listByService(serviceId: string): Promise<ServiceAccessAccountRecord[]> {
+    const rows = await this.database.query("service_access_accounts")
+      .where({ service_id: serviceId })
+      .orderBy("created_at", "asc")
+      .orderBy("id", "asc");
+    return rows.map((row) => this.mapAccount(row));
+  }
+
   /** 读取服务账号公开状态。 */
   public async getByService(serviceId: string): Promise<ServiceAccessAccountRecord> {
-    const row = await this.database.query("service_access_accounts").where({ service_id: serviceId }).first();
+    const row = await this.database.query("service_access_accounts")
+      .where({ service_id: serviceId })
+      .orderBy("created_at", "asc")
+      .orderBy("id", "asc")
+      .first();
     if (!row) throw new ApiError(404, "service_access_account_not_found", "服务访问账号不存在");
+    return this.mapAccount(row);
+  }
+
+  /** 为同一 Jellyfin 地址创建新的独立登录账号。 */
+  public async createAccount(serviceId: string, input: { username: unknown; password?: unknown }): Promise<ServiceAccessAccountRecord> {
+    const username = validateServiceAccessUsername(input.username);
+    const password = input.password === undefined ? "" : validateServiceAccessPassword(input.password);
+    const accountId = randomUUID();
+    const now = new Date().toISOString();
+    try {
+      await this.database.query("service_access_accounts").insert({
+        id: accountId,
+        service_id: serviceId,
+        username,
+        username_lookup: createUsernameLookup(username),
+        password_hash: await hashPassword(password),
+        password_required: password.length > 0 ? 1 : 0,
+        credential_revision: 1,
+        status: "active",
+        created_at: now,
+        updated_at: now,
+      });
+    } catch (error) {
+      this.throwUsernameConflict(error);
+    }
+    return this.getById(serviceId, accountId);
+  }
+
+  /** 读取服务下的指定协议账号，避免账号 ID 越过媒体库边界。 */
+  public async getById(serviceId: string, accountId: string): Promise<ServiceAccessAccountRecord> {
+    const row = await this.database.query("service_access_accounts").where({ id: accountId, service_id: serviceId }).first();
+    if (!row) throw new ApiError(404, "service_access_account_not_found", "Jellyfin 账号不存在");
     return this.mapAccount(row);
   }
 
@@ -109,9 +154,9 @@ export class ServiceAccessService {
   }
 
   /** 修改用户名或密码，并让所有协议的旧会话立即失效。 */
-  public async updateCredentials(serviceId: string, input: { username?: unknown; password?: unknown }): Promise<ServiceAccessAccountRecord> {
+  public async updateCredentials(serviceId: string, accountId: string, input: { username?: unknown; password?: unknown }): Promise<ServiceAccessAccountRecord> {
     return this.database.query.transaction(async (transaction) => {
-      const row = await transaction("service_access_accounts").where({ service_id: serviceId }).first();
+      const row = await transaction("service_access_accounts").where({ id: accountId, service_id: serviceId }).first();
       if (!row) throw new ApiError(404, "service_access_account_not_found", "服务访问账号不存在");
       const patch: Record<string, unknown> = { credential_revision: Number(row.credential_revision) + 1, updated_at: new Date().toISOString() };
       if (input.username !== undefined) {
@@ -126,25 +171,80 @@ export class ServiceAccessService {
       if (input.username === undefined && input.password === undefined) {
         throw validationError("credentials", "至少需要修改用户名或密码中的一项");
       }
-      await transaction("service_access_accounts").where({ id: row.id }).update(patch);
+      try {
+        await transaction("service_access_accounts").where({ id: row.id }).update(patch);
+      } catch (error) {
+        this.throwUsernameConflict(error);
+      }
       await transaction("service_protocol_sessions").where({ account_id: row.id }).whereNull("revoked_at").update({ revoked_at: String(patch.updated_at) });
       return this.mapAccount({ ...row, ...patch });
     });
   }
 
   /** 重置随机密码，明文只在本次响应中返回。 */
-  public async resetPassword(serviceId: string): Promise<GeneratedServiceAccessCredentials> {
+  public async resetPassword(serviceId: string, accountId: string): Promise<GeneratedServiceAccessCredentials> {
     const password = generateServiceAccessPassword();
-    const account = await this.updateCredentials(serviceId, { password });
+    const account = await this.updateCredentials(serviceId, accountId, { password });
     return { account, password };
   }
 
+  /** 启用或停用指定账号；停用时撤销该账号全部协议会话。 */
+  public async updateStatus(serviceId: string, accountId: string, status: unknown): Promise<ServiceAccessAccountRecord> {
+    if (status !== "active" && status !== "disabled") {
+      throw validationError("status", "Jellyfin 账号状态不正确");
+    }
+    const account = await this.getById(serviceId, accountId);
+    if (account.status === status) return account;
+    if (status === "disabled") {
+      const activeCountRow = await this.database.query("service_access_accounts")
+        .where({ service_id: serviceId, status: "active" })
+        .count<{ count: string | number }[]>({ count: "id" })
+        .first();
+      if (Number(activeCountRow?.count ?? 0) <= 1) {
+        throw new ApiError(409, "last_active_service_access_account", "至少需要保留一个启用的 Jellyfin 账号");
+      }
+    }
+    const now = new Date().toISOString();
+    await this.database.query.transaction(async (transaction) => {
+      await transaction("service_access_accounts").where({ id: accountId, service_id: serviceId }).update({ status, updated_at: now });
+      if (status === "disabled") {
+        await transaction("service_protocol_sessions").where({ account_id: accountId }).whereNull("revoked_at").update({ revoked_at: now });
+      }
+    });
+    return this.getById(serviceId, accountId);
+  }
+
+  /** 删除指定账号及其独立会话和观看记录，但始终保留至少一个账号。 */
+  public async deleteAccount(serviceId: string, accountId: string): Promise<void> {
+    await this.getById(serviceId, accountId);
+    const countRow = await this.database.query("service_access_accounts")
+      .where({ service_id: serviceId })
+      .count<{ count: string | number }[]>({ count: "id" })
+      .first();
+    if (Number(countRow?.count ?? 0) <= 1) {
+      throw new ApiError(409, "last_service_access_account", "至少需要保留一个 Jellyfin 账号");
+    }
+    const deleted = await this.database.query("service_access_accounts").where({ id: accountId, service_id: serviceId }).delete();
+    if (deleted !== 1) throw new ApiError(404, "service_access_account_not_found", "Jellyfin 账号不存在");
+  }
+
   /** 撤销当前服务的指定协议会话，不删除播放记录。 */
-  public async revokeSessions(serviceId: string, protocol?: "jellyfin" | "emby"): Promise<number> {
+  public async revokeSessions(serviceId: string, protocol?: "jellyfin" | "emby", accountId?: string): Promise<number> {
     const now = new Date().toISOString();
     const query = this.database.query("service_protocol_sessions").where({ service_id: serviceId }).whereNull("revoked_at");
     if (protocol) query.where({ protocol });
+    if (accountId) query.where({ account_id: accountId });
     return query.update({ revoked_at: now });
+  }
+
+  /** 将数据库唯一约束错误转换成稳定的同媒体库用户名冲突提示。 */
+  private throwUsernameConflict(error: unknown): never {
+    const databaseError = error as Error & { code?: string };
+    const duplicate = databaseError.code === "23505"
+      || databaseError.code === "ER_DUP_ENTRY"
+      || /unique|duplicate/iu.test(databaseError.message);
+    if (duplicate) throw new ApiError(409, "service_access_username_conflict", "当前媒体库已经存在相同用户名");
+    throw error;
   }
 
   /** 将数据库行转换为公开账号状态。 */

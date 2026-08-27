@@ -1527,6 +1527,20 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     });
   }
 
+  server.delete<{ Body: Record<string, unknown> }>("/api/v1/scan-jobs/completed", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    requireConfirmation(request.body, "completed");
+    const result = await runtime.repository.deleteCompletedJobs(user.id);
+    for (const job of result.scanJobs) await runtime.failureReports.remove(job);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-job-clear",
+      事件: "用户清除已完成任务",
+      用户ID: user.id,
+      删除任务数量: result.deletedCount,
+    });
+    return { deletedCount: result.deletedCount };
+  });
+
   server.delete<{ Params: { jobId: string }; Body: Record<string, unknown> }>("/api/v1/scan-jobs/:jobId", async (request, reply) => {
     const user = await requireRequestUser(request, runtime.database);
     requireConfirmation(request.body, request.params.jobId);

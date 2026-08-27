@@ -103,7 +103,7 @@ export class ScanFailureReportService {
   }
 
   /** 删除任务时同步清理对应报告，避免任务不存在后遗留不可访问文件。 */
-  public async remove(job: ScanJobRecord): Promise<void> {
+  public async remove(job: Pick<ScanJobRecord, "id" | "userId" | "serviceId">): Promise<void> {
     this.recordIdsByJob.delete(job.id);
     try {
       await fs.rm(this.getReportPath(job.userId, job.id), { force: true });

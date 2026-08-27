@@ -230,6 +230,17 @@ export interface CreateCloudServiceInput {
   userId?: string;
 }
 
+export interface ServiceAccessAccount {
+  id: string;
+  serviceId: string;
+  username: string;
+  hasPassword: boolean;
+  credentialRevision: number;
+  status: "active" | "disabled";
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ServiceAccessSettings {
   relayPlaybackSupported: boolean;
   appRelayPlaybackEnabled: boolean;
@@ -241,16 +252,10 @@ export interface ServiceAccessSettings {
   jellyfinPath: string;
   /** 固定 /j/ 前缀之后的单层可编辑地址后缀。 */
   jellyfinPathSuffix: string;
-  account: {
-    id: string;
-    serviceId: string;
-    username: string;
-    hasPassword: boolean;
-    credentialRevision: number;
-    status: "active" | "disabled";
-    createdAt: string;
-    updatedAt: string;
-  };
+  /** 历史最早账号，保留给旧版客户端读取。 */
+  account: ServiceAccessAccount;
+  /** 同一个 Jellyfin 地址下按创建时间排列的全部账号。 */
+  accounts: ServiceAccessAccount[];
 }
 
 export interface CreateCloudServiceResult {
@@ -294,12 +299,12 @@ export interface ScanJob {
   updatedAt: string;
 }
 
-/** 服务级全量或增量扫描定时任务。 */
+/** 服务级扫描或视频规格分析定时任务。 */
 export interface ScanSchedule {
   id: string;
   userId: string;
   serviceId: string;
-  scanMode: "incremental" | "full";
+  scanMode: "incremental" | "full" | "media_probe";
   enabled: boolean;
   scheduleType: ScanScheduleType;
   intervalMinutes: number | null;
@@ -307,6 +312,9 @@ export interface ScanSchedule {
   dayOfWeek: number | null;
   dayOfMonth: number | null;
   timezoneOffsetMinutes: number;
+  quietPeriodEnabled: boolean;
+  quietStartTime: string | null;
+  quietEndTime: string | null;
   nextRunAt: string | null;
   lastTriggeredAt: string | null;
   lastJobId: string | null;
@@ -323,6 +331,9 @@ export interface UpdateScanScheduleInput {
   dayOfWeek: number;
   dayOfMonth: number;
   timezoneOffsetMinutes: number;
+  quietPeriodEnabled: boolean;
+  quietStartTime: string;
+  quietEndTime: string;
 }
 
 /** 视频规格后台任务详情中的失败文件。 */
@@ -751,7 +762,7 @@ export async function createScanJob(serviceId: string, scanMode: "incremental" |
   return result.job;
 }
 
-/** 读取服务的全量和增量扫描计划。 */
+/** 读取服务的扫描和视频规格分析计划。 */
 export async function getServiceScanSchedules(serviceId: string, admin = false): Promise<ScanSchedule[]> {
   const result = await requestJson<{ schedules: ScanSchedule[] }>(
     admin ? `/api/v1/admin/services/${serviceId}/scan-schedules` : `/api/v1/services/${serviceId}/scan-schedules`,
@@ -759,10 +770,10 @@ export async function getServiceScanSchedules(serviceId: string, admin = false):
   return result.schedules;
 }
 
-/** 保存一个扫描模式的定时计划。 */
+/** 保存一种后台任务的定时计划。 */
 export async function updateServiceScanSchedule(
   serviceId: string,
-  scanMode: "incremental" | "full",
+  scanMode: "incremental" | "full" | "media_probe",
   input: UpdateScanScheduleInput,
   admin = false,
 ): Promise<ScanSchedule> {
@@ -823,6 +834,15 @@ export async function deleteScanJob(jobId: string, admin = false): Promise<void>
     method: "DELETE",
     body: JSON.stringify({ confirmation: jobId }),
   });
+}
+
+/** 清除当前用户或管理范围内的全部已完成后台任务。 */
+export async function clearCompletedScanJobs(admin = false): Promise<number> {
+  const result = await requestJson<{ deletedCount: number }>(
+    admin ? "/api/v1/admin/jobs/completed" : "/api/v1/scan-jobs/completed",
+    { method: "DELETE", body: JSON.stringify({ confirmation: "completed" }) },
+  );
+  return result.deletedCount;
 }
 
 /** 下载任务级扫描刮削失败报告，并使用服务端文件名保存到本地。 */
@@ -982,6 +1002,49 @@ export async function getServiceAccessSettings(serviceId: string, admin = false)
 export async function updateServiceAccessCredentials(serviceId: string, input: { username?: string; password?: string }, admin = false): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/access-account` : `/api/v1/services/${serviceId}/access-account`, { method: "PATCH", body: JSON.stringify(input) });
   return result.settings;
+}
+
+/** 为当前媒体库的同一个 Jellyfin 地址新增登录账号。 */
+export async function createServiceAccessAccount(
+  serviceId: string,
+  input: { username: string; password?: string },
+  admin = false,
+): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(
+    admin ? `/api/v1/admin/services/${serviceId}/access-accounts` : `/api/v1/services/${serviceId}/access-accounts`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return result.settings;
+}
+
+/** 修改、启用或停用指定 Jellyfin 账号。 */
+export async function updateServiceAccessAccount(
+  serviceId: string,
+  accountId: string,
+  input: { username?: string; password?: string; status?: "active" | "disabled" },
+  admin = false,
+): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(
+    admin ? `/api/v1/admin/services/${serviceId}/access-accounts/${accountId}` : `/api/v1/services/${serviceId}/access-accounts/${accountId}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+  return result.settings;
+}
+
+/** 删除指定 Jellyfin 账号及其独立观看记录。 */
+export function deleteServiceAccessAccount(serviceId: string, accountId: string, admin = false): Promise<void> {
+  return requestJson(
+    admin ? `/api/v1/admin/services/${serviceId}/access-accounts/${accountId}` : `/api/v1/services/${serviceId}/access-accounts/${accountId}`,
+    { method: "DELETE", body: JSON.stringify({ confirmation: accountId }) },
+  );
+}
+
+/** 仅撤销指定 Jellyfin 账号的全部登录会话。 */
+export function revokeServiceAccessAccountSessions(serviceId: string, accountId: string, admin = false): Promise<{ revokedCount: number }> {
+  return requestJson(
+    admin ? `/api/v1/admin/services/${serviceId}/access-accounts/${accountId}/revoke-sessions` : `/api/v1/services/${serviceId}/access-accounts/${accountId}/revoke-sessions`,
+    { method: "POST", body: "{}" },
+  );
 }
 
 /** 重置服务协议密码，明文只在本次响应返回。 */

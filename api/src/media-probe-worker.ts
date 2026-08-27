@@ -299,9 +299,10 @@ export class MediaProbeWorker {
         .orderBy("p.created_at", "asc")
         .limit(20);
       for (const row of candidates) {
-        // 手动补齐和重新授权恢复是显式任务；只有扫描产生的规格任务受服务开关控制。
+        // 手动、定时和重新授权恢复都是显式任务；只有扫描自动产生的规格任务受服务开关控制。
         if (!isMediaProbeEnabled(row.configuration_json)
           && row.trigger_type !== "manual_backfill"
+          && row.trigger_type !== "scheduled"
           && row.trigger_type !== "reauthorized") continue;
         const changed = await transaction("media_file_probes")
           .where({ source_file_id: row.source_file_id })

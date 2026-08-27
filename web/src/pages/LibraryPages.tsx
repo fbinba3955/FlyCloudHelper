@@ -1,17 +1,20 @@
 import { Link } from "@tanstack/react-router";
-import { Copy, Images, Settings2, Trash2 } from "lucide-react";
+import { Copy, Images, Pencil, Plus, Settings2, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { MediaCatalogView, type MediaCatalogQuery } from "@/components/MediaCatalogView";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, StatCard, StatusPill } from "@/components/ui-kit";
 import {
   clearServiceCatalog,
+  createServiceAccessAccount,
+  deleteServiceAccessAccount,
   getService,
   getServiceAccessSettings,
   listAdminServiceItems,
   listLibraryItems,
-  revokeServiceAccessSessions,
-  updateServiceAccessCredentials,
+  revokeServiceAccessAccountSessions,
+  type ServiceAccessAccount,
+  updateServiceAccessAccount,
   updateServiceJellyfinSettings,
   updateLibraryPlaybackSettings,
 } from "@/lib/api";
@@ -185,15 +188,18 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
   const [updatingRegionLibraries, setUpdatingRegionLibraries] = useState(false);
   const [savingJellyfinPath, setSavingJellyfinPath] = useState(false);
   const [jellyfinPathSuffix, setJellyfinPathSuffix] = useState("");
-  const [accessUsername, setAccessUsername] = useState("");
-  const [newAccessPassword, setNewAccessPassword] = useState("");
+  const [showCreateAccount, setShowCreateAccount] = useState(false);
+  const [newAccountUsername, setNewAccountUsername] = useState("");
+  const [newAccountPassword, setNewAccountPassword] = useState("");
+  const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
+  const [editingAccountUsername, setEditingAccountUsername] = useState("");
+  const [editingAccountPassword, setEditingAccountPassword] = useState("");
+  const [pendingAccountAction, setPendingAccountAction] = useState<string | null>(null);
+  // 关键变量：账号操作同步写入引用，拦截 React 更新按钮状态之前的重复提交。
+  const pendingAccountActionRef = useRef<string | null>(null);
   const service = resource.data?.service;
   const settings = resource.data?.settings;
   const settingsPath = admin ? "/admin/libraries/$serviceId/settings" : "/app/libraries/$serviceId/settings";
-
-  useEffect(() => {
-    if (settings?.account.username) setAccessUsername(settings.account.username);
-  }, [settings?.account.username]);
 
   useEffect(() => {
     if (settings?.jellyfinPathSuffix) setJellyfinPathSuffix(settings.jellyfinPathSuffix);
@@ -261,36 +267,132 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     }
   }
 
-  /** 保存媒体库的 Jellyfin 访问用户名和可选密码。 */
-  async function saveAccessCredentials(event: FormEvent<HTMLFormElement>): Promise<void> {
+  /** 占用全页账号操作槽，避免多个账号操作和刷新互相覆盖。 */
+  function beginAccountAction(action: string): boolean {
+    if (pendingAccountActionRef.current) return false;
+    pendingAccountActionRef.current = action;
+    setPendingAccountAction(action);
+    return true;
+  }
+
+  /** 释放账号操作槽。 */
+  function finishAccountAction(): void {
+    pendingAccountActionRef.current = null;
+    setPendingAccountAction(null);
+  }
+
+  /** 创建共享当前 Jellyfin 地址的新登录账号。 */
+  async function createAccessAccount(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    if (!settings) return;
-    const input: { username?: string; password?: string } = {};
-    if (accessUsername !== settings.account.username) input.username = accessUsername;
-    // 关键变量：已有密码时保存空值表示切换为免密码；默认免密码时空输入不重复提交。
-    if (newAccessPassword.length > 0 || settings.account.hasPassword) input.password = newAccessPassword;
-    if (input.username === undefined && input.password === undefined) {
-      setMessage("访问用户名和密码均未修改");
-      return;
-    }
+    if (!settings || !beginAccountAction("create")) return;
     try {
-      await updateServiceAccessCredentials(serviceId, input, admin);
-      setNewAccessPassword("");
-      setMessage(newAccessPassword.length > 0 ? "Jellyfin 访问凭据已保存" : "Jellyfin 已改为免密码登录");
+      await createServiceAccessAccount(serviceId, {
+        username: newAccountUsername,
+        password: newAccountPassword,
+      }, admin);
+      setNewAccountUsername("");
+      setNewAccountPassword("");
+      setShowCreateAccount(false);
+      setMessage("Jellyfin 账号已创建，可使用同一个服务地址登录");
       await resource.refresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Jellyfin 访问凭据保存失败");
+      setMessage(error instanceof Error ? error.message : "创建 Jellyfin 账号失败");
+    } finally {
+      finishAccountAction();
     }
   }
 
-  /** 二次确认后撤销当前媒体库的全部 Jellyfin 会话。 */
-  async function revokeAccessSessions(): Promise<void> {
-    if (!window.confirm("确定撤销当前媒体库的全部 Jellyfin 会话吗？播放记录不会删除。")) return;
+  /** 打开指定账号的用户名和密码编辑区。 */
+  function beginEditAccount(account: ServiceAccessAccount): void {
+    setEditingAccountId(account.id);
+    setEditingAccountUsername(account.username);
+    setEditingAccountPassword("");
+  }
+
+  /** 保存指定 Jellyfin 账号的用户名和可选新密码。 */
+  async function saveAccessAccount(event: FormEvent<HTMLFormElement>, account: ServiceAccessAccount): Promise<void> {
+    event.preventDefault();
+    if (!settings || !beginAccountAction(`save:${account.id}`)) return;
+    const input: { username?: string; password?: string } = {};
+    if (editingAccountUsername !== account.username) input.username = editingAccountUsername;
+    // 关键变量：编辑时密码留空表示不修改，避免仅改用户名时意外清空现有密码。
+    if (editingAccountPassword.length > 0) input.password = editingAccountPassword;
+    if (input.username === undefined && input.password === undefined) {
+      setMessage("访问用户名和密码均未修改");
+      finishAccountAction();
+      return;
+    }
     try {
-      const result = await revokeServiceAccessSessions(serviceId, admin);
-      setMessage(`已撤销 ${result.revokedCount} 个 Jellyfin 会话`);
+      await updateServiceAccessAccount(serviceId, account.id, input, admin);
+      setEditingAccountId(null);
+      setEditingAccountPassword("");
+      setMessage(`账号“${editingAccountUsername}”已保存，原登录会话已撤销`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Jellyfin 访问凭据保存失败");
+    } finally {
+      finishAccountAction();
+    }
+  }
+
+  /** 将指定账号改为免密码登录，同时撤销其旧会话。 */
+  async function clearAccessAccountPassword(account: ServiceAccessAccount): Promise<void> {
+    if (!account.hasPassword || !window.confirm(`确定把账号“${account.username}”改为免密码登录吗？`)) return;
+    if (!beginAccountAction(`passwordless:${account.id}`)) return;
+    try {
+      await updateServiceAccessAccount(serviceId, account.id, { password: "" }, admin);
+      setMessage(`账号“${account.username}”已改为免密码登录`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "切换免密码登录失败");
+    } finally {
+      finishAccountAction();
+    }
+  }
+
+  /** 启用或停用指定账号，停用前需要二次确认。 */
+  async function toggleAccessAccountStatus(account: ServiceAccessAccount): Promise<void> {
+    const nextStatus = account.status === "active" ? "disabled" : "active";
+    if (nextStatus === "disabled" && !window.confirm(`确定停用账号“${account.username}”吗？该账号现有 Jellyfin 会话会被撤销。`)) return;
+    if (!beginAccountAction(`status:${account.id}`)) return;
+    try {
+      await updateServiceAccessAccount(serviceId, account.id, { status: nextStatus }, admin);
+      setMessage(`账号“${account.username}”已${nextStatus === "active" ? "启用" : "停用"}`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "修改 Jellyfin 账号状态失败");
+    } finally {
+      finishAccountAction();
+    }
+  }
+
+  /** 二次确认后只撤销指定账号的 Jellyfin 会话。 */
+  async function revokeAccessAccountSessions(account: ServiceAccessAccount): Promise<void> {
+    if (!window.confirm(`确定撤销账号“${account.username}”的全部 Jellyfin 会话吗？观看记录不会删除。`)) return;
+    if (!beginAccountAction(`sessions:${account.id}`)) return;
+    try {
+      const result = await revokeServiceAccessAccountSessions(serviceId, account.id, admin);
+      setMessage(`账号“${account.username}”已撤销 ${result.revokedCount} 个会话`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Jellyfin 会话撤销失败");
+    } finally {
+      finishAccountAction();
+    }
+  }
+
+  /** 二次确认后删除账号及其独立观看记录。 */
+  async function deleteAccessAccount(account: ServiceAccessAccount): Promise<void> {
+    if (!window.confirm(`确定删除账号“${account.username}”吗？该账号的会话、观看进度和播放历史都会删除，此操作无法撤销。`)) return;
+    if (!beginAccountAction(`delete:${account.id}`)) return;
+    try {
+      await deleteServiceAccessAccount(serviceId, account.id, admin);
+      if (editingAccountId === account.id) setEditingAccountId(null);
+      setMessage(`账号“${account.username}”及其独立观看记录已删除`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "删除 Jellyfin 账号失败");
+    } finally {
+      finishAccountAction();
     }
   }
 
@@ -298,6 +400,9 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取 Jellyfin 配置…"}</div></Panel>;
   }
   const jellyfinAddress = settings.jellyfinUrl ?? `云助手 API 地址${settings.jellyfinPath}`;
+  // 关键变量：旧服务响应没有 accounts 时仍把历史单账号作为列表中的第一个账号显示。
+  const accessAccounts = settings.accounts?.length > 0 ? settings.accounts : [settings.account];
+  const activeAccountCount = accessAccounts.filter((account) => account.status === "active").length;
   return (
     <>
       <PageHeader title={`${service.displayName} · Jellyfin 配置`} actions={<Link to={settingsPath} params={{ serviceId }}><SecondaryButton>返回媒体库设置</SecondaryButton></Link>} />
@@ -330,7 +435,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
         </div>
         <p className="mt-3 text-xs text-muted-foreground">已有节目没有地区数据时归入“其他节目”；后续正常扫描会按刮削结果更新，不增加单独的地区补全任务。</p>
       </Panel>
-      <Panel title="服务地址与账号" className="mt-4">
+      <Panel title="服务地址" className="mt-4">
         <div className="rounded-xl border border-border bg-secondary/35 p-4">
           <form onSubmit={(event) => void saveJellyfinPath(event)}>
             <p className="text-xs text-muted-foreground">Jellyfin 服务地址</p>
@@ -347,14 +452,59 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
             <p className="min-w-0 break-all font-mono text-xs">{jellyfinAddress}</p>
             <SecondaryButton type="button" onClick={() => void copyLibraryText(settings.jellyfinUrl ?? settings.jellyfinPath).then(() => setMessage(settings.jellyfinUrl ? "Jellyfin 服务地址已复制" : "Jellyfin 服务路径已复制"))}><Copy className="size-4" /> 复制</SecondaryButton>
           </div>
-          <form onSubmit={(event) => void saveAccessCredentials(event)} className="mt-4 grid gap-3 border-t border-border pt-4 md:grid-cols-2">
-            <label><span className="text-xs text-muted-foreground">访问用户名</span><input value={accessUsername} minLength={4} maxLength={255} onChange={(event) => setAccessUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
-            <label><span className="text-xs text-muted-foreground">访问密码（可选，默认免密码）</span><input value={newAccessPassword} type="password" autoComplete="new-password" placeholder={settings.account.hasPassword ? "留空保存可切换为免密码" : "当前无需密码"} onChange={(event) => setNewAccessPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+        </div>
+      </Panel>
+      <Panel
+        title="Jellyfin 账号"
+        description={`共 ${accessAccounts.length} 个账号，共享同一个服务地址，观看记录按账号独立保存。`}
+        className="mt-4"
+        action={<SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => setShowCreateAccount((value) => !value)}><Plus className="size-4" /> 添加账号</SecondaryButton>}
+      >
+        {showCreateAccount && (
+          <form onSubmit={(event) => void createAccessAccount(event)} className="mb-4 grid gap-3 rounded-xl border border-border bg-secondary/35 p-4 md:grid-cols-2">
+            <label><span className="text-xs text-muted-foreground">新账号用户名</span><input value={newAccountUsername} required minLength={4} maxLength={255} onChange={(event) => setNewAccountUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+            <label><span className="text-xs text-muted-foreground">登录密码（可选）</span><input value={newAccountPassword} type="password" autoComplete="new-password" placeholder="留空则无需密码" onChange={(event) => setNewAccountPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
             <div className="flex flex-wrap gap-2 md:col-span-2">
-              <PrimaryButton type="submit"><Settings2 className="size-4" /> 保存访问设置</PrimaryButton>
-              <SecondaryButton type="button" onClick={() => void revokeAccessSessions()}>撤销全部会话</SecondaryButton>
+              <PrimaryButton type="submit" disabled={pendingAccountAction !== null}><Plus className="size-4" /> {pendingAccountAction === "create" ? "正在创建…" : "创建账号"}</PrimaryButton>
+              <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => setShowCreateAccount(false)}>取消</SecondaryButton>
             </div>
           </form>
+        )}
+        <div className="space-y-3">
+          {accessAccounts.map((account, index) => {
+            const editing = editingAccountId === account.id;
+            const accountPending = pendingAccountAction?.endsWith(account.id) ?? false;
+            return (
+              <article key={account.id} className="rounded-xl border border-border bg-secondary/35 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="truncate text-sm font-medium">{account.username}</p>
+                      <StatusPill tone={account.status === "active" ? "success" : "neutral"}>{account.status === "active" ? "已启用" : "已停用"}</StatusPill>
+                    </div>
+                    <p className="mt-1 text-[11px] text-muted-foreground">{index === 0 ? "第一个账号 · " : ""}{account.hasPassword ? "需要密码" : "免密码"} · 凭据 r{account.credentialRevision}</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => beginEditAccount(account)}><Pencil className="size-4" /> 编辑</SecondaryButton>
+                    <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => void revokeAccessAccountSessions(account)}>撤销会话</SecondaryButton>
+                    <SecondaryButton type="button" disabled={pendingAccountAction !== null || (account.status === "active" && activeAccountCount <= 1)} onClick={() => void toggleAccessAccountStatus(account)}>{account.status === "active" ? "停用" : "启用"}</SecondaryButton>
+                    <button type="button" disabled={pendingAccountAction !== null || accessAccounts.length <= 1} onClick={() => void deleteAccessAccount(account)} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {accountPending && pendingAccountAction?.startsWith("delete:") ? "正在删除…" : "删除"}</button>
+                  </div>
+                </div>
+                {editing && (
+                  <form onSubmit={(event) => void saveAccessAccount(event, account)} className="mt-4 grid gap-3 border-t border-border pt-4 md:grid-cols-2">
+                    <label><span className="text-xs text-muted-foreground">访问用户名</span><input value={editingAccountUsername} required minLength={4} maxLength={255} onChange={(event) => setEditingAccountUsername(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+                    <label><span className="text-xs text-muted-foreground">新密码</span><input value={editingAccountPassword} type="password" autoComplete="new-password" placeholder="留空表示不修改" onChange={(event) => setEditingAccountPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+                    <div className="flex flex-wrap gap-2 md:col-span-2">
+                      <PrimaryButton type="submit" disabled={pendingAccountAction !== null}><Settings2 className="size-4" /> {accountPending && pendingAccountAction?.startsWith("save:") ? "正在保存…" : "保存账号"}</PrimaryButton>
+                      {account.hasPassword && <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => void clearAccessAccountPassword(account)}>改为免密码</SecondaryButton>}
+                      <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => setEditingAccountId(null)}>取消</SecondaryButton>
+                    </div>
+                  </form>
+                )}
+              </article>
+            );
+          })}
         </div>
       </Panel>
     </>

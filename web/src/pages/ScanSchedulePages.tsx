@@ -22,9 +22,26 @@ interface ScheduleFormState {
   timeOfDay: string;
   dayOfWeek: number;
   dayOfMonth: number;
+  quietPeriodEnabled: boolean;
+  quietStartTime: string;
+  quietEndTime: string;
 }
 
 const weekDayLabels = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+
+/** 把接口沿用的 scanMode 转换成页面任务名称。 */
+function getScheduledTaskName(scanMode: ScanSchedule["scanMode"]): string {
+  if (scanMode === "full") return "全量扫描";
+  if (scanMode === "incremental") return "增量扫描";
+  return "视频规格分析";
+}
+
+/** 返回不同定时任务的执行说明。 */
+function getScheduledTaskDescription(scanMode: ScanSchedule["scanMode"]): string {
+  if (scanMode === "full") return "按计划执行完整扫描与缺失文件对账。";
+  if (scanMode === "incremental") return "按计划扫描增量目录并完成刮削。";
+  return "按计划为新增、变化或历史失败的视频读取时长、编码、分辨率、音轨和字幕；此计划独立于扫描时规格开关。";
+}
 
 /** 把接口分钟数转换成页面更容易编辑的数值和单位。 */
 function readInterval(minutes: number | null): { value: number; unit: IntervalUnit } {
@@ -45,6 +62,9 @@ function toFormState(schedule: ScanSchedule): ScheduleFormState {
     timeOfDay: schedule.timeOfDay ?? "03:00",
     dayOfWeek: schedule.dayOfWeek ?? 1,
     dayOfMonth: schedule.dayOfMonth ?? 1,
+    quietPeriodEnabled: schedule.quietPeriodEnabled === true,
+    quietStartTime: schedule.quietStartTime ?? "00:00",
+    quietEndTime: schedule.quietEndTime ?? "07:00",
   };
 }
 
@@ -87,8 +107,16 @@ function ScheduleEditor({
   /** 保存当前扫描模式的完整计划配置。 */
   async function save(): Promise<void> {
     if (saving) return;
+    if (form.quietPeriodEnabled && (!form.quietStartTime || !form.quietEndTime)) {
+      setMessage("请完整设置每日禁扫开始和结束时间");
+      return;
+    }
+    if (form.quietPeriodEnabled && form.quietStartTime === form.quietEndTime) {
+      setMessage("禁扫开始时间和结束时间不能相同");
+      return;
+    }
     setSaving(true);
-    setMessage("正在保存扫描定时任务…");
+    setMessage("正在保存定时任务…");
     try {
       const saved = await updateServiceScanSchedule(schedule.serviceId, schedule.scanMode, {
         enabled: form.enabled,
@@ -98,22 +126,25 @@ function ScheduleEditor({
         dayOfWeek: form.dayOfWeek,
         dayOfMonth: form.dayOfMonth,
         timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
+        quietPeriodEnabled: form.quietPeriodEnabled,
+        quietStartTime: form.quietStartTime,
+        quietEndTime: form.quietEndTime,
       }, admin);
       onSaved(saved);
-      setMessage("扫描定时任务已保存");
+      setMessage(`${getScheduledTaskName(saved.scanMode)}计划已保存`);
       console.info("codex-flycloud-scan-schedule", {
         事件: "网页保存扫描定时任务成功",
         服务ID: saved.serviceId,
-        扫描模式: saved.scanMode === "full" ? "全量" : "增量",
+        定时任务类型: getScheduledTaskName(saved.scanMode),
         是否启用: saved.enabled,
       });
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "扫描定时任务保存失败";
+      const errorMessage = error instanceof Error ? error.message : "定时任务保存失败";
       setMessage(errorMessage);
       console.warn("codex-flycloud-scan-schedule", {
         事件: "网页保存扫描定时任务失败",
         服务ID: schedule.serviceId,
-        扫描模式: schedule.scanMode === "full" ? "全量" : "增量",
+        定时任务类型: getScheduledTaskName(schedule.scanMode),
         错误信息: errorMessage,
       });
     } finally {
@@ -123,11 +154,11 @@ function ScheduleEditor({
 
   return (
     <Panel
-      title={`${schedule.scanMode === "full" ? "全量" : "增量"}扫描定时任务`}
-      description={schedule.scanMode === "full" ? "按计划执行完整扫描与缺失文件对账。" : "按计划扫描增量目录并完成刮削。"}
+      title={`${getScheduledTaskName(schedule.scanMode)}定时任务`}
+      description={getScheduledTaskDescription(schedule.scanMode)}
     >
       <div className="flex items-center justify-between gap-3 rounded-xl border border-border bg-secondary/40 p-4">
-        <div><p className="text-sm font-medium">启用计划</p><p className="mt-1 text-xs text-muted-foreground">关闭后保留配置，但不会创建扫描任务。</p></div>
+        <div><p className="text-sm font-medium">启用计划</p><p className="mt-1 text-xs text-muted-foreground">关闭后保留配置，但不会创建后台任务。</p></div>
         <button type="button" role="switch" aria-checked={form.enabled} onClick={() => setForm((current) => ({ ...current, enabled: !current.enabled }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors ${form.enabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
           <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${form.enabled ? "translate-x-5" : "translate-x-0"}`} />
         </button>
@@ -148,6 +179,22 @@ function ScheduleEditor({
         </div>
       )}
 
+      <div className="mt-4 rounded-xl border border-border bg-secondary/30 p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div><p className="text-sm font-medium">{schedule.scanMode === "media_probe" ? "每日暂停规格分析时段" : "每日禁扫时段"}</p><p className="mt-1 text-xs text-muted-foreground">只顺延当前自动定时任务；手动操作和正在运行的任务不受影响。</p></div>
+          <button type="button" role="switch" aria-checked={form.quietPeriodEnabled} onClick={() => setForm((current) => ({ ...current, quietPeriodEnabled: !current.quietPeriodEnabled }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors ${form.quietPeriodEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+            <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${form.quietPeriodEnabled ? "translate-x-5" : "translate-x-0"}`} />
+          </button>
+        </div>
+        {form.quietPeriodEnabled && (
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <label><span className="text-xs text-muted-foreground">开始时间</span><input type="time" value={form.quietStartTime} onChange={(event) => setForm((current) => ({ ...current, quietStartTime: event.target.value }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+            <label><span className="text-xs text-muted-foreground">结束时间</span><input type="time" value={form.quietEndTime} onChange={(event) => setForm((current) => ({ ...current, quietEndTime: event.target.value }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" /></label>
+            <p className="text-xs text-muted-foreground sm:col-span-2">{form.quietStartTime > form.quietEndTime ? "当前时间段跨越零点。" : "每天在该时间段内不启动当前自动任务。"}命中的计划会顺延到结束时间。</p>
+          </div>
+        )}
+      </div>
+
       <div className="mt-4 grid gap-2 rounded-xl border border-border bg-secondary/30 p-4 text-xs text-muted-foreground sm:grid-cols-2">
         <p>执行时区：{getTimezoneLabel()}</p><p>下次执行：{formatScheduleTime(schedule.nextRunAt)}</p><p>最近触发：{formatScheduleTime(schedule.lastTriggeredAt)}</p><p>最近任务：{schedule.lastJobId ?? "暂无"}</p>
         {schedule.lastError && <p className="sm:col-span-2 text-destructive">最近错误：{schedule.lastError}</p>}
@@ -157,7 +204,7 @@ function ScheduleEditor({
   );
 }
 
-/** 服务扫描定时任务独立设置页面。 */
+/** 服务扫描和视频规格分析定时任务独立设置页面。 */
 export function ServiceScanSchedulePage({ serviceId, admin = false }: { serviceId: string; admin?: boolean }) {
   const service = useApiResource(() => getService(serviceId, admin), [serviceId, admin]);
   const schedules = useApiResource(() => getServiceScanSchedules(serviceId, admin), [serviceId, admin]);
@@ -168,8 +215,8 @@ export function ServiceScanSchedulePage({ serviceId, admin = false }: { serviceI
     void schedules.refresh();
   }
 
-  if (!service.data || !schedules.data) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{service.error ?? schedules.error ?? "正在读取扫描定时任务…"}</div></Panel>;
-  return <><PageHeader title={`${service.data.displayName} · 扫描定时任务`} actions={<Link to={detailPath} params={{ serviceId }}><SecondaryButton>返回服务详情</SecondaryButton></Link>} /><Panel className="mb-4"><div className="flex items-start gap-3"><CalendarClock className="mt-0.5 size-5 text-muted-foreground" /><div><p className="text-sm font-medium">计划由云助手后台执行</p><p className="mt-1 text-xs text-muted-foreground">全量和增量计划互相独立；同一服务已有任务运行时，到期计划会等待任务空闲后重试。</p></div><StatusPill>{getTimezoneLabel()}</StatusPill></div></Panel><div className="grid gap-4 xl:grid-cols-2">{schedules.data.map((schedule) => <ScheduleEditor key={schedule.scanMode} schedule={schedule} admin={admin} onSaved={applySaved} />)}</div></>;
+  if (!service.data || !schedules.data) return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{service.error ?? schedules.error ?? "正在读取定时任务…"}</div></Panel>;
+  return <><PageHeader title={`${service.data.displayName} · 定时任务`} actions={<Link to={detailPath} params={{ serviceId }}><SecondaryButton>返回服务详情</SecondaryButton></Link>} /><Panel className="mb-4"><div className="flex items-start gap-3"><CalendarClock className="mt-0.5 size-5 text-muted-foreground" /><div><p className="text-sm font-medium">计划由云助手后台执行</p><p className="mt-1 text-xs text-muted-foreground">全量扫描、增量扫描和视频规格分析计划互相独立；暂停时段只顺延自动任务，手动操作始终可以执行。</p></div><StatusPill>{getTimezoneLabel()}</StatusPill></div></Panel><div className="grid gap-4 xl:grid-cols-2">{schedules.data.map((schedule) => <ScheduleEditor key={schedule.scanMode} schedule={schedule} admin={admin} onSaved={applySaved} />)}</div></>;
 }
 
 export function UserServiceScanSchedulePage({ serviceId }: { serviceId: string }) { return <ServiceScanSchedulePage serviceId={serviceId} />; }

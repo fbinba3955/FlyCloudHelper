@@ -1079,6 +1079,21 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     return { job };
   });
 
+  server.delete<{ Body: Record<string, unknown> }>("/api/v1/admin/jobs/completed", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    requireConfirmation(request.body, "completed");
+    const result = await runtime.repository.deleteCompletedJobs();
+    for (const job of result.scanJobs) await runtime.failureReports.remove(job);
+    await audit(runtime, operator, "clear_completed_jobs", "scan_job", null, { deletedCount: result.deletedCount });
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-job-clear",
+      事件: "管理员清除已完成任务",
+      管理员ID: operator.id,
+      删除任务数量: result.deletedCount,
+    });
+    return { deletedCount: result.deletedCount };
+  });
+
   server.delete<{ Params: { jobId: string }; Body: Record<string, unknown> }>("/api/v1/admin/jobs/:jobId", async (request, reply) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     requireConfirmation(request.body, request.params.jobId);

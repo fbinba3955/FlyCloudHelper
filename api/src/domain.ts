@@ -140,12 +140,13 @@ export interface ScanJobRecord {
   updatedAt: string;
 }
 
-/** 服务级全量或增量扫描定时计划。 */
+/** 服务级扫描或视频规格分析定时计划。 */
 export interface ScanScheduleRecord {
   id: string;
   userId: string;
   serviceId: string;
-  scanMode: "incremental" | "full";
+  /** 保留 scanMode 字段兼容现有客户端，media_probe 表示独立 ffprobe 规格任务。 */
+  scanMode: "incremental" | "full" | "media_probe";
   enabled: boolean;
   scheduleType: ScanScheduleType;
   intervalMinutes: number | null;
@@ -153,6 +154,12 @@ export interface ScanScheduleRecord {
   dayOfWeek: number | null;
   dayOfMonth: number | null;
   timezoneOffsetMinutes: number;
+  /** 是否启用每天重复的禁扫时间段。 */
+  quietPeriodEnabled: boolean;
+  /** 禁扫时间段开始时间，按计划保存的固定时区解释。 */
+  quietStartTime: string | null;
+  /** 禁扫时间段结束时间，允许小于开始时间以表示跨零点。 */
+  quietEndTime: string | null;
   nextRunAt: string | null;
   lastTriggeredAt: string | null;
   lastJobId: string | null;

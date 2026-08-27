@@ -6,6 +6,7 @@ import { AdminServiceFilters } from "@/components/AdminServiceFilters";
 import { Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   cancelScanJob,
+  clearCompletedScanJobs,
   deleteScanJob,
   downloadScanFailureReport,
   listJobs,
@@ -176,8 +177,11 @@ function JobsView({ admin }: { admin: boolean }) {
   const [mediaProbeFailures, setMediaProbeFailures] = useState<MediaProbeFailure[]>([]);
   const [mediaProbeFailuresLoaded, setMediaProbeFailuresLoaded] = useState(false);
   const [pendingJobOperations, setPendingJobOperations] = useState<Record<string, JobOperation>>({});
+  const [clearingCompletedJobs, setClearingCompletedJobs] = useState(false);
   // 关键变量：引用中的任务操作会在事件处理入口同步写入，阻止 React 状态刷新前发生的连续点击。
   const pendingJobOperationsRef = useRef<Map<string, JobOperation>>(new Map());
+  // 关键变量：批量清理请求同步占位，避免确认框关闭到 React 刷新之间重复提交。
+  const clearingCompletedJobsRef = useRef(false);
   const jobs = resource.data?.items ?? [];
   const activeJob = jobs.find((job) => job.id === selectedJobId) ?? jobs[0];
   const pendingActiveJobOperation = activeJob ? pendingJobOperations[activeJob.id] : undefined;
@@ -346,6 +350,26 @@ function JobsView({ admin }: { admin: boolean }) {
     }
   }
 
+  /** 二次确认后清除权限范围内全部已完成任务，其他状态任务保持不变。 */
+  async function clearCompletedJobs(): Promise<void> {
+    if (clearingCompletedJobsRef.current) return;
+    if (!window.confirm("确定清除全部已完成任务吗？任务进度、事件与错误记录将无法恢复；失败、已取消和未结束任务不会被删除。")) return;
+    clearingCompletedJobsRef.current = true;
+    setClearingCompletedJobs(true);
+    setMessage("正在清除已完成任务…");
+    try {
+      const deletedCount = await clearCompletedScanJobs(admin);
+      setSelectedJobId(null);
+      setMessage(`已清除 ${deletedCount.toLocaleString()} 个已完成任务`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "清除已完成任务失败");
+    } finally {
+      clearingCompletedJobsRef.current = false;
+      setClearingCompletedJobs(false);
+    }
+  }
+
   /** 下载任务扫描、识别和刮削阶段产生的脱敏失败报告。 */
   async function downloadSelectedFailureReport(): Promise<void> {
     if (!activeJob || !canDownloadFailureReport) return;
@@ -433,7 +457,11 @@ function JobsView({ admin }: { admin: boolean }) {
             )}
             {activeJob.status !== "retry_waiting" && (activeJob.errorCode || activeJob.errorMessage) && <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive/8 p-4"><p className="font-mono text-xs text-destructive">{activeJob.errorCode}</p><p className="mt-2 text-sm">{activeJob.errorMessage}</p></div>}
           </Panel>
-          <Panel title="任务列表" description={`共 ${resource.data?.total ?? 0} 个任务`}>
+          <Panel
+            title="任务列表"
+            description={`共 ${resource.data?.total ?? 0} 个任务`}
+            action={<button type="button" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除已完成"}</button>}
+          >
             <ul className="space-y-2">
               {jobs.map((job) => <li key={job.id}><button type="button" onClick={() => setSelectedJobId(job.id)} className="w-full rounded-xl border border-border bg-secondary/40 p-3.5 text-left"><div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div className="min-w-0"><p className="truncate font-mono text-xs">{job.id}</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.serviceName} · {backgroundJobTypeLabels[job.jobType]} · {job.jobType === "scan" ? `${job.scanMode === "full" ? "全量" : "增量"} · ` : ""}{getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p><p className="mt-1 text-[11px] text-muted-foreground">{getJobDurationLabel(job.status)}：{formatJobDuration(job.elapsedMs)}</p><div className="mt-1 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2"><span>开始时间：{formatJobDateTime(job.startedAt)}</span><span>结束时间：{formatJobDateTime(job.finishedAt)}</span></div></div><StatusPill tone={getJobTone(job.status)}>{getJobStatusLabel(job)}</StatusPill></div><div className="mt-2.5"><ProgressMeter value={job.status === "completed" ? 1 : job.processedCount} total={job.status === "completed" ? 1 : job.totalCount} /></div></button></li>)}
             </ul>

@@ -9,11 +9,14 @@ import type { MetadataPluginManager } from "./plugin-manager.js";
 import type { ServiceRepository } from "./service-repository.js";
 import type { TmdbKeyPool } from "./metadata/tmdb.js";
 
+/** 定时器支持的任务类型；字段名沿用 scanMode 以兼容已经发布的客户端。 */
+type ScheduledTaskMode = "incremental" | "full" | "media_probe";
+
 interface ScanScheduleRow {
   id: string;
   user_id: string;
   service_id: string;
-  scan_mode: "incremental" | "full";
+  scan_mode: ScheduledTaskMode;
   enabled: number | string | boolean;
   schedule_type: ScanScheduleType;
   interval_minutes: number | string | null;
@@ -21,6 +24,9 @@ interface ScanScheduleRow {
   day_of_week: number | string | null;
   day_of_month: number | string | null;
   timezone_offset_minutes: number | string;
+  quiet_period_enabled: number | string | boolean;
+  quiet_start_time: string | null;
+  quiet_end_time: string | null;
   next_run_at: string | null;
   last_triggered_at: string | null;
   last_job_id: string | null;
@@ -37,6 +43,9 @@ export interface ScanScheduleConfiguration {
   dayOfWeek: number | null;
   dayOfMonth: number | null;
   timezoneOffsetMinutes: number;
+  quietPeriodEnabled: boolean;
+  quietStartTime: string | null;
+  quietEndTime: string | null;
 }
 
 type ScanScheduleLogger = (
@@ -49,6 +58,13 @@ function readConfiguredRoots(scanProfile: Record<string, unknown>, scanMode: "in
   const selectedRoots = scanMode === "full" ? scanProfile.fullRoots : scanProfile.incrementalRoots;
   if (Array.isArray(selectedRoots)) return selectedRoots;
   return Array.isArray(scanProfile.roots) ? scanProfile.roots : [];
+}
+
+/** 把定时任务类型转换成中文名称，统一日志和错误提示。 */
+function readScheduledTaskName(scanMode: ScheduledTaskMode): string {
+  if (scanMode === "full") return "全量扫描";
+  if (scanMode === "incremental") return "增量扫描";
+  return "视频规格分析";
 }
 
 /** 把数据库定时计划转换成接口和执行器共用的数据对象。 */
@@ -65,6 +81,9 @@ function mapScanSchedule(row: ScanScheduleRow): ScanScheduleRecord {
     dayOfWeek: row.day_of_week === null ? null : Number(row.day_of_week),
     dayOfMonth: row.day_of_month === null ? null : Number(row.day_of_month),
     timezoneOffsetMinutes: Number(row.timezone_offset_minutes),
+    quietPeriodEnabled: Number(row.quiet_period_enabled) === 1 || row.quiet_period_enabled === true,
+    quietStartTime: row.quiet_start_time,
+    quietEndTime: row.quiet_end_time,
     nextRunAt: row.next_run_at,
     lastTriggeredAt: row.last_triggered_at,
     lastJobId: row.last_job_id,
@@ -78,7 +97,7 @@ function mapScanSchedule(row: ScanScheduleRow): ScanScheduleRecord {
 function createDefaultSchedule(
   userId: string,
   serviceId: string,
-  scanMode: "incremental" | "full",
+  scanMode: ScheduledTaskMode,
 ): ScanScheduleRecord {
   const now = new Date().toISOString();
   return {
@@ -88,11 +107,14 @@ function createDefaultSchedule(
     scanMode,
     enabled: false,
     scheduleType: "interval",
-    intervalMinutes: scanMode === "full" ? 7 * 24 * 60 : 6 * 60,
+    intervalMinutes: scanMode === "full" ? 7 * 24 * 60 : scanMode === "media_probe" ? 24 * 60 : 6 * 60,
     timeOfDay: "03:00",
     dayOfWeek: 1,
     dayOfMonth: 1,
     timezoneOffsetMinutes: -new Date().getTimezoneOffset(),
+    quietPeriodEnabled: false,
+    quietStartTime: "00:00",
+    quietEndTime: "07:00",
     nextRunAt: null,
     lastTriggeredAt: null,
     lastJobId: null,
@@ -128,6 +150,49 @@ function getMonthDayCount(year: number, month: number): number {
   return new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
 }
 
+/** 把 HH:mm 转换成当天分钟数，便于判断普通或跨零点禁扫时段。 */
+function readClockMinutes(timeOfDay: string | null): number {
+  const { hour, minute } = readClock(timeOfDay);
+  return hour * 60 + minute;
+}
+
+/**
+ * 如果候选执行时间落入每日禁扫时段，则顺延到本次禁扫结束。
+ * 开始时间大于结束时间表示跨零点，例如 23:00 至 07:00。
+ */
+function postponeQuietCandidate(candidateMilliseconds: number, configuration: ScanScheduleConfiguration): number {
+  if (!configuration.quietPeriodEnabled || !configuration.quietStartTime || !configuration.quietEndTime) {
+    return candidateMilliseconds;
+  }
+  const startMinutes = readClockMinutes(configuration.quietStartTime);
+  const endMinutes = readClockMinutes(configuration.quietEndTime);
+  if (startMinutes === endMinutes) return candidateMilliseconds;
+
+  const offset = configuration.timezoneOffsetMinutes;
+  const localCandidate = new Date(candidateMilliseconds + offset * 60_000);
+  const candidateMinutes = localCandidate.getUTCHours() * 60 + localCandidate.getUTCMinutes();
+  const year = localCandidate.getUTCFullYear();
+  const month = localCandidate.getUTCMonth();
+  const day = localCandidate.getUTCDate();
+  const { hour: endHour, minute: endMinute } = readClock(configuration.quietEndTime);
+
+  if (startMinutes < endMinutes) {
+    const insideSameDayPeriod = candidateMinutes >= startMinutes && candidateMinutes < endMinutes;
+    return insideSameDayPeriod
+      ? localPartsToUtc(year, month, day, endHour, endMinute, offset)
+      : candidateMilliseconds;
+  }
+
+  // 关键变量：跨零点时，开始时间之后顺延到次日结束，结束时间之前顺延到当日结束。
+  if (candidateMinutes >= startMinutes) {
+    return localPartsToUtc(year, month, day + 1, endHour, endMinute, offset);
+  }
+  if (candidateMinutes < endMinutes) {
+    return localPartsToUtc(year, month, day, endHour, endMinute, offset);
+  }
+  return candidateMilliseconds;
+}
+
 /** 根据当前配置计算严格晚于基准时间的下一次执行时间。 */
 export function calculateNextScanRunAt(
   configuration: ScanScheduleConfiguration,
@@ -136,7 +201,8 @@ export function calculateNextScanRunAt(
   if (!configuration.enabled) return null;
   const baseMilliseconds = baseTime.getTime();
   if (configuration.scheduleType === "interval") {
-    return new Date(baseMilliseconds + Math.max(1, configuration.intervalMinutes ?? 1) * 60_000).toISOString();
+    const candidate = baseMilliseconds + Math.max(1, configuration.intervalMinutes ?? 1) * 60_000;
+    return new Date(postponeQuietCandidate(candidate, configuration)).toISOString();
   }
 
   const offset = configuration.timezoneOffsetMinutes; // 关键变量：指定时间按保存页面所在时区解释，而不是容器 UTC 时区。
@@ -149,7 +215,7 @@ export function calculateNextScanRunAt(
   if (configuration.scheduleType === "daily") {
     let candidate = localPartsToUtc(year, month, day, hour, minute, offset);
     if (candidate <= baseMilliseconds) candidate = localPartsToUtc(year, month, day + 1, hour, minute, offset);
-    return new Date(candidate).toISOString();
+    return new Date(postponeQuietCandidate(candidate, configuration)).toISOString();
   }
 
   if (configuration.scheduleType === "weekly") {
@@ -161,7 +227,7 @@ export function calculateNextScanRunAt(
       daysAhead += 7;
       candidate = localPartsToUtc(year, month, day + daysAhead, hour, minute, offset);
     }
-    return new Date(candidate).toISOString();
+    return new Date(postponeQuietCandidate(candidate, configuration)).toISOString();
   }
 
   const requestedDay = configuration.dayOfMonth ?? 1;
@@ -178,19 +244,19 @@ export function calculateNextScanRunAt(
     targetDay = Math.min(requestedDay, getMonthDayCount(targetYear, targetMonth));
     candidate = localPartsToUtc(targetYear, targetMonth, targetDay, hour, minute, offset);
   }
-  return new Date(candidate).toISOString();
+  return new Date(postponeQuietCandidate(candidate, configuration)).toISOString();
 }
 
-/** 持久化服务级扫描计划，并提供执行器需要的原子领取操作。 */
+/** 持久化服务级后台计划，并提供执行器需要的原子领取操作。 */
 export class ScanScheduleStore {
   public constructor(private readonly database: FlyCloudHelperDatabase) {}
 
-  /** 读取一个服务的全量和增量扫描计划；缺失模式返回默认关闭配置。 */
+  /** 读取一个服务的扫描和视频规格计划；缺失模式返回默认关闭配置。 */
   public async listServiceSchedules(userId: string, serviceId: string): Promise<ScanScheduleRecord[]> {
     const rows = await this.database.query("service_scan_schedules")
       .where({ user_id: userId, service_id: serviceId }) as ScanScheduleRow[];
     const mapped = rows.map(mapScanSchedule);
-    return (["full", "incremental"] as const).map((scanMode) =>
+    return (["full", "incremental", "media_probe"] as const).map((scanMode) =>
       mapped.find((item) => item.scanMode === scanMode) ?? createDefaultSchedule(userId, serviceId, scanMode));
   }
 
@@ -198,7 +264,7 @@ export class ScanScheduleStore {
   public async saveServiceSchedule(input: {
     userId: string;
     serviceId: string;
-    scanMode: "incremental" | "full";
+    scanMode: ScheduledTaskMode;
     configuration: ScanScheduleConfiguration;
   }): Promise<ScanScheduleRecord> {
     const existing = await this.database.query("service_scan_schedules").where({
@@ -216,6 +282,9 @@ export class ScanScheduleStore {
       day_of_week: input.configuration.scheduleType === "weekly" ? input.configuration.dayOfWeek : null,
       day_of_month: input.configuration.scheduleType === "monthly" ? input.configuration.dayOfMonth : null,
       timezone_offset_minutes: input.configuration.timezoneOffsetMinutes,
+      quiet_period_enabled: input.configuration.quietPeriodEnabled ? 1 : 0,
+      quiet_start_time: input.configuration.quietStartTime,
+      quiet_end_time: input.configuration.quietEndTime,
       next_run_at: nextRunAt,
       last_error: null,
       updated_at: now.toISOString(),
@@ -255,6 +324,17 @@ export class ScanScheduleStore {
 
   /** 原子领取一次到期执行权，同时先推进到下一周期，防止重复创建任务。 */
   public async claimDueSchedule(schedule: ScanScheduleRecord, now: Date): Promise<boolean> {
+    // 最终执行闸门：即使旧计划或冲突重试时间落入禁扫时段，也只顺延自动计划，不创建扫描任务。
+    const postponedRunAt = postponeQuietCandidate(now.getTime(), schedule);
+    if (postponedRunAt > now.getTime()) {
+      await this.database.query("service_scan_schedules")
+        .where({ id: schedule.id, enabled: 1, next_run_at: schedule.nextRunAt })
+        .update({
+          next_run_at: new Date(postponedRunAt).toISOString(),
+          updated_at: now.toISOString(),
+        });
+      return false;
+    }
     const nextRunAt = calculateNextScanRunAt(schedule, now);
     const updated = await this.database.query("service_scan_schedules")
       .where({ id: schedule.id, enabled: 1, next_run_at: schedule.nextRunAt })
@@ -267,8 +347,8 @@ export class ScanScheduleStore {
     return Number(updated) === 1;
   }
 
-  /** 保存定时计划成功创建的扫描任务。 */
-  public async markTriggeredJob(scheduleId: string, jobId: string): Promise<void> {
+  /** 保存定时计划本次创建的后台任务；没有待分析文件时任务 ID 为空。 */
+  public async markTriggeredJob(scheduleId: string, jobId: string | null): Promise<void> {
     await this.database.query("service_scan_schedules").where({ id: scheduleId }).update({
       last_job_id: jobId,
       last_error: null,
@@ -287,7 +367,7 @@ export class ScanScheduleStore {
   }
 }
 
-/** 轮询到期计划并复用现有扫描任务队列，不在定时器线程直接执行扫描。 */
+/** 轮询到期计划并复用现有扫描或规格队列，不在定时器线程直接处理媒体。 */
 export class ScanScheduleWorker {
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
@@ -340,8 +420,8 @@ export class ScanScheduleWorker {
     } catch (error) {
       this.options.logger("warn", {
         日志关键字: "codex-flycloud-scan-schedule",
-        事件: "轮询定时扫描计划失败",
-        错误信息: toSafeErrorMessage(error, "轮询定时扫描计划失败"),
+        事件: "轮询后台定时计划失败",
+        错误信息: toSafeErrorMessage(error, "轮询后台定时计划失败"),
       });
     } finally {
       this.running = false;
@@ -349,11 +429,48 @@ export class ScanScheduleWorker {
     }
   }
 
-  /** 把一条到期计划转换成普通扫描任务。 */
+  /** 把一条到期计划转换成扫描任务或独立 ffprobe 规格任务。 */
   private async triggerSchedule(schedule: ScanScheduleRecord, now: Date): Promise<void> {
-    if (!(await this.options.store.claimDueSchedule(schedule, now))) return;
+    const postponedRunAt = postponeQuietCandidate(now.getTime(), schedule);
+    if (!(await this.options.store.claimDueSchedule(schedule, now))) {
+      if (postponedRunAt > now.getTime()) {
+        this.options.logger("info", {
+          日志关键字: "codex-flycloud-scan-schedule",
+          事件: "自动任务命中每日禁扫时段",
+          服务ID: schedule.serviceId,
+          定时任务类型: readScheduledTaskName(schedule.scanMode),
+          顺延至: new Date(postponedRunAt).toISOString(),
+        });
+      }
+      return;
+    }
     try {
       const service = await this.options.repository.getServiceDetail(schedule.serviceId, schedule.userId);
+      if (schedule.scanMode === "media_probe") {
+        if (service.dataType !== "video") {
+          throw new ApiError(409, "media_probe_video_only", "只有影视服务可以定时分析视频规格");
+        }
+        if (service.status !== "active") {
+          throw new ApiError(409, "service_not_active", "请先启用服务，再执行定时视频规格分析");
+        }
+        const result = await this.options.repository.enqueueExistingServiceMediaProbes(
+          service.id,
+          schedule.userId,
+          schedule.userId,
+          "scheduled",
+        );
+        await this.options.store.markTriggeredJob(schedule.id, result.jobId);
+        this.options.logger("info", {
+          日志关键字: "codex-flycloud-scan-schedule",
+          事件: result.jobId ? "定时视频规格任务创建成功" : "定时视频规格任务没有待分析文件",
+          用户ID: schedule.userId,
+          服务ID: schedule.serviceId,
+          计划ID: schedule.id,
+          任务ID: result.jobId,
+          入队文件数量: result.queuedCount,
+        });
+        return;
+      }
       const configuredRoots = readConfiguredRoots(service.scanProfile, schedule.scanMode);
       if (configuredRoots.length === 0) {
         throw new ApiError(409, "scan_paths_not_configured", `未配置${schedule.scanMode === "full" ? "全量" : "增量"}扫描路径`);
@@ -377,20 +494,20 @@ export class ScanScheduleWorker {
         用户ID: schedule.userId,
         服务ID: schedule.serviceId,
         计划ID: schedule.id,
-        扫描模式: schedule.scanMode === "full" ? "全量" : "增量",
+        定时任务类型: readScheduledTaskName(schedule.scanMode),
         任务ID: job.id,
       });
     } catch (error) {
-      const errorMessage = toSafeErrorMessage(error, "定时扫描任务创建失败");
+      const errorMessage = toSafeErrorMessage(error, "定时后台任务创建失败");
       const retrySoon = error instanceof ApiError && error.code === "scan_job_conflict";
       await this.options.store.markTriggerFailure(schedule.id, errorMessage, retrySoon);
       this.options.logger("warn", {
         日志关键字: "codex-flycloud-scan-schedule",
-        事件: "定时扫描任务创建失败",
+        事件: "定时后台任务创建失败",
         用户ID: schedule.userId,
         服务ID: schedule.serviceId,
         计划ID: schedule.id,
-        扫描模式: schedule.scanMode === "full" ? "全量" : "增量",
+        定时任务类型: readScheduledTaskName(schedule.scanMode),
         是否等待任务空闲后重试: retrySoon,
         错误信息: errorMessage,
       });

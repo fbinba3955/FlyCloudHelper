@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
-import { requireRequestUser, requireSuperAdmin } from "../http.js";
+import { requireConfirmation, requireRequestUser, requireSuperAdmin } from "../http.js";
 import { buildJellyfinPath, validateJellyfinPathSuffix } from "../jellyfin-path.js";
 import type { ApiRuntime } from "../runtime.js";
 
@@ -22,7 +22,9 @@ function supportsRelayPlayback(runtime: ApiRuntime, providerType: string): boole
 /** 构造媒体库协议配置。 */
 async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string) {
   const service = await runtime.repository.getServiceDetail(serviceId);
-  const account = await runtime.serviceAccess.getByService(serviceId);
+  const accounts = await runtime.serviceAccess.listByService(serviceId);
+  const account = accounts[0]; // 关键变量：保留旧响应字段指向历史最早账号，兼容已经发布的客户端。
+  if (!account) throw new ApiError(404, "service_access_account_not_found", "服务访问账号不存在");
   const library = await runtime.database.query("media_libraries")
     .select(
       "jellyfin_path_suffix",
@@ -45,6 +47,7 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
     jellyfinPath,
     jellyfinPathSuffix,
     account,
+    accounts,
   };
 }
 
@@ -58,7 +61,8 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
 
     server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/access-account`, async (request) => {
       const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      const account = await runtime.serviceAccess.updateCredentials(request.params.serviceId, {
+      const currentAccount = await runtime.serviceAccess.getByService(request.params.serviceId);
+      const account = await runtime.serviceAccess.updateCredentials(request.params.serviceId, currentAccount.id, {
         username: request.body.username,
         password: request.body.password,
       });
@@ -72,7 +76,8 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
 
     server.post<{ Params: { serviceId: string } }>(`${prefix}/:serviceId/access-account/reset-password`, async (request) => {
       const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
-      const generated = await runtime.serviceAccess.resetPassword(request.params.serviceId);
+      const currentAccount = await runtime.serviceAccess.getByService(request.params.serviceId);
+      const generated = await runtime.serviceAccess.resetPassword(request.params.serviceId, currentAccount.id);
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-jellyfin-compat", 事件: "重置服务访问密码并撤销旧会话",
         操作用户ID: operator.id, 服务ID: request.params.serviceId, 凭据修订: generated.account.credentialRevision,
@@ -86,6 +91,84 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       runtime.logBusinessEvent("info", {
         日志关键字: "codex-jellyfin-compat", 事件: "撤销服务全部协议会话",
         操作用户ID: operator.id, 服务ID: request.params.serviceId, 撤销会话数: revokedCount,
+      });
+      return { revokedCount };
+    });
+
+    server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/access-accounts`, async (request) => {
+      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      const account = await runtime.serviceAccess.createAccount(request.params.serviceId, {
+        username: request.body.username,
+        password: request.body.password,
+      });
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-jellyfin-account-management",
+        事件: "创建Jellyfin账号",
+        操作用户ID: operator.id,
+        服务ID: request.params.serviceId,
+        Jellyfin账号ID: account.id,
+        是否需要密码: account.hasPassword,
+      });
+      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId), account };
+    });
+
+    server.patch<{ Params: { serviceId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/access-accounts/:accountId`, async (request) => {
+      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      let account = await runtime.serviceAccess.getById(request.params.serviceId, request.params.accountId);
+      const changesCredentials = request.body.username !== undefined || request.body.password !== undefined;
+      const changesStatus = request.body.status !== undefined;
+      if (!changesCredentials && !changesStatus) {
+        throw new ApiError(422, "service_access_account_update_empty", "没有需要保存的 Jellyfin 账号设置");
+      }
+      if (changesCredentials && changesStatus) {
+        throw new ApiError(422, "service_access_account_update_mixed", "账号凭据和启停状态需要分别保存");
+      }
+      if (changesCredentials) {
+        account = await runtime.serviceAccess.updateCredentials(request.params.serviceId, request.params.accountId, {
+          username: request.body.username,
+          password: request.body.password,
+        });
+      }
+      if (changesStatus) {
+        account = await runtime.serviceAccess.updateStatus(request.params.serviceId, request.params.accountId, request.body.status);
+      }
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-jellyfin-account-management",
+        事件: "修改Jellyfin账号",
+        操作用户ID: operator.id,
+        服务ID: request.params.serviceId,
+        Jellyfin账号ID: account.id,
+        账号状态: account.status,
+        是否修改凭据: changesCredentials,
+      });
+      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId), account };
+    });
+
+    server.delete<{ Params: { serviceId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/access-accounts/:accountId`, async (request, reply) => {
+      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      requireConfirmation(request.body, request.params.accountId);
+      await runtime.serviceAccess.deleteAccount(request.params.serviceId, request.params.accountId);
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-jellyfin-account-management",
+        事件: "删除Jellyfin账号及独立观看记录",
+        操作用户ID: operator.id,
+        服务ID: request.params.serviceId,
+        Jellyfin账号ID: request.params.accountId,
+      });
+      return reply.status(204).send();
+    });
+
+    server.post<{ Params: { serviceId: string; accountId: string } }>(`${prefix}/:serviceId/access-accounts/:accountId/revoke-sessions`, async (request) => {
+      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      await runtime.serviceAccess.getById(request.params.serviceId, request.params.accountId);
+      const revokedCount = await runtime.serviceAccess.revokeSessions(request.params.serviceId, undefined, request.params.accountId);
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-jellyfin-account-management",
+        事件: "撤销指定Jellyfin账号会话",
+        操作用户ID: operator.id,
+        服务ID: request.params.serviceId,
+        Jellyfin账号ID: request.params.accountId,
+        撤销会话数: revokedCount,
       });
       return { revokedCount };
     });

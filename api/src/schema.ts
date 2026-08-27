@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 36;
+export const currentSchemaVersion = 39;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -55,6 +55,21 @@ async function addUniqueIfMissing(
       || databaseError.code === "ER_DUP_KEYNAME"
       || /(?:index|constraint) .* already exists/iu.test(databaseError.message);
     if (!duplicateIndex) throw error;
+  }
+}
+
+/** 删除旧版单服务单账号唯一约束，并容忍迁移已执行但版本号尚未更新。 */
+async function dropLegacyServiceAccessAccountUnique(database: Knex): Promise<void> {
+  try {
+    await database.schema.alterTable("service_access_accounts", (table) => {
+      table.dropUnique(["service_id"]);
+    });
+  } catch (error) {
+    const databaseError = error as Error & { code?: string };
+    const constraintMissing = databaseError.code === "42704"
+      || databaseError.code === "ER_CANT_DROP_FIELD_OR_KEY"
+      || /(?:constraint|index).*?(?:does not exist|not found|no such)/iu.test(databaseError.message);
+    if (!constraintMissing) throw error;
   }
 }
 
@@ -377,7 +392,7 @@ async function createServiceTables(database: Knex): Promise<void> {
   if (!(await database.schema.hasTable("service_access_accounts"))) {
     await database.schema.createTable("service_access_accounts", (table) => {
       table.string("id", 64).primary();
-      table.string("service_id", 64).notNullable().unique().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
       table.string("username", 255).notNullable();
       table.string("username_lookup", 255).notNullable();
       table.text("password_hash").notNullable();
@@ -553,6 +568,9 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.integer("day_of_week").nullable();
       table.integer("day_of_month").nullable();
       table.integer("timezone_offset_minutes").notNullable().defaultTo(0);
+      table.integer("quiet_period_enabled").notNullable().defaultTo(0);
+      table.string("quiet_start_time", 5).nullable();
+      table.string("quiet_end_time", 5).nullable();
       table.string("next_run_at", 40).nullable();
       table.string("last_triggered_at", 40).nullable();
       table.string("last_job_id", 64).nullable();
@@ -563,6 +581,15 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.index(["enabled", "next_run_at"], "idx_service_scan_schedules_due");
     });
   }
+  await addColumnIfMissing(database, "service_scan_schedules", "quiet_period_enabled", (table) => {
+    table.integer("quiet_period_enabled").notNullable().defaultTo(0);
+  });
+  await addColumnIfMissing(database, "service_scan_schedules", "quiet_start_time", (table) => {
+    table.string("quiet_start_time", 5).nullable();
+  });
+  await addColumnIfMissing(database, "service_scan_schedules", "quiet_end_time", (table) => {
+    table.string("quiet_end_time", 5).nullable();
+  });
 
   if (!(await database.schema.hasTable("scan_job_events"))) {
     await database.schema.createTable("scan_job_events", (table) => {
@@ -1201,6 +1228,9 @@ export async function migrateDatabase(database: Knex): Promise<void> {
     }
     if (Number(existingState.schema_version ?? 0) < 32) {
       await migrateUniqueCloudServiceDeviceBinding(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 39) {
+      await dropLegacyServiceAccessAccountUnique(database);
     }
     await database("system_state").where({ singleton_id: 1 }).update({
       service_instance_id: existingState.service_instance_id || randomUUID(),

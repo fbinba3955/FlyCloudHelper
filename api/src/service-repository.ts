@@ -1881,6 +1881,39 @@ export class ServiceRepository {
     });
   }
 
+  /** 批量删除指定用户或管理范围内的已完成任务，并返回需要清理失败报告的扫描任务。 */
+  public async deleteCompletedJobs(userId?: string): Promise<{
+    deletedCount: number;
+    scanJobs: Array<{ id: string; userId: string; serviceId: string }>;
+  }> {
+    return this.database.query.transaction(async (transaction) => {
+      let scanJobQuery = transaction("scan_jobs").select("id", "user_id", "service_id").where({ status: "completed" });
+      let mediaProbeJobQuery = transaction("media_probe_jobs").select("id").where({ status: "completed" });
+      if (userId) {
+        scanJobQuery = scanJobQuery.where({ user_id: userId });
+        mediaProbeJobQuery = mediaProbeJobQuery.where({ user_id: userId });
+      }
+      const scanJobRows = await scanJobQuery as Array<{ id: string; user_id: string; service_id: string }>;
+      const mediaProbeJobRows = await mediaProbeJobQuery as Array<{ id: string }>;
+      // 关键变量：分批操作避免 SQLite 参数上限以及大量历史任务导致单条 SQL 过长。
+      const deleteBatchSize = 200;
+      for (let offset = 0; offset < scanJobRows.length; offset += deleteBatchSize) {
+        const jobIds = scanJobRows.slice(offset, offset + deleteBatchSize).map((row) => row.id);
+        await transaction("scan_job_events").whereIn("job_id", jobIds).delete();
+        await transaction("scan_jobs").whereIn("id", jobIds).delete();
+      }
+      for (let offset = 0; offset < mediaProbeJobRows.length; offset += deleteBatchSize) {
+        const jobIds = mediaProbeJobRows.slice(offset, offset + deleteBatchSize).map((row) => row.id);
+        await transaction("media_file_probes").whereIn("probe_job_id", jobIds).update({ probe_job_id: null });
+        await transaction("media_probe_jobs").whereIn("id", jobIds).delete();
+      }
+      return {
+        deletedCount: scanJobRows.length + mediaProbeJobRows.length,
+        scanJobs: scanJobRows.map((row) => ({ id: row.id, userId: row.user_id, serviceId: row.service_id })),
+      };
+    });
+  }
+
   /** 恢复暂停任务，继续使用原冻结配置。 */
   public async resumeJob(jobId: string, userId?: string): Promise<ScanJobRecord> {
     const job = await this.getJob(jobId, userId);
@@ -2454,7 +2487,7 @@ export class ServiceRepository {
    */
   public async enqueueMediaProbes(sourceFiles: SourceFileRecord[], forceFailed = false, options: {
     requestedByUserId?: string;
-    triggerType?: "manual_backfill" | "scan_completed" | "retry" | "recovered" | "reauthorized";
+    triggerType?: "manual_backfill" | "scan_completed" | "retry" | "recovered" | "reauthorized" | "scheduled";
     sourceScanJobId?: string;
   } = {}): Promise<{ queuedCount: number; jobId: string | null }> {
     const uniqueSourceFiles = [...new Map(sourceFiles.map((sourceFile) => [sourceFile.id, sourceFile])).values()];
@@ -2547,11 +2580,12 @@ export class ServiceRepository {
     });
   }
 
-  /** 用户手动触发时，为该服务已有但缺少规格的活动视频建立独立后台任务。 */
+  /** 手动或定时触发时，为该服务已有、变化或历史失败的视频建立独立规格后台任务。 */
   public async enqueueExistingServiceMediaProbes(
     serviceId: string,
     userId: string,
     requestedByUserId = userId,
+    triggerType: "manual_backfill" | "scheduled" = "manual_backfill",
   ): Promise<{ queuedCount: number; jobId: string | null }> {
     const rows = await this.database.query("source_files")
       .where({ service_id: serviceId, user_id: userId, status: "active" })
@@ -2574,7 +2608,7 @@ export class ServiceRepository {
       metadataProfileRevision: Number(row.metadata_profile_revision ?? 0),
       locator: parseJsonObject(row.locator_json),
     }));
-    return this.enqueueMediaProbes(sourceFiles, true, { requestedByUserId, triggerType: "manual_backfill" });
+    return this.enqueueMediaProbes(sourceFiles, true, { requestedByUserId, triggerType });
   }
 
   /**
