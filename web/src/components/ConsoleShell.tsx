@@ -2,6 +2,7 @@ import { Link, Outlet, useRouterState } from "@tanstack/react-router";
 import {
   Activity,
   Bell,
+  BrainCircuit,
   ChevronRight,
   HardDrive,
   LayoutDashboard,
@@ -76,6 +77,7 @@ const adminNavigation: NavigationItem[] = [
   { to: "/admin/jobs", label: "后台任务", icon: ListChecks },
   { to: "/admin/catalog", label: "媒体库", icon: LibraryBig },
   { to: "/admin/plugins", label: "插件管理", icon: Puzzle },
+  { to: "/admin/ai-models", label: "AI 模型", icon: BrainCircuit },
   { to: "/admin/config", label: "系统配置", icon: Settings2 },
   { to: "/admin/system", label: "系统状态", icon: ServerCog },
   { to: "/admin/audit", label: "审计日志", icon: ScrollText },

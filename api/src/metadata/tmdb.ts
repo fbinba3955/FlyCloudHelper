@@ -132,6 +132,10 @@ export interface TmdbVideoQuery {
   title: string;
   /** 目录标题无候选时使用的文件名查询词。 */
   fallbackTitle?: string;
+  /** 首次标题没有候选时，延迟生成第二查询词；用于避免正常命中时调用 AI。 */
+  resolveSecondSearchTitle?: () => Promise<string>;
+  /** 会影响动态第二查询词的识别修订，参与部署级公共缓存键。 */
+  cacheRevision?: string;
   year: number | null;
   language: string;
   region: string;
@@ -317,15 +321,46 @@ export class TmdbKeyPool {
     }
 
     const primaryTitle = query.title.trim();
+    const primaryCandidates = await this.searchCandidates(
+      query.mediaType,
+      primaryTitle,
+      query.year,
+      query.language,
+      query.region,
+      query.signal,
+    );
+    if (primaryCandidates.length > 0) {
+      const candidate = this.pickCandidate(query.mediaType, primaryCandidates, primaryTitle, query.year);
+      if (query.includeDetails === false) {
+        return this.mapSearchCandidateMetadata(query.mediaType, candidate, primaryTitle, primaryCandidates.length);
+      }
+      return this.readDetails(
+        query.mediaType,
+        candidate.id,
+        primaryTitle,
+        primaryCandidates.length,
+        query.language,
+        query.region,
+        query.signal,
+        candidate,
+      );
+    }
+    // 关键变量：只有第一次 TMDB 搜索确实没有候选时才延迟请求 AI，仍保持最多两次 TMDB 搜索。
+    const aiSecondTitle = query.resolveSecondSearchTitle
+      ? String(await query.resolveSecondSearchTitle()).trim()
+      : "";
     // 关键变量：文件名回退优先于普通简化标题，并与主查询去重。
     const fileFallbackTitle = String(query.fallbackTitle ?? "").trim();
     const simplifiedTitle = FlymbyVideoTitleCleaner.buildAlternateTmdbSearchQuery(primaryTitle);
     const firstSeriesFallback = query.mediaType === "tv" && !fileFallbackTitle && !simplifiedTitle
       ? this.buildFirstSeriesTitleFallback(primaryTitle)
       : "";
-    const alternateTitle = fileFallbackTitle || simplifiedTitle || firstSeriesFallback;
+    const normalizedPrimaryTitle = FlymbyVideoTitleCleaner.normalizeSearchText(primaryTitle);
+    const validAiSecondTitle = FlymbyVideoTitleCleaner.normalizeSearchText(aiSecondTitle) === normalizedPrimaryTitle
+      ? ""
+      : aiSecondTitle;
+    const alternateTitle = validAiSecondTitle || fileFallbackTitle || simplifiedTitle || firstSeriesFallback;
     const attempts: Array<{ title: string; year: number | null }> = [];
-    this.appendSearchAttempt(attempts, primaryTitle, query.year);
     // 关键变量：第二次查询同时放宽标题和年份，保持每个任务最多两次 TMDB 搜索。
     const relaxedTitle = alternateTitle || (query.year !== null ? primaryTitle : "");
     this.appendSearchAttempt(attempts, relaxedTitle, query.year !== null ? null : query.year);
@@ -474,6 +509,7 @@ export class TmdbKeyPool {
       this.readLanguage(query.language),
       this.readRegion(query.region),
       query.includeDetails === false ? "summary" : "details",
+      String(query.cacheRevision ?? ""),
     ]);
   }
 

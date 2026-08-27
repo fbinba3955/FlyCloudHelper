@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 39;
+export const currentSchemaVersion = 42;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -683,6 +683,7 @@ async function createCatalogTables(database: Knex): Promise<void> {
       table.string("scan_root_key", 64).nullable();
       table.string("generation_id", 64).notNullable();
       table.integer("metadata_profile_revision").notNullable().defaultTo(0);
+      table.string("recognition_revision", 128).nullable();
       table.text("locator_json").notNullable();
       table.string("status", 32).notNullable();
       table.string("created_at", 40).notNullable();
@@ -697,6 +698,9 @@ async function createCatalogTables(database: Knex): Promise<void> {
   });
   await addColumnIfMissing(database, "source_files", "metadata_profile_revision", (table) => {
     table.integer("metadata_profile_revision").notNullable().defaultTo(0);
+  });
+  await addColumnIfMissing(database, "source_files", "recognition_revision", (table) => {
+    table.string("recognition_revision", 128).nullable();
   });
 
   if (!(await database.schema.hasTable("nfo_sidecar_cache"))) {
@@ -992,7 +996,7 @@ async function migrateUniqueSourceFileOwnership(database: Knex): Promise<void> {
   );
 }
 
-/** 创建导出、插件和扩展审计表。 */
+/** 创建导出、插件、AI 模型和扩展审计表。 */
 async function createOperationTables(database: Knex): Promise<void> {
   if (!(await database.schema.hasTable("user_notifications"))) {
     await database.schema.createTable("user_notifications", (table) => {
@@ -1115,6 +1119,84 @@ async function createOperationTables(database: Knex): Promise<void> {
       table.text("configuration_state_json").notNullable();
       table.string("created_at", 40).notNullable();
       table.unique(["plugin_id", "version", "revision"], { indexName: "uq_metadata_plugin_configurations" });
+    });
+  }
+
+  if (!(await database.schema.hasTable("ai_model_profiles"))) {
+    await database.schema.createTable("ai_model_profiles", (table) => {
+      table.string("id", 64).primary();
+      table.string("display_name", 100).notNullable();
+      table.string("protocol", 32).notNullable();
+      table.string("status", 32).notNullable();
+      table.integer("configuration_revision").notNullable().defaultTo(1);
+      table.string("last_check_status", 32).notNullable().defaultTo("unknown");
+      table.string("last_check_error_code", 100).nullable();
+      table.text("last_check_error_message").nullable();
+      table.integer("last_check_latency_ms").nullable();
+      table.integer("last_check_structured_output").notNullable().defaultTo(0);
+      table.string("last_checked_at", 40).nullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.index(["status", "updated_at"], "idx_ai_model_profiles_status_updated");
+    });
+  }
+
+  if (!(await database.schema.hasTable("ai_model_configurations"))) {
+    await database.schema.createTable("ai_model_configurations", (table) => {
+      table.string("id", 64).primary();
+      table.string("model_id", 64).notNullable().references("id").inTable("ai_model_profiles").onDelete("CASCADE");
+      table.integer("revision").notNullable();
+      table.string("base_url", 1000).notNullable();
+      table.string("model_name", 255).notNullable();
+      table.integer("timeout_ms").notNullable();
+      table.integer("max_concurrency").notNullable();
+      table.text("encrypted_secrets").nullable();
+      table.text("configuration_state_json").notNullable();
+      table.string("created_at", 40).notNullable();
+      table.unique(["model_id", "revision"], { indexName: "uq_ai_model_configurations_revision" });
+      table.index(["model_id", "created_at"], "idx_ai_model_configurations_model_created");
+    });
+  }
+
+  if (!(await database.schema.hasTable("ai_video_name_clean_cache"))) {
+    await database.schema.createTable("ai_video_name_clean_cache", (table) => {
+      table.string("id", 64).primary();
+      table.string("model_id", 64).notNullable().references("id").inTable("ai_model_profiles").onDelete("CASCADE");
+      table.integer("model_revision").notNullable();
+      table.string("prompt_version", 64).notNullable();
+      table.string("cleaner_version", 64).notNullable();
+      table.string("input_hash", 64).notNullable();
+      table.text("result_json").notNullable();
+      table.float("confidence").notNullable();
+      table.string("created_at", 40).notNullable();
+      table.string("expires_at", 40).notNullable();
+      table.unique(
+        ["model_id", "model_revision", "prompt_version", "cleaner_version", "input_hash"],
+        { indexName: "uq_ai_video_name_clean_cache_input" },
+      );
+      table.index(["expires_at"], "idx_ai_video_name_clean_cache_expires");
+    });
+  }
+
+  if (!(await database.schema.hasTable("ai_video_name_clean_usages"))) {
+    await database.schema.createTable("ai_video_name_clean_usages", (table) => {
+      table.string("id", 64).primary();
+      table.string("job_id", 64).notNullable().references("id").inTable("scan_jobs").onDelete("CASCADE");
+      table.string("user_id", 64).notNullable();
+      table.string("service_id", 64).notNullable();
+      table.string("model_id", 64).notNullable();
+      table.integer("model_revision").notNullable();
+      table.string("candidate_key", 64).notNullable();
+      table.string("media_type", 16).notNullable();
+      table.string("trigger_reason", 64).notNullable();
+      table.string("rule_title", 300).notNullable();
+      table.string("cleaned_title", 200).notNullable();
+      table.string("alternate_title", 200).notNullable();
+      table.float("confidence").notNullable();
+      table.integer("file_count").notNullable();
+      table.string("created_at", 40).notNullable();
+      table.unique(["job_id", "candidate_key"], { indexName: "uq_ai_video_name_clean_usages_job_candidate" });
+      table.index(["job_id", "created_at"], "idx_ai_video_name_clean_usages_job_created");
     });
   }
 

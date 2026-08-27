@@ -106,10 +106,33 @@ export function describeMediaDirectory(
   allowedTypes: MediaType[],
   scanRootPath = "/",
 ): Map<string, MediaDescriptor> {
-  const descriptors = new Map<string, MediaDescriptor>();
-  const parsedVideos = allowedTypes.includes("video")
+  return buildMediaDirectoryDescriptors(
+    entries,
+    allowedTypes,
+    scanRootPath,
+    parseMediaDirectory(entries, allowedTypes, scanRootPath),
+  );
+}
+
+/** 同步执行现有目录规则，供 Worker 在 AI 请求前取得可解释的规则结果。 */
+export function parseMediaDirectory(
+  entries: ProviderEntry[],
+  allowedTypes: MediaType[],
+  scanRootPath = "/",
+): Map<string, FlymbyParsedVideoName> {
+  return allowedTypes.includes("video")
     ? parseFlymbyVideoDirectory(entries, scanRootPath)
     : new Map<string, FlymbyParsedVideoName>();
+}
+
+/** 使用最终规则或 AI 查询建议构建媒体描述，保持真实媒体类型和季集结构不变。 */
+export function buildMediaDirectoryDescriptors(
+  entries: ProviderEntry[],
+  allowedTypes: MediaType[],
+  scanRootPath: string,
+  parsedVideos: Map<string, FlymbyParsedVideoName>,
+): Map<string, MediaDescriptor> {
+  const descriptors = new Map<string, MediaDescriptor>();
   for (const entry of entries) {
     const descriptor = describeMediaFile(entry, allowedTypes, scanRootPath, parsedVideos.get(entry.resourceId));
     if (descriptor) descriptors.set(entry.resourceId, descriptor);
@@ -154,6 +177,10 @@ function describeVideo(
         resolution: parsed.resolution,
         source: parsed.source,
         releaseGroup: parsed.releaseGroup,
+        aiCleanedTitle: parsed.aiCleanedTitle,
+        aiAlternateTitle: parsed.aiAlternateTitle,
+        aiConfidence: parsed.aiConfidence,
+        aiReason: parsed.aiReason,
       },
     };
   }
@@ -197,6 +224,10 @@ function describeVideo(
       resolution: parsed.resolution,
       source: parsed.source,
       releaseGroup: parsed.releaseGroup,
+      aiCleanedTitle: parsed.aiCleanedTitle,
+      aiAlternateTitle: parsed.aiAlternateTitle,
+      aiConfidence: parsed.aiConfidence,
+      aiReason: parsed.aiReason,
     },
     parent: {
       identityKey: `video:series:${scrapeTaskKey}`,

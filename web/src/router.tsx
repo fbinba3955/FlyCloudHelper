@@ -44,6 +44,7 @@ import {
   AdminSystemPage,
   AdminUsersPage,
 } from "@/pages/AdminPages";
+import { AdminAiModelsPage } from "@/pages/AiModelPages";
 import {
   AdminServiceScanSchedulePage,
   UserServiceScanSchedulePage,
@@ -470,6 +471,12 @@ const adminPluginsRoute = createRoute({
   component: AdminPluginsPage,
 });
 
+const adminAiModelsRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "ai-models",
+  component: AdminAiModelsPage,
+});
+
 const adminSystemRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "system",
@@ -520,6 +527,7 @@ const adminRouteTree = adminRoute.addChildren([
   adminLibraryCatalogRoute,
   adminLibraryJellyfinSettingsRoute,
   adminPluginsRoute,
+  adminAiModelsRoute,
   adminConfigurationRoute,
   adminSystemRoute,
   adminAuditRoute,

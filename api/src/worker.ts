@@ -5,11 +5,21 @@ import type { MediaType, ScanJobRecord, SourceFileRecord } from "./domain.js";
 import { ApiError, toSafeErrorMessage } from "./errors.js";
 import {
   createStableId,
-  describeMediaDirectory,
+  buildMediaDirectoryDescriptors,
   describeMediaFile,
   getFileExtension,
+  parseMediaDirectory,
   type MediaDescriptor,
 } from "./media/filename.js";
+import {
+  AiVideoNameCleaner,
+  buildAiRecognitionRevision,
+  buildAiVideoNameCandidateContexts,
+  readAiModelTaskSnapshot,
+  type AiVideoNameCandidateContext,
+  type AiVideoNameCleanResult,
+} from "./media/ai-video-name-cleaner.js";
+import type { AiModelManager } from "./ai/ai-model-manager.js";
 import { isWeakFlymbyScrapeTitle } from "./media/flymby-video-parser.js";
 import { FlymbyVideoTitleCleaner } from "./media/flymby-video-title-cleaner.js";
 import {
@@ -81,6 +91,12 @@ interface ScanMetadataCache {
     hasManualMatch: boolean;
     itemType: string;
   }>>;
+  /** 同一影片任务只执行一次 AI 清洗，批量请求中的各候选也复用同一 Promise。 */
+  aiResults: Map<string, Promise<AiVideoNameCleanResult | null>>;
+  /** 按最终业务任务键保存目录和文件名上下文，供 TMDB 首次未匹配时补充第二查询词。 */
+  aiContexts: Map<string, AiVideoNameCandidateContext>;
+  /** AI 补充采用记录的任务归属，用于普通用户和管理员任务详情权限隔离。 */
+  aiUsageOwner: { userId: string; serviceId: string };
 }
 
 interface NfoSidecarEntry {
@@ -370,6 +386,7 @@ export class ScanWorker {
   private readonly tmdb: TmdbKeyPool;
   private readonly musicBrainz: MusicBrainzClient;
   private readonly plugins: MetadataPluginManager;
+  private readonly aiVideoNameCleaner: AiVideoNameCleaner;
   private readonly failureReports: ScanFailureReportService;
   private readonly logger: WorkerLogger;
   private readonly config: ApiConfig;
@@ -386,6 +403,7 @@ export class ScanWorker {
     tmdb: TmdbKeyPool;
     musicBrainz: MusicBrainzClient;
     plugins: MetadataPluginManager;
+    aiModels: AiModelManager;
     failureReports: ScanFailureReportService;
     logger: WorkerLogger;
     config: ApiConfig;
@@ -397,6 +415,7 @@ export class ScanWorker {
     this.tmdb = input.tmdb;
     this.musicBrainz = input.musicBrainz;
     this.plugins = input.plugins;
+    this.aiVideoNameCleaner = new AiVideoNameCleaner(input.database, input.aiModels, input.logger);
     this.failureReports = input.failureReports;
     this.logger = input.logger;
     this.config = input.config;
@@ -661,6 +680,9 @@ export class ScanWorker {
       video: new Map(),
       seasons: new Map(),
       parentItems: new Map(),
+      aiResults: new Map(),
+      aiContexts: new Map(),
+      aiUsageOwner: { userId: job.userId, serviceId: job.serviceId },
     };
     // 关键变量：已经在目录枚举中读取的 NFO，按远端绝对路径索引且不写入凭据。
     const nfoSidecars = restoreNfoSidecars(checkpoint.nfoSidecars);
@@ -681,6 +703,19 @@ export class ScanWorker {
     const scrapeConcurrency = Math.max(1, configuredScrapeTaskConcurrency);
     const tmdbRequestConcurrency = this.tmdb.getStatus().effectiveConcurrency;
     const metadataProfileRevision = Number(job.snapshot.metadataProfileRevision ?? 0);
+    // 关键变量：任务始终使用创建时冻结的模型修订，暂停恢复后也不会切换到新配置。
+    const aiModelSnapshot = readAiModelTaskSnapshot(job.snapshot.aiModel);
+    const recognitionRevision = buildAiRecognitionRevision(metadataProfileRevision, aiModelSnapshot);
+    this.logger.info({
+      日志关键字: "codex-flycloud-helper-ai-clean",
+      事件: "读取扫描任务AI清洗快照",
+      任务ID: job.id,
+      是否启用AI清洗: aiModelSnapshot !== null,
+      模型ID: aiModelSnapshot?.modelId ?? "无",
+      模型修订: aiModelSnapshot?.configurationRevision ?? 0,
+      触发策略: aiModelSnapshot?.triggerMode ?? "disabled",
+      有效识别修订: recognitionRevision,
+    });
     // 关键变量：同一节目目录内的单集落库允许并发，远端数据库连接池负责限制部署级总连接数。
     const mediaFilePersistenceConcurrency = 4;
     // 关键变量：只缓存当前目录，目录枚举完成后立即加入刮削队列，避免等待全盘扫描结束。
@@ -963,6 +998,7 @@ export class ScanWorker {
         await this.repository.markSourceFilesMetadataProcessed(
           successfullyPersistedSourceFileIds,
           metadataProfileRevision,
+          recognitionRevision,
         );
       } catch (error) {
         // 标记失败只会让下次全量扫描重新处理，不影响本次已经落库的数据。
@@ -1030,10 +1066,17 @@ export class ScanWorker {
       const firstItem = directoryItems[0];
       if (!firstItem) return;
       const candidatesToPrepare = directoryItems.filter((candidate) => candidate.shouldProcess);
-      const descriptors = describeMediaDirectory(
-        directoryItems.map((item) => item.entry),
+      const directoryEntries = directoryItems.map((item) => item.entry);
+      const ruleParsedVideos = parseMediaDirectory(
+        directoryEntries,
         firstItem.rootTypes,
         firstItem.rootPath,
+      );
+      const ruleDescriptors = buildMediaDirectoryDescriptors(
+        directoryEntries,
+        firstItem.rootTypes,
+        firstItem.rootPath,
+        ruleParsedVideos,
       );
       const videoFileNames = directoryItems.map((item) => item.entry.name);
       const explicitEpisodeFileCount = videoFileNames.filter((fileName) =>
@@ -1042,7 +1085,7 @@ export class ScanWorker {
       const dateEpisodeFileCount = videoFileNames.filter((fileName) =>
         /(?:^|\D)(?:19|20)\d{2}[01]\d[0-3]\d(?:\D|$)/u.test(fileName),
       ).length;
-      const recognizedEpisodeCount = [...descriptors.values()].filter((descriptor) =>
+      const recognizedEpisodeCount = [...ruleDescriptors.values()].filter((descriptor) =>
         descriptor.itemType === "video.episode",
       ).length;
       const directoryName = path.posix.basename(String(flushedDirectoryKey ?? ""));
@@ -1071,6 +1114,8 @@ export class ScanWorker {
           if (signal.aborted || tmdbRecoveryError) return { businessTasks: [], skippedCount: 0, businessTaskKeys: [] };
           const sourceBatchStartedAt = Date.now();
           let directorySkippedCount = 0;
+          let descriptors = ruleDescriptors;
+          let aiContextsByResourceId = buildAiVideoNameCandidateContexts(directoryEntries, ruleParsedVideos);
           try {
             const preparedFiles = await this.repository.prepareSourceFiles(
               candidatesToPrepare.map((candidate) => candidate.sourceFileInput),
@@ -1130,12 +1175,37 @@ export class ScanWorker {
             return { businessTasks: [], skippedCount: directorySkippedCount, businessTaskKeys: [] };
           }
 
+          // 关键变量：先完成源文件复用判断，只为本轮确实需要处理且没有同目录 NFO 的弱标题调用模型。
+          const directoryPath = path.posix.dirname(firstItem.entry.path);
+          const directoryHasNfo = [...nfoSidecars.keys()].some((nfoPath) => path.posix.dirname(nfoPath) === directoryPath);
+          if (aiModelSnapshot && !directoryHasNfo && directoryItems.some((candidate) => candidate.shouldProcess)) {
+            const cleanedDirectory = await this.aiVideoNameCleaner.cleanWeakDirectory({
+              entries: directoryEntries,
+              parsedVideos: ruleParsedVideos,
+              snapshot: aiModelSnapshot,
+              jobId: job.id,
+              userId: job.userId,
+              serviceId: job.serviceId,
+              taskCache: metadataCache.aiResults,
+              signal,
+            });
+            descriptors = buildMediaDirectoryDescriptors(
+              directoryEntries,
+              firstItem.rootTypes,
+              firstItem.rootPath,
+              cleanedDirectory.parsedVideos,
+            );
+            aiContextsByResourceId = cleanedDirectory.contextsByResourceId;
+          }
+
           const directoryTasks = new Map<string, PendingBusinessMedia[]>();
           for (const candidate of directoryItems) {
             if (!candidate.shouldProcess) continue;
             const descriptor = descriptors.get(candidate.entry.resourceId);
             if (!descriptor) continue;
             const businessTaskKey = readBusinessTaskKey(descriptor);
+            const aiContext = aiContextsByResourceId.get(candidate.entry.resourceId);
+            if (aiContext) metadataCache.aiContexts.set(businessTaskKey, aiContext);
             const taskItems = directoryTasks.get(businessTaskKey) ?? [];
             taskItems.push({ descriptor, candidate });
             directoryTasks.set(businessTaskKey, taskItems);
@@ -1518,6 +1588,7 @@ export class ScanWorker {
           scanRootKey,
           generationId: sourceGenerationId,
           metadataProfileRevision,
+          recognitionRevision,
           locator: entry.locator,
         },
         skipIfUnchanged: !isRetryJob
@@ -2011,7 +2082,7 @@ export class ScanWorker {
       }
     }
     if (descriptor.mediaType === "video" && (!providerId || providerId === "tmdb" || providerId === "builtin.tmdb")) {
-      const tmdbResult = await this.enrichVideoFromTmdb(descriptor, profile, cache, jobId, signal);
+      const tmdbResult = await this.enrichVideoFromTmdb(descriptor, profile, jobSnapshot, cache, jobId, signal);
       if (tmdbResult) return tmdbResult;
     }
     if (descriptor.mediaType === "music" && descriptor.itemType === "music.track") {
@@ -2124,6 +2195,7 @@ export class ScanWorker {
   private async enrichVideoFromTmdb(
     descriptor: MediaDescriptor,
     profile: Record<string, unknown>,
+    jobSnapshot: Record<string, unknown>,
     cache: ScanMetadataCache,
     jobId: string,
     signal: AbortSignal,
@@ -2139,6 +2211,9 @@ export class ScanWorker {
     const region = String(profile.region ?? "CN");
     const imdbId = typeof descriptor.metadata.imdbId === "string" ? descriptor.metadata.imdbId : "";
     const explicitTmdbId = Number(descriptor.metadata.explicitTmdbId ?? 0);
+    const aiModelSnapshot = readAiModelTaskSnapshot(jobSnapshot.aiModel);
+    const businessTaskKey = readBusinessTaskKey(descriptor);
+    const aiContext = cache.aiContexts.get(businessTaskKey);
     // 关键变量：关闭时普通标题命中后只保留搜索摘要，详情在打开条目时实时补查。
     const synchronizeDetails = profile.syncDetails === true;
     // TMDB 客户端必须先检查部署级共享缓存；仅在缓存未命中时才由 Key 池决定返回空结果或延迟恢复。
@@ -2147,7 +2222,8 @@ export class ScanWorker {
       !confirmedNumericSeriesTitle && isWeakFlymbyScrapeTitle(query)) {
       return null;
     }
-    const cacheKey = `${mediaType}|${String(descriptor.metadata.scrapeTaskKey ?? query)}|${language}|${region}`;
+    const recognitionRevision = buildAiRecognitionRevision(Number(jobSnapshot.metadataProfileRevision ?? 0), aiModelSnapshot);
+    const cacheKey = `${mediaType}|${String(descriptor.metadata.scrapeTaskKey ?? query)}|${language}|${region}|${recognitionRevision}`;
     let videoPromise = cache.video.get(cacheKey);
     const isFirstTaskQuery = !videoPromise;
     if (!videoPromise) {
@@ -2171,6 +2247,21 @@ export class ScanWorker {
         imdbId,
         explicitTmdbId,
         includeDetails: synchronizeDetails,
+        cacheRevision: recognitionRevision,
+        resolveSecondSearchTitle: aiModelSnapshot?.triggerMode === "weak_or_unmatched"
+          && explicitTmdbId <= 0
+          && !imdbId
+          && aiContext
+          ? () => this.aiVideoNameCleaner.resolveSecondSearchTitle({
+            context: aiContext,
+            snapshot: aiModelSnapshot,
+            jobId,
+            userId: cache.aiUsageOwner.userId,
+            serviceId: cache.aiUsageOwner.serviceId,
+            taskCache: cache.aiResults,
+            signal,
+          })
+          : undefined,
         signal,
       });
       cache.video.set(cacheKey, videoPromise);

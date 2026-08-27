@@ -273,6 +273,7 @@ export async function registerServiceMigrationRoutes(
       requireObject(request.body, "metadata", "元数据配置"),
       dataType,
     );
+    await runtime.aiModels.validateMetadataProfile(metadataProfile);
     const snapshot = requireObject(request.body, "snapshot", "迁移快照信息");
     const expectedBytes = readSnapshotBytes(snapshot.totalBytes, runtime.config.migrationSnapshotMaxBytes);
     const expectedChunkCount = readSnapshotChunkCount(snapshot.totalChunks);

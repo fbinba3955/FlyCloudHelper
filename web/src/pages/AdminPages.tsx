@@ -93,6 +93,7 @@ function SystemConfigurationSummary({ config }: { config: AdminConfigStatus }) {
       <SystemSummaryItem label="音乐刮削" value="MusicBrainz" status={config.music.musicBrainz.status === "available" ? "可用" : "不可用"} tone={config.music.musicBrainz.status === "available" ? "success" : "warning"} />
       <SystemSummaryItem label="凭据主密钥" value={configurationSourceLabels[config.credentials.source]} status={config.credentials.configured ? "已配置" : "未配置"} tone={config.credentials.configured ? "success" : "danger"} />
       <SystemSummaryItem label="元数据插件" value={`已启用 ${config.plugins.enabledCount} / 已安装 ${config.plugins.installedCount}`} status={config.plugins.directoryReady ? "目录正常" : "目录异常"} tone={config.plugins.directoryReady ? "success" : "danger"} />
+      <SystemSummaryItem label="AI 模型" value={`已启用 ${config.aiModels.enabledCount} / 已配置 ${config.aiModels.configuredCount}`} status={config.aiModels.availableCount > 0 ? `${config.aiModels.availableCount} 个可用` : "尚无可用模型"} tone={config.aiModels.availableCount > 0 ? "success" : config.aiModels.configuredCount > 0 ? "warning" : "neutral"} />
       <SystemSummaryItem label="扫描 Worker" value={`活动 ${config.worker.activeWorkers} / 并发 ${config.worker.concurrency}`} status={config.worker.running ? "运行中" : "已停止"} tone={config.worker.running ? "success" : "warning"} />
     </div>
   );

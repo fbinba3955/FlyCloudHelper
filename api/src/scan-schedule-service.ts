@@ -8,6 +8,7 @@ import { ApiError, toSafeErrorMessage } from "./errors.js";
 import type { MetadataPluginManager } from "./plugin-manager.js";
 import type { ServiceRepository } from "./service-repository.js";
 import type { TmdbKeyPool } from "./metadata/tmdb.js";
+import type { AiModelManager } from "./ai/ai-model-manager.js";
 
 /** 定时器支持的任务类型；字段名沿用 scanMode 以兼容已经发布的客户端。 */
 type ScheduledTaskMode = "incremental" | "full" | "media_probe";
@@ -377,6 +378,7 @@ export class ScanScheduleWorker {
     store: ScanScheduleStore;
     repository: ServiceRepository;
     plugins: MetadataPluginManager;
+    aiModels: AiModelManager;
     tmdb: TmdbKeyPool;
     logger: ScanScheduleLogger;
   }) {}
@@ -485,6 +487,7 @@ export class ScanScheduleWorker {
         scanMode: schedule.scanMode,
         runtimeRevision: "scanner-worker-v1",
         tmdbKeyPoolRevision: this.options.tmdb.revision,
+        aiModel: await this.options.aiModels.buildTaskSnapshot(service.metadataProfile),
         pluginVersions: await this.options.plugins.buildTaskSnapshots(service.metadataProfile),
       });
       await this.options.store.markTriggeredJob(schedule.id, job.id);

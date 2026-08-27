@@ -3,6 +3,7 @@ import { CalendarClock, Plus, RefreshCw, ScanLine, Settings2, Trash2 } from "luc
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
+import { AiCleaningSettingsFields, type AiCleaningSettingsValue } from "@/components/AiCleaningSettingsFields";
 import { GuangyaAuthorizationPanel } from "@/components/GuangyaAuthorizationPanel";
 import { ProviderConnectionGuide } from "@/components/ProviderConnectionGuide";
 import { ServicePathPicker, toProviderDirectory } from "@/components/ServicePathPicker";
@@ -15,6 +16,7 @@ import {
   deleteCloudService,
   getService,
   listAdminUsers,
+  listAvailableAiModels,
   listProviders,
   listServices,
   reconnectServiceConnection,
@@ -116,6 +118,8 @@ interface VideoMetadataSettings {
   syncDetails: boolean;
   /** 是否在扫描结束后异步使用 ffprobe 分析实际媒体规格。 */
   analyzeMediaSpecs: boolean;
+  /** 只作用于影视刮削查询词的 AI 补充配置。 */
+  aiCleaning: AiCleaningSettingsValue;
 }
 
 interface ScanConcurrencySettings {
@@ -158,6 +162,9 @@ function readVideoMetadataSettings(profile: Record<string, unknown>): VideoMetad
     ? videoProfile.sources.find((item): item is string => typeof item === "string")
     : undefined;
   const configuredProvider = typeof videoProfile.providerId === "string" ? videoProfile.providerId : firstSource;
+  const aiCleaning = videoProfile.aiCleaning && typeof videoProfile.aiCleaning === "object" && !Array.isArray(videoProfile.aiCleaning)
+    ? videoProfile.aiCleaning as Record<string, unknown>
+    : {};
   return {
     providerId: configuredProvider === "tmdb" || !configuredProvider ? "builtin.tmdb" : configuredProvider,
     language: typeof videoProfile.language === "string" ? videoProfile.language : "zh-CN",
@@ -167,6 +174,12 @@ function readVideoMetadataSettings(profile: Record<string, unknown>): VideoMetad
     syncDetails: videoProfile.syncDetails === true,
     // 关键变量：旧服务默认不读取视频字节，只有用户明确开启后才进入独立队列。
     analyzeMediaSpecs: videoProfile.analyzeMediaSpecs === true,
+    aiCleaning: {
+      enabled: aiCleaning.enabled === true,
+      modelId: typeof aiCleaning.modelId === "string" ? aiCleaning.modelId : "",
+      triggerMode: aiCleaning.triggerMode === "weak_only" ? "weak_only" : "weak_or_unmatched",
+      minConfidence: typeof aiCleaning.minConfidence === "number" ? aiCleaning.minConfidence : 0.75,
+    },
   };
 }
 
@@ -194,6 +207,7 @@ function buildVideoMetadataProfile(
         useNfo: settings.useNfo,
         syncDetails: settings.syncDetails,
         analyzeMediaSpecs: settings.analyzeMediaSpecs,
+        aiCleaning: settings.aiCleaning,
       },
     },
   };
@@ -429,6 +443,7 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
             useNfo: true,
             syncDetails: false,
             analyzeMediaSpecs: false,
+            aiCleaning: { enabled: false, modelId: "", triggerMode: "weak_or_unmatched", minConfidence: 0.75 },
           },
         },
       },
@@ -609,6 +624,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   const navigate = useNavigate();
   const resource = useApiResource(() => getService(serviceId, admin), [serviceId, admin]);
   const providers = useApiResource(() => listProviders(), []);
+  const availableAiModels = useApiResource(() => listAvailableAiModels(serviceId), [serviceId]);
   const [message, setMessage] = useState<string | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState(false);
   const updatingStatusRef = useRef(false);
@@ -629,6 +645,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     useNfo: true,
     syncDetails: false,
     analyzeMediaSpecs: false,
+    aiCleaning: { enabled: false, modelId: "", triggerMode: "weak_or_unmatched", minConfidence: 0.75 },
   });
   const [scanConcurrencySettings, setScanConcurrencySettings] = useState<ScanConcurrencySettings>({
     scanDirectoryConcurrency: 8,
@@ -745,6 +762,9 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         使用本地NFO: metadataSettings.useNfo,
         同步刮削详情: metadataSettings.syncDetails,
         分析媒体规格: metadataSettings.analyzeMediaSpecs,
+        启用AI清洗: metadataSettings.aiCleaning.enabled,
+        AI模型ID: metadataSettings.aiCleaning.modelId || "无",
+        AI触发策略: metadataSettings.aiCleaning.triggerMode,
         错误信息: errorMessage,
       });
       setMessage(errorMessage);
@@ -989,6 +1009,12 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
                 </SecondaryButton>
               </div>
             </div>
+            <AiCleaningSettingsFields state={{
+              value: metadataSettings.aiCleaning,
+              models: availableAiModels.data?.items ?? [],
+              loading: availableAiModels.loading,
+              onChange: (aiCleaning) => setMetadataSettings((current) => ({ ...current, aiCleaning })),
+            }} />
             <div className="flex justify-end"><PrimaryButton type="submit">保存元数据配置</PrimaryButton></div>
           </form>
         </Panel>

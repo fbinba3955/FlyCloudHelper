@@ -460,6 +460,27 @@ export function validateMetadataProfile(
   if (metadataSettings.analyzeMediaSpecs !== undefined && typeof metadataSettings.analyzeMediaSpecs !== "boolean") {
     throw validationError(`metadata.profiles.${serviceDataType}.analyzeMediaSpecs`, "媒体规格分析开关必须是布尔值");
   }
+  if (metadataSettings.aiCleaning !== undefined) {
+    if (!metadataSettings.aiCleaning || typeof metadataSettings.aiCleaning !== "object" || Array.isArray(metadataSettings.aiCleaning)) {
+      throw validationError(`metadata.profiles.${serviceDataType}.aiCleaning`, "AI 清洗配置必须是对象");
+    }
+    const aiCleaning = metadataSettings.aiCleaning as Record<string, unknown>;
+    if (typeof aiCleaning.enabled !== "boolean") {
+      throw validationError(`metadata.profiles.${serviceDataType}.aiCleaning.enabled`, "AI 清洗开关必须是布尔值");
+    }
+    if (aiCleaning.enabled && (typeof aiCleaning.modelId !== "string" || !aiCleaning.modelId.trim())) {
+      throw validationError(`metadata.profiles.${serviceDataType}.aiCleaning.modelId`, "启用 AI 清洗时必须选择模型");
+    }
+    if (aiCleaning.triggerMode !== undefined
+      && aiCleaning.triggerMode !== "weak_only"
+      && aiCleaning.triggerMode !== "weak_or_unmatched") {
+      throw validationError(`metadata.profiles.${serviceDataType}.aiCleaning.triggerMode`, "AI 清洗策略无效");
+    }
+    if (aiCleaning.minConfidence !== undefined
+      && (typeof aiCleaning.minConfidence !== "number" || aiCleaning.minConfidence < 0.5 || aiCleaning.minConfidence > 1)) {
+      throw validationError(`metadata.profiles.${serviceDataType}.aiCleaning.minConfidence`, "AI 清洗最低置信度必须在 0.5 到 1 之间");
+    }
+  }
   return profile;
 }
 
@@ -481,6 +502,11 @@ export function readVideoMetadataLogFields(profile: Record<string, unknown>): Re
     使用本地NFO: videoProfile.useNfo !== false,
     同步刮削详情: videoProfile.syncDetails === true,
     分析媒体规格: videoProfile.analyzeMediaSpecs === true,
+    启用AI清洗: Boolean(videoProfile.aiCleaning && typeof videoProfile.aiCleaning === "object"
+      && (videoProfile.aiCleaning as Record<string, unknown>).enabled === true),
+    AI触发策略: videoProfile.aiCleaning && typeof videoProfile.aiCleaning === "object"
+      ? String((videoProfile.aiCleaning as Record<string, unknown>).triggerMode ?? "weak_or_unmatched")
+      : "disabled",
   };
 }
 
@@ -607,6 +633,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       requireObject(request.body, "metadata", "元数据配置"),
       dataType,
     );
+    await runtime.aiModels.validateMetadataProfile(metadataProfile);
     await validateProviderAccess(adapter, connection, scanProfile);
     const creation = await runtime.repository.createService({
       serviceId: randomUUID(),
@@ -1264,6 +1291,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       requireObject(request.body, "metadata", "元数据配置"),
       service.dataType,
     );
+    await runtime.aiModels.validateMetadataProfile(profile);
     const updatedService = await runtime.repository.updateMetadataProfile(
       request.params.serviceId,
       user.id,
@@ -1470,6 +1498,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       scanMode,
       runtimeRevision: "scanner-worker-v1",
       tmdbKeyPoolRevision: runtime.tmdb.revision,
+      aiModel: await runtime.aiModels.buildTaskSnapshot(service.metadataProfile),
       pluginVersions: await runtime.plugins.buildTaskSnapshots(service.metadataProfile),
     });
     runtime.logBusinessEvent("info", { 事件: "创建扫描任务", 用户ID: user.id, 服务ID: job.serviceId, 任务ID: job.id });
@@ -1597,6 +1626,7 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     if (sourceJob.status !== "failed" && sourceJob.status !== "cancelled") {
       throw new ApiError(409, "job_not_retryable", "只有失败或已取消任务可以重试");
     }
+    const service = await runtime.repository.getServiceDetail(sourceJob.serviceId, user.id);
     const job = await runtime.repository.createScanJob({
       jobId: randomUUID(),
       userId: user.id,
@@ -1607,10 +1637,9 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       scanMode: sourceJob.scanMode,
       runtimeRevision: "scanner-worker-v1",
       tmdbKeyPoolRevision: runtime.tmdb.revision,
+      aiModel: await runtime.aiModels.buildTaskSnapshot(service.metadataProfile),
       retryOfJobId: sourceJob.id,
-      pluginVersions: await runtime.plugins.buildTaskSnapshots(
-        (await runtime.repository.getServiceDetail(sourceJob.serviceId, user.id)).metadataProfile,
-      ),
+      pluginVersions: await runtime.plugins.buildTaskSnapshots(service.metadataProfile),
     });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-retry",

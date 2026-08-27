@@ -1,14 +1,16 @@
 import { Link } from "@tanstack/react-router";
-import { Download, Images, Pause, Play, Radio, RefreshCw, RotateCcw, Settings2, Square, Trash2 } from "lucide-react";
+import { Download, Images, Pause, Play, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
+import { AiSupplementDialog } from "@/components/AiSupplementDialog";
 import { Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/ui-kit";
 import {
   cancelScanJob,
   clearCompletedScanJobs,
   deleteScanJob,
   downloadScanFailureReport,
+  getJobAiSupplements,
   listJobs,
   listAdminUsers,
   listMediaProbeJobFailures,
@@ -18,6 +20,7 @@ import {
   resumeScanJob,
   retryScanJob,
   type JobStatus,
+  type JobAiSupplementResult,
   type MediaProbeFailure,
   type ScanJob,
   type ServiceListFilters,
@@ -233,12 +236,19 @@ function JobsView({ admin }: { admin: boolean }) {
   const [message, setMessage] = useState<string | null>(null);
   const [mediaProbeFailures, setMediaProbeFailures] = useState<MediaProbeFailure[]>([]);
   const [mediaProbeFailuresLoaded, setMediaProbeFailuresLoaded] = useState(false);
+  const [aiSupplementDialogOpen, setAiSupplementDialogOpen] = useState(false);
+  const [aiSupplementDialogJobId, setAiSupplementDialogJobId] = useState("");
+  const [aiSupplementResult, setAiSupplementResult] = useState<JobAiSupplementResult | null>(null);
+  const [aiSupplementLoading, setAiSupplementLoading] = useState(false);
+  const [aiSupplementError, setAiSupplementError] = useState<string | null>(null);
   const [pendingJobOperations, setPendingJobOperations] = useState<Record<string, JobOperation>>({});
   const [clearingCompletedJobs, setClearingCompletedJobs] = useState(false);
   // 关键变量：引用中的任务操作会在事件处理入口同步写入，阻止 React 状态刷新前发生的连续点击。
   const pendingJobOperationsRef = useRef<Map<string, JobOperation>>(new Map());
   // 关键变量：批量清理请求同步占位，避免确认框关闭到 React 刷新之间重复提交。
   const clearingCompletedJobsRef = useRef(false);
+  // 关键变量：Dialog 请求归属任务，切换任务或关闭后忽略旧请求返回。
+  const aiSupplementRequestJobIdRef = useRef<string | null>(null);
   const jobs = resource.data?.items ?? [];
   const activeJob = jobs.find((job) => job.id === selectedJobId) ?? jobs[0];
   const pendingActiveJobOperation = activeJob ? pendingJobOperations[activeJob.id] : undefined;
@@ -450,6 +460,40 @@ function JobsView({ admin }: { admin: boolean }) {
     }
   }
 
+  /** 打开当前扫描任务的 AI 补充汇总，并读取最近 20 条采用内容。 */
+  async function openAiSupplementDialog(): Promise<void> {
+    if (!activeJob || activeJob.jobType !== "scan") return;
+    const targetJobId = activeJob.id;
+    aiSupplementRequestJobIdRef.current = targetJobId;
+    setAiSupplementDialogJobId(targetJobId);
+    setAiSupplementDialogOpen(true);
+    setAiSupplementLoading(true);
+    setAiSupplementError(null);
+    setAiSupplementResult(null);
+    try {
+      const result = await getJobAiSupplements(targetJobId, admin);
+      if (aiSupplementRequestJobIdRef.current !== targetJobId) return;
+      setAiSupplementResult(result);
+    } catch (error) {
+      if (aiSupplementRequestJobIdRef.current !== targetJobId) return;
+      const errorMessage = error instanceof Error ? error.message : "读取 AI 补充详情失败";
+      console.warn("codex-flycloud-helper-ai-clean", {
+        事件: "读取任务AI补充详情失败",
+        任务ID: targetJobId,
+        错误信息: errorMessage,
+      });
+      setAiSupplementError(errorMessage);
+    } finally {
+      if (aiSupplementRequestJobIdRef.current === targetJobId) setAiSupplementLoading(false);
+    }
+  }
+
+  /** 关闭 AI 补充详情并使尚未完成的旧请求失效。 */
+  function closeAiSupplementDialog(): void {
+    aiSupplementRequestJobIdRef.current = null;
+    setAiSupplementDialogOpen(false);
+  }
+
   return (
     <>
       <PageHeader
@@ -534,7 +578,10 @@ function JobsView({ admin }: { admin: boolean }) {
                   <span title="完整电影或节目处理失败的数量">错误 {activeJob.errorCount.toLocaleString()}</span>
                 </div>
               )}
-              {activeJob.jobType === "scan" && <div className="mt-4 flex justify-end border-t border-border/70 pt-4">
+              {activeJob.jobType === "scan" && <div className="mt-4 flex flex-wrap justify-end gap-2 border-t border-border/70 pt-4">
+                <SecondaryButton onClick={() => void openAiSupplementDialog()}>
+                  <Sparkles className="size-4" /> AI补充详情
+                </SecondaryButton>
                 <SecondaryButton onClick={() => void downloadSelectedFailureReport()} disabled={!canDownloadFailureReport}>
                   <Download className="size-4" /> 下载失败报告
                 </SecondaryButton>
@@ -602,6 +649,14 @@ function JobsView({ admin }: { admin: boolean }) {
           </Panel>
         </div>
       )}
+      <AiSupplementDialog state={{
+        open: aiSupplementDialogOpen,
+        loading: aiSupplementLoading,
+        error: aiSupplementError,
+        jobId: aiSupplementDialogJobId,
+        result: aiSupplementResult,
+        onClose: closeAiSupplementDialog,
+      }} />
     </>
   );
 }

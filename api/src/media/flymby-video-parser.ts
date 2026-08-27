@@ -4,6 +4,9 @@ import { FlymbyVideoTitleCleaner } from "./flymby-video-title-cleaner.js";
 
 export type FlymbyParsedVideoType = "movie" | "tv";
 
+// 关键变量：影响影视查询语义的本地清洗规则发生变化时必须提升，避免复用旧 AI 清洗缓存。
+export const FLYMBY_VIDEO_NAME_CLEANER_VERSION = "webdav-video-name-parser-2026-08-20";
+
 export interface FlymbyParsedVideoName {
   mediaType: FlymbyParsedVideoType;
   fileName: string;
@@ -39,6 +42,11 @@ export interface FlymbyParsedVideoName {
   resolution: string;
   source: string;
   releaseGroup: string;
+  /** AI 只补充查询词，不修改真实文件名、媒体类型或季集结构。 */
+  aiCleanedTitle?: string;
+  aiAlternateTitle?: string;
+  aiConfidence?: number;
+  aiReason?: string;
 }
 
 const videoExtensionPattern = /^(?:mp4|mkv|iso|avi|mov|wmv|flv|m4v|ts|m2ts|webm|rmvb|mpg|mpeg|3gp|strm)$/iu;

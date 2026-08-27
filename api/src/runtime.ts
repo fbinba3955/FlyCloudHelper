@@ -1,4 +1,5 @@
 import type { ApiConfig } from "./config.js";
+import type { AiModelManager } from "./ai/ai-model-manager.js";
 import type { FlyCloudHelperDatabase } from "./database.js";
 import type { LibraryExportService } from "./export-service.js";
 import type { MusicBrainzClient } from "./metadata/musicbrainz.js";
@@ -34,6 +35,7 @@ export interface ApiRuntime {
   scanSchedules: ScanScheduleStore;
   scanScheduleWorker: ScanScheduleWorker;
   plugins: MetadataPluginManager;
+  aiModels: AiModelManager;
   exports: LibraryExportService;
   failureReports: ScanFailureReportService;
   publicAccess: PublicAccessService;

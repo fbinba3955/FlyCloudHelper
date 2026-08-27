@@ -243,6 +243,8 @@ export interface SourceFileRecord {
   generationId: string;
   /** 最近一次成功生成当前媒体目录结果时使用的元数据配置修订。 */
   metadataProfileRevision: number;
+  /** 规则、服务元数据配置、模型和提示词共同组成的有效识别修订。 */
+  recognitionRevision: string;
   locator: Record<string, unknown>;
 }
 
@@ -334,6 +336,52 @@ export interface PluginVersionRecord {
   installedPath: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export type AiModelProtocol = "openai_chat_completions";
+export type AiModelStatus = "enabled" | "disabled";
+export type AiModelCheckStatus = "unknown" | "available" | "unavailable";
+
+/** 管理端可见的 AI 模型配置，不包含 API Key 原文。 */
+export interface AiModelRecord {
+  id: string;
+  displayName: string;
+  protocol: AiModelProtocol;
+  status: AiModelStatus;
+  configurationRevision: number;
+  baseUrl: string;
+  modelName: string;
+  timeoutMs: number;
+  maxConcurrency: number;
+  apiKeyConfigured: boolean;
+  lastCheckStatus: AiModelCheckStatus;
+  lastCheckErrorCode: string | null;
+  lastCheckErrorMessage: string | null;
+  lastCheckLatencyMs: number | null;
+  lastCheckStructuredOutput: boolean;
+  lastCheckedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 单次模型可用性测试的脱敏结果。 */
+export interface AiModelAvailabilityResult {
+  available: boolean;
+  structuredOutput: boolean;
+  latencyMs: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
+export type AiCleaningTriggerMode = "weak_only" | "weak_or_unmatched";
+
+/** 扫描任务冻结的 AI 模型与清洗策略，不包含地址或 API Key。 */
+export interface AiModelTaskSnapshot {
+  modelId: string;
+  configurationRevision: number;
+  promptVersion: string;
+  triggerMode: AiCleaningTriggerMode;
+  minConfidence: number;
 }
 
 export interface AuditRecord {

@@ -4,6 +4,7 @@ import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
+import { AiModelManager } from "./ai/ai-model-manager.js";
 import { projectRoot, type ApiConfig } from "./config.js";
 import { FlyCloudHelperDatabase } from "./database.js";
 import { ApiError } from "./errors.js";
@@ -14,6 +15,7 @@ import { TmdbKeyPool } from "./metadata/tmdb.js";
 import { MetadataPluginManager } from "./plugin-manager.js";
 import { ProviderRegistry } from "./providers/registry.js";
 import { registerAdminRoutes } from "./routes/admin-routes.js";
+import { registerAiModelRoutes } from "./routes/ai-model-routes.js";
 import { registerAuthRoutes } from "./routes/auth-routes.js";
 import { registerCatalogRoutes } from "./routes/catalog-routes.js";
 import { registerGuangyaAuthRoutes } from "./routes/guangya-auth-routes.js";
@@ -109,6 +111,9 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
           "masterKey",
           "credentialKeyBackup.masterKey",
           "connection",
+          "apiKey",
+          "body.apiKey",
+          "req.body.apiKey",
         ],
         censor: "[已脱敏]",
       },
@@ -154,6 +159,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   );
   const musicBrainz = new MusicBrainzClient(config);
   const plugins = new MetadataPluginManager(database, config, vault);
+  const aiModels = new AiModelManager(database, vault);
   const failureReports = new ScanFailureReportService(config, server.log);
   const exports = new LibraryExportService(database, config, (level, fields) => {
     if (level === "warn") {
@@ -170,6 +176,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     tmdb,
     musicBrainz,
     plugins,
+    aiModels,
     failureReports,
     logger: server.log,
     config,
@@ -187,6 +194,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     store: scanSchedules,
     repository,
     plugins,
+    aiModels,
     tmdb,
     logger,
   });
@@ -213,6 +221,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     scanSchedules,
     scanScheduleWorker,
     plugins,
+    aiModels,
     exports,
     failureReports,
     publicAccess,
@@ -394,6 +403,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerJellyfinRoutes(server, runtime);
   await registerNotificationRoutes(server, runtime);
   await registerAdminRoutes(server, runtime);
+  await registerAiModelRoutes(server, runtime);
   await registerPluginRoutes(server, runtime);
 
   if (fs.existsSync(config.webDistDirectory)) {

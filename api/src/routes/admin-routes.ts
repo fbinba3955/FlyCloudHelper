@@ -112,11 +112,12 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
 
   server.get("/api/v1/admin/config/status", async (request) => {
     await requireSuperAdmin(request, runtime.database);
-    const [pluginCount, enabledPluginCount, tmdbStatus, publicAccess] = await Promise.all([
+    const [pluginCount, enabledPluginCount, tmdbStatus, publicAccess, aiModels] = await Promise.all([
       runtime.database.query("metadata_plugin_versions").count<{ count: string | number }[]>({ count: "id" }).first(),
       runtime.database.query("metadata_plugin_versions").where({ status: "enabled" }).count<{ count: string | number }[]>({ count: "id" }).first(),
       getTmdbConfigurationStatus(runtime),
       runtime.publicAccess.getStatus(),
+      runtime.aiModels.getSummary(),
     ]);
     return {
       database: { type: runtime.config.databaseType, schemaVersion: (await runtime.database.getSystemState()).schemaVersion },
@@ -141,6 +142,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
         installedCount: Number(pluginCount?.count ?? 0),
         enabledCount: Number(enabledPluginCount?.count ?? 0),
       },
+      aiModels,
       worker: runtime.worker.getStatus(),
     };
   });
@@ -469,6 +471,11 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       adapter.descriptor.recommendedScanSettings,
     );
     await validateProviderAccess(adapter, connection, scanProfile);
+    const metadataProfile = validateMetadataProfile(
+      requireObject(request.body, "metadata", "元数据配置"),
+      dataType,
+    );
+    await runtime.aiModels.validateMetadataProfile(metadataProfile);
     const creation = await runtime.repository.createService({
       serviceId: randomUUID(),
       libraryId: randomUUID(),
@@ -479,10 +486,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       encryptedConnection: runtime.vault.encrypt(connection),
       providerSchemaVersion: adapter.descriptor.credentialSchemaVersion,
       scanProfile,
-      metadataProfile: validateMetadataProfile(
-        requireObject(request.body, "metadata", "元数据配置"),
-        dataType,
-      ),
+      metadataProfile,
     });
     const service = creation.service;
     consumeProviderAuthorization(runtime, operator.id, resolvedConnection.authorizationSessionId);
@@ -794,6 +798,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     const operator = await requireSuperAdmin(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
     const profile = validateMetadataProfile(requireObject(request.body, "metadata", "元数据配置"), service.dataType);
+    await runtime.aiModels.validateMetadataProfile(profile);
     const updated = await runtime.repository.updateMetadataProfile(
       service.id,
       service.userId,
@@ -894,6 +899,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       scanMode,
       runtimeRevision: "scanner-worker-v1",
       tmdbKeyPoolRevision: runtime.tmdb.revision,
+      aiModel: await runtime.aiModels.buildTaskSnapshot(service.metadataProfile),
       pluginVersions: await runtime.plugins.buildTaskSnapshots(service.metadataProfile),
     });
     await audit(runtime, operator, "create_scan_job", "scan_job", job.id, { 服务ID: service.id });
@@ -1151,6 +1157,7 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       scanMode: sourceJob.scanMode,
       runtimeRevision: "scanner-worker-v1",
       tmdbKeyPoolRevision: runtime.tmdb.revision,
+      aiModel: await runtime.aiModels.buildTaskSnapshot(service.metadataProfile),
       retryOfJobId: sourceJob.id,
       pluginVersions: await runtime.plugins.buildTaskSnapshots(service.metadataProfile),
     });

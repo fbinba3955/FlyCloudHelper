@@ -3,6 +3,7 @@ import type { Knex } from "knex";
 import type { FlyCloudHelperDatabase } from "./database.js";
 import {
   type CloudServiceRecord,
+  type AiModelTaskSnapshot,
   type CatalogSort,
   type JobEventRecord,
   type JobStage,
@@ -1248,6 +1249,7 @@ export class ServiceRepository {
     scanMode: "incremental" | "full";
     runtimeRevision: string;
     tmdbKeyPoolRevision: string;
+    aiModel: AiModelTaskSnapshot | null;
     retryOfJobId?: string;
     pluginVersions: Array<{
       pluginId: string;
@@ -1292,6 +1294,7 @@ export class ServiceRepository {
           providerType: service.provider_type,
           runtimeRevision: input.runtimeRevision,
           tmdbKeyPoolRevision: input.tmdbKeyPoolRevision,
+          aiModel: input.aiModel,
           retryOfJobId: input.retryOfJobId ?? null,
           pluginVersions: input.pluginVersions,
         };
@@ -2596,9 +2599,14 @@ export class ServiceRepository {
         const storedMetadataRevision = Number(existing?.metadata_profile_revision ?? 0);
         const revisionMatches = storedMetadataRevision === 0
           || storedMetadataRevision === input.metadataProfileRevision;
+        // 关键变量：历史数据没有识别修订时允许复用一次，之后统一写入当前识别修订。
+        const storedRecognitionRevision = String(existing?.recognition_revision ?? "");
+        const recognitionRevisionMatches = storedRecognitionRevision.length === 0
+          || storedRecognitionRevision === input.recognitionRevision;
         reusableByResourceId.set(input.providerResourceId, Boolean(existing)
           && fingerprintUnchangedByResourceId.get(input.providerResourceId) === true
           && revisionMatches
+          && recognitionRevisionMatches
           && reusableItemIdBySourceFileId.has(String(existing!.id)));
       }
 
@@ -2625,6 +2633,9 @@ export class ServiceRepository {
             metadata_profile_revision: existingByResourceId.has(input.providerResourceId)
               ? Number(existingByResourceId.get(input.providerResourceId)!.metadata_profile_revision ?? 0)
               : 0,
+            recognition_revision: existingByResourceId.has(input.providerResourceId)
+              ? String(existingByResourceId.get(input.providerResourceId)!.recognition_revision ?? "") || null
+              : null,
             locator_json: JSON.stringify(input.locator),
             status: "active",
             created_at: now,
@@ -2654,6 +2665,7 @@ export class ServiceRepository {
       if (reusableSourceIds.length > 0) {
         await transaction("source_files").whereIn("id", reusableSourceIds).update({
           metadata_profile_revision: firstInput.metadataProfileRevision,
+          recognition_revision: firstInput.recognitionRevision,
           updated_at: now,
         });
         const reusableItemIds = [...new Set(reusableSourceIds
@@ -2691,13 +2703,18 @@ export class ServiceRepository {
     });
   }
 
-  /** 批量标记已经成功完成媒体落库的源文件所使用的元数据配置修订。 */
-  public async markSourceFilesMetadataProcessed(sourceFileIds: string[], metadataProfileRevision: number): Promise<void> {
+  /** 批量标记已经成功完成媒体落库的源文件所使用的元数据配置和有效识别修订。 */
+  public async markSourceFilesMetadataProcessed(
+    sourceFileIds: string[],
+    metadataProfileRevision: number,
+    recognitionRevision: string,
+  ): Promise<void> {
     const uniqueSourceFileIds = [...new Set(sourceFileIds)];
     if (uniqueSourceFileIds.length === 0) return;
     for (const sourceFileIdBatch of chunkStrings(uniqueSourceFileIds, 200)) {
       await this.database.query("source_files").whereIn("id", sourceFileIdBatch).update({
         metadata_profile_revision: metadataProfileRevision,
+        recognition_revision: recognitionRevision,
         updated_at: new Date().toISOString(),
       });
     }
@@ -2828,6 +2845,7 @@ export class ServiceRepository {
       scanRootKey: String(row.scan_root_key ?? ""),
       generationId: String(row.generation_id),
       metadataProfileRevision: Number(row.metadata_profile_revision ?? 0),
+      recognitionRevision: String(row.recognition_revision ?? ""),
       locator: parseJsonObject(row.locator_json),
     }));
     return this.enqueueMediaProbes(sourceFiles, true, { requestedByUserId, triggerType });
@@ -2871,6 +2889,7 @@ export class ServiceRepository {
       scanRootKey: String(row.scan_root_key ?? ""),
       generationId: String(row.generation_id),
       metadataProfileRevision: Number(row.metadata_profile_revision ?? 0),
+      recognitionRevision: String(row.recognition_revision ?? ""),
       locator: parseJsonObject(row.locator_json),
     }));
     return this.enqueueMediaProbes(sourceFiles, true, {
@@ -3103,7 +3122,8 @@ export class ServiceRepository {
       path: String(row.path), name: String(row.name), extension: String(row.extension ?? ""), size: Number(row.size ?? 0),
       modifiedAt: row.modified_at ? String(row.modified_at) : null, etag: row.etag ? String(row.etag) : null,
       scanRootKey: String(row.scan_root_key ?? ""), generationId: String(row.generation_id),
-      metadataProfileRevision: Number(row.metadata_profile_revision ?? 0), locator: parseJsonObject(row.locator_json),
+      metadataProfileRevision: Number(row.metadata_profile_revision ?? 0), recognitionRevision: String(row.recognition_revision ?? ""),
+      locator: parseJsonObject(row.locator_json),
     }));
     const result = await this.enqueueMediaProbes(sourceFiles, true, {
       requestedByUserId,

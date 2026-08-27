@@ -180,7 +180,67 @@ export interface AdminConfigStatus {
   };
   credentials: { configured: boolean; source: "file" | "environment" | "generated" };
   plugins: { directoryReady: boolean; installedCount: number; enabledCount: number };
+  aiModels: {
+    configuredCount: number;
+    enabledCount: number;
+    availableCount: number;
+    unavailableCount: number;
+  };
   worker: WorkerStatus;
+}
+
+export type AiModelProtocol = "openai_chat_completions";
+export type AiModelStatus = "enabled" | "disabled";
+export type AiModelCheckStatus = "unknown" | "available" | "unavailable";
+
+/** 管理端 AI 模型记录；API Key 永远不从服务端回显。 */
+export interface AiModel {
+  id: string;
+  displayName: string;
+  protocol: AiModelProtocol;
+  status: AiModelStatus;
+  configurationRevision: number;
+  baseUrl: string;
+  modelName: string;
+  timeoutMs: number;
+  maxConcurrency: number;
+  apiKeyConfigured: boolean;
+  lastCheckStatus: AiModelCheckStatus;
+  lastCheckErrorCode: string | null;
+  lastCheckErrorMessage: string | null;
+  lastCheckLatencyMs: number | null;
+  lastCheckStructuredOutput: boolean;
+  lastCheckedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SaveAiModelInput {
+  displayName: string;
+  protocol: AiModelProtocol;
+  status: AiModelStatus;
+  baseUrl: string;
+  modelName: string;
+  timeoutMs: number;
+  maxConcurrency: number;
+  apiKey?: string;
+  clearApiKey?: boolean;
+}
+
+export interface AiModelAvailabilityResult {
+  available: boolean;
+  structuredOutput: boolean;
+  latencyMs: number;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
+/** 服务配置页可读取的最小 AI 模型信息，不包含接口地址和 Secret 状态。 */
+export interface AvailableAiModel {
+  id: string;
+  displayName: string;
+  status: AiModelStatus;
+  available: boolean;
 }
 
 export interface CloudService {
@@ -308,6 +368,27 @@ export interface ScanJob {
   hiddenWaitingJobCount: number;
   queueAheadCount: number;
   updatedAt: string;
+}
+
+/** 单个扫描任务采用的一条 AI 查询词补充记录。 */
+export interface AiSupplementRecord {
+  id: string;
+  mediaType: "movie" | "tv";
+  triggerReason: string;
+  ruleTitle: string;
+  cleanedTitle: string;
+  alternateTitle: string;
+  confidence: number;
+  fileCount: number;
+  modelId: string;
+  modelDisplayName: string;
+  modelRevision: number;
+  createdAt: string;
+}
+
+export interface JobAiSupplementResult {
+  total: number;
+  items: AiSupplementRecord[];
 }
 
 /** 服务级扫描或视频规格分析定时任务。 */
@@ -890,6 +971,15 @@ export async function downloadScanFailureReport(jobId: string, admin = false): P
   URL.revokeObjectURL(objectUrl);
 }
 
+/** 读取当前任务 AI 补充查询词的总数和最近 20 条采用记录。 */
+export function getJobAiSupplements(jobId: string, admin = false): Promise<JobAiSupplementResult> {
+  return requestJson(
+    admin
+      ? `/api/v1/admin/jobs/${encodeURIComponent(jobId)}/ai-supplements`
+      : `/api/v1/scan-jobs/${encodeURIComponent(jobId)}/ai-supplements`,
+  );
+}
+
 /** 清空单个服务的扫描与刮削结果，保留服务连接和配置。 */
 export function clearServiceCatalog(
   serviceId: string,
@@ -1292,6 +1382,54 @@ export function getAdminStatus(): Promise<AdminRuntimeStatus> {
 /** 读取管理后台脱敏配置状态。 */
 export function getAdminConfigStatus(): Promise<AdminConfigStatus> {
   return requestJson("/api/v1/admin/config/status");
+}
+
+/** 读取全部 AI 模型配置，响应不包含 API Key 原文。 */
+export function listAdminAiModels(): Promise<{ items: AiModel[]; total: number }> {
+  return requestJson("/api/v1/admin/ai-models");
+}
+
+/** 读取服务可选择的启用模型，并保留当前已选停用模型用于回显。 */
+export function listAvailableAiModels(serviceId: string): Promise<{ items: AvailableAiModel[]; total: number }> {
+  return requestJson(`/api/v1/ai-models/available?serviceId=${encodeURIComponent(serviceId)}`);
+}
+
+/** 创建 AI 模型和第一份配置修订。 */
+export async function createAdminAiModel(input: SaveAiModelInput): Promise<AiModel> {
+  const result = await requestJson<{ model: AiModel }>("/api/v1/admin/ai-models", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return result.model;
+}
+
+/** 保存 AI 模型的新配置修订；空 API Key 由服务端解释为保留旧值。 */
+export async function updateAdminAiModel(modelId: string, input: SaveAiModelInput): Promise<AiModel> {
+  const result = await requestJson<{ model: AiModel }>(`/api/v1/admin/ai-models/${encodeURIComponent(modelId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+  return result.model;
+}
+
+/** 启用或停用 AI 模型。 */
+export async function updateAdminAiModelStatus(modelId: string, status: AiModelStatus): Promise<AiModel> {
+  const result = await requestJson<{ model: AiModel }>(
+    `/api/v1/admin/ai-models/${encodeURIComponent(modelId)}/status`,
+    { method: "PATCH", body: JSON.stringify({ status }) },
+  );
+  return result.model;
+}
+
+/** 使用模型当前配置执行真实对话与 JSON 结构化输出测试。 */
+export async function testAdminAiModel(modelId: string): Promise<{
+  result: AiModelAvailabilityResult;
+  model: AiModel;
+}> {
+  return requestJson(`/api/v1/admin/ai-models/${encodeURIComponent(modelId)}/test`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 /** 用系统配置中的完整新列表替换 TMDB Key 池，Key 原文不会回显。 */
