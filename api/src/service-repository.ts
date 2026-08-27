@@ -23,6 +23,7 @@ import {
 import { ApiError, toSafeErrorMessage } from "./errors.js";
 import { isFlymbyExcludedPath } from "./media/flymby-scan-exclusions.js";
 import { createStableId } from "./media/filename.js";
+import type { FlymbyNfoMetadata } from "./media/flymby-nfo-parser.js";
 import { parseFlymbyVideoName } from "./media/flymby-video-parser.js";
 import { parseMediaProbeResult, type MediaProbeResult } from "./media/media-probe.js";
 import type { TmdbEpisodeMetadata, TmdbVideoMetadata } from "./metadata/tmdb.js";
@@ -155,6 +156,16 @@ interface ActiveDurationRow {
   active_started_at: string | null;
 }
 
+interface JobWaitRow {
+  id: string;
+  user_id: string;
+  service_id: string;
+  service_name: string;
+  owner_username: string;
+  status: JobStatus;
+  created_at: string;
+}
+
 /** Worker 持久化的业务统计集合；使用稳定任务键避免续扫后重复计数。 */
 export interface ScanCheckpointProgress {
   enumeratedEntryCount: number;
@@ -178,6 +189,19 @@ export interface PreparedSourceFileRecord {
   unchanged: boolean;
   /** 复用的是已匹配目录结果；全量扫描可据此恢复影片级统计。 */
   reusedMatchedCatalog: boolean;
+}
+
+/** NFO旁车缓存使用的稳定资源身份和文件指纹。 */
+export interface NfoSidecarCacheInput {
+  userId: string;
+  serviceId: string;
+  libraryId: string;
+  providerResourceId: string;
+  path: string;
+  size: number;
+  modifiedAt: string | null;
+  etag: string | null;
+  parserVersion: string;
 }
 
 /** 单个扫描任务的安全检查点；不包含任何 Provider 连接凭据。 */
@@ -284,6 +308,10 @@ function mapJob(row: JobRow): ScanJobRecord {
     startedAt: row.started_at,
     finishedAt: row.finished_at,
     elapsedMs: calculateActiveDurationMs(row),
+    waitingReason: null,
+    waitingForJobs: [],
+    hiddenWaitingJobCount: 0,
+    queueAheadCount: 0,
     updatedAt: row.updated_at,
   };
 }
@@ -325,6 +353,10 @@ function mapMediaProbeJob(row: MediaProbeJobRow): ScanJobRecord {
     startedAt: row.started_at,
     finishedAt: row.finished_at,
     elapsedMs: calculateActiveDurationMs(row),
+    waitingReason: null,
+    waitingForJobs: [],
+    hiddenWaitingJobCount: 0,
+    queueAheadCount: 0,
     updatedAt: row.updated_at,
   };
 }
@@ -550,13 +582,121 @@ function toVideoProviderEntry(row: Record<string, unknown>) {
 export class ServiceRepository {
   private readonly database: FlyCloudHelperDatabase;
   private readonly logger?: ServiceRepositoryLogger;
+  private readonly scanWorkerConcurrency: number;
+  private readonly mediaProbeConcurrency: number;
   // 关键变量：阻止同一 API 实例同时执行同一服务的多次清空，跨实例仍由数据库服务行锁兜底。
   private readonly clearingCatalogServiceIds = new Set<string>();
 
-  /** 初始化服务仓储，并接收用于记录删除清理结果的业务日志。 */
-  public constructor(database: FlyCloudHelperDatabase, logger?: ServiceRepositoryLogger) {
+  /** 初始化服务仓储，并保存两个独立任务池的并发上限。 */
+  public constructor(
+    database: FlyCloudHelperDatabase,
+    logger?: ServiceRepositoryLogger,
+    queueLimits: { scanWorkerConcurrency: number; mediaProbeConcurrency: number } = {
+      scanWorkerConcurrency: 5,
+      mediaProbeConcurrency: 1,
+    },
+  ) {
     this.database = database;
     this.logger = logger;
+    this.scanWorkerConcurrency = queueLimits.scanWorkerConcurrency;
+    this.mediaProbeConcurrency = queueLimits.mediaProbeConcurrency;
+  }
+
+  /**
+   * 为排队任务补充当前等待关系。
+   * 管理端可以看到全部阻塞任务，普通用户只看到本人任务，其余任务仅返回隐藏数量。
+   */
+  private async attachQueuedJobWaitDetails(
+    jobs: ScanJobRecord[],
+    viewerUserId?: string,
+    transaction: Knex | Knex.Transaction = this.database.query,
+  ): Promise<ScanJobRecord[]> {
+    const queuedJobs = jobs.filter((job) => job.status === "queued");
+    if (queuedJobs.length === 0) return jobs;
+
+    const selectWaitRows = (tableName: "scan_jobs" | "media_probe_jobs") => transaction(`${tableName} as j`)
+      .join("cloud_services as s", "s.id", "j.service_id")
+      .join("user_accounts as u", "u.id", "j.user_id")
+      .select(
+        "j.id",
+        "j.user_id",
+        "j.service_id",
+        "j.status",
+        "j.created_at",
+        "s.display_name as service_name",
+        "u.username as owner_username",
+      );
+
+    const [runningScanRows, queuedScanRows, activeScanRows, runningProbeRows, runningProbeFileCountRow] = await Promise.all([
+      selectWaitRows("scan_jobs").where("j.status", "running") as unknown as Promise<JobWaitRow[]>,
+      selectWaitRows("scan_jobs").where("j.status", "queued") as unknown as Promise<JobWaitRow[]>,
+      selectWaitRows("scan_jobs").whereIn("j.status", ["queued", "running", "retry_waiting"]) as unknown as Promise<JobWaitRow[]>,
+      selectWaitRows("media_probe_jobs").where("j.status", "running") as unknown as Promise<JobWaitRow[]>,
+      transaction("media_file_probes").where("status", "running")
+        .count<{ count: string | number }[]>({ count: "source_file_id" }).first(),
+    ]);
+    // 关键变量：规格并发按正在执行的文件数占槽，一个父任务内部也可能同时占用多个槽位。
+    const runningProbeFileCount = Number(runningProbeFileCountRow?.count ?? 0);
+
+    /** 把阻塞任务转换成公开字段，并隔离其他账号的任务详情。 */
+    const createWaitTargets = (rows: JobWaitRow[], jobType: "scan" | "media_probe", currentUserId: string) => {
+      const visibleRows = viewerUserId ? rows.filter((row) => row.user_id === currentUserId) : rows;
+      return {
+        targets: visibleRows.map((row) => ({
+          id: row.id,
+          jobType,
+          serviceId: row.service_id,
+          serviceName: row.service_name,
+          ownerUsername: row.owner_username,
+          status: row.status,
+        })),
+        hiddenCount: rows.length - visibleRows.length,
+      };
+    };
+
+    return jobs.map((job): ScanJobRecord => {
+      if (job.status !== "queued") return job;
+      if (job.jobType === "scan") {
+        const queueAheadCount = queuedScanRows.filter((row) => row.id !== job.id
+          && (row.created_at < job.createdAt || (row.created_at === job.createdAt && row.id < job.id))).length;
+        if (runningScanRows.length >= this.scanWorkerConcurrency) {
+          const waiting = createWaitTargets(runningScanRows, "scan", job.userId);
+          return {
+            ...job,
+            waitingReason: "scan_worker_capacity",
+            waitingForJobs: waiting.targets,
+            hiddenWaitingJobCount: waiting.hiddenCount,
+            queueAheadCount,
+          };
+        }
+        return {
+          ...job,
+          waitingReason: queueAheadCount > 0 ? "scan_queue_order" : "worker_dispatch",
+          queueAheadCount,
+        };
+      }
+
+      const sameServiceScans = activeScanRows.filter((row) => row.service_id === job.serviceId);
+      if (sameServiceScans.length > 0) {
+        const waiting = createWaitTargets(sameServiceScans, "scan", job.userId);
+        return {
+          ...job,
+          waitingReason: "service_scan_priority",
+          waitingForJobs: waiting.targets,
+          hiddenWaitingJobCount: waiting.hiddenCount,
+        };
+      }
+      if (runningProbeFileCount >= this.mediaProbeConcurrency) {
+        const waiting = createWaitTargets(runningProbeRows, "media_probe", job.userId);
+        return {
+          ...job,
+          waitingReason: "media_probe_worker_capacity",
+          waitingForJobs: waiting.targets,
+          hiddenWaitingJobCount: waiting.hiddenCount,
+        };
+      }
+      return { ...job, waitingReason: "worker_dispatch" };
+    });
   }
 
   /** 构造服务摘要公共查询，始终保留用户和媒体库链路。 */
@@ -1252,11 +1392,17 @@ export class ServiceRepository {
       query.where("j.user_id", userId);
     }
     const row = await query.first() as JobRow | undefined;
-    if (row) return mapJob(row);
+    if (row) {
+      const mappedJob = mapJob(row);
+      return (await this.attachQueuedJobWaitDetails([mappedJob], userId, transaction))[0] ?? mappedJob;
+    }
     const mediaProbeQuery = this.mediaProbeJobSummaryQuery(transaction).where("j.id", jobId);
     if (userId) mediaProbeQuery.where("j.user_id", userId);
     const mediaProbeRow = await mediaProbeQuery.first() as MediaProbeJobRow | undefined;
-    if (mediaProbeRow) return mapMediaProbeJob(mediaProbeRow);
+    if (mediaProbeRow) {
+      const mappedJob = mapMediaProbeJob(mediaProbeRow);
+      return (await this.attachQueuedJobWaitDetails([mappedJob], userId, transaction))[0] ?? mappedJob;
+    }
     throw new ApiError(404, "background_job_not_found", "后台任务不存在");
   }
 
@@ -1437,6 +1583,10 @@ export class ServiceRepository {
     userId?: string;
     serviceId?: string;
     status?: JobStatus;
+    /** 组合状态筛选，例如“未结束”同时包含排队、运行、等待恢复和暂停。 */
+    statuses?: JobStatus[];
+    /** 只读取扫描刮削或视频规格分析任务。 */
+    jobType?: "scan" | "media_probe";
     limit: number;
     offset: number;
   }): Promise<{ items: ScanJobRecord[]; total: number }> {
@@ -1456,11 +1606,21 @@ export class ServiceRepository {
       countQuery.where("j.service_id", filters.serviceId);
       mediaProbeCountQuery.where("j.service_id", filters.serviceId);
     }
-    if (filters.status) {
-      query.where("j.status", filters.status);
-      mediaProbeQuery.where("j.status", filters.status);
-      countQuery.where("j.status", filters.status);
-      mediaProbeCountQuery.where("j.status", filters.status);
+    const selectedStatuses = filters.statuses && filters.statuses.length > 0
+      ? filters.statuses
+      : filters.status ? [filters.status] : [];
+    if (selectedStatuses.length > 0) {
+      query.whereIn("j.status", selectedStatuses);
+      mediaProbeQuery.whereIn("j.status", selectedStatuses);
+      countQuery.whereIn("j.status", selectedStatuses);
+      mediaProbeCountQuery.whereIn("j.status", selectedStatuses);
+    }
+    if (filters.jobType === "scan") {
+      mediaProbeQuery.whereRaw("1 = 0");
+      mediaProbeCountQuery.whereRaw("1 = 0");
+    } else if (filters.jobType === "media_probe") {
+      query.whereRaw("1 = 0");
+      countQuery.whereRaw("1 = 0");
     }
     // 关键变量：两个物理任务表分别读取同一候选窗口，再统一按创建时间分页，保持旧接口兼容。
     const candidateLimit = filters.offset + filters.limit;
@@ -1474,7 +1634,7 @@ export class ServiceRepository {
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .slice(filters.offset, filters.offset + filters.limit);
     return {
-      items,
+      items: await this.attachQueuedJobWaitDetails(items, filters.userId),
       total: Number(countRow?.count ?? 0) + Number(mediaProbeCountRow?.count ?? 0),
     };
   }
@@ -2249,6 +2409,7 @@ export class ServiceRepository {
         await transaction("file_links").where({ library_id: libraryId }).delete();
         await transaction("media_relations").where({ library_id: libraryId }).delete();
         await transaction("media_items").where({ library_id: libraryId }).delete();
+        await transaction("nfo_sidecar_cache").where({ library_id: libraryId }).delete();
         await transaction("source_files").where({ library_id: libraryId }).delete();
         await transaction("catalog_changes").where({ library_id: libraryId }).delete();
         await transaction("media_libraries").where({ id: libraryId }).update({
@@ -2268,6 +2429,67 @@ export class ServiceRepository {
     } finally {
       this.clearingCatalogServiceIds.delete(serviceId);
     }
+  }
+
+  /** 文件指纹未变化时返回已解析的NFO，缺少修改时间和ETag时不冒险复用。 */
+  public async readNfoSidecarCache(input: NfoSidecarCacheInput): Promise<FlymbyNfoMetadata | null> {
+    if (!input.modifiedAt && !input.etag) return null;
+    const row = await this.database.query("nfo_sidecar_cache").where({
+      user_id: input.userId,
+      library_id: input.libraryId,
+      provider_resource_id: input.providerResourceId,
+    }).first();
+    if (!row
+      || String(row.path) !== input.path
+      || Number(row.size) !== input.size
+      || String(row.modified_at ?? "") !== String(input.modifiedAt ?? "")
+      || String(row.etag ?? "") !== String(input.etag ?? "")
+      || String(row.parser_version) !== input.parserVersion) {
+      return null;
+    }
+    try {
+      const metadata = parseJsonObject(row.metadata_json);
+      const rootType = String(metadata.rootType ?? "");
+      if (!["movie", "tvshow", "episodedetails", "unknown"].includes(rootType)) return null;
+      return metadata as unknown as FlymbyNfoMetadata;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 保存当前NFO文件指纹和解析结果，相同稳定资源ID原位更新。 */
+  public async saveNfoSidecarCache(
+    input: NfoSidecarCacheInput,
+    metadata: FlymbyNfoMetadata,
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    await this.database.query("nfo_sidecar_cache")
+      .insert({
+        id: createStableId("nfo-sidecar", input.userId, input.libraryId, input.providerResourceId),
+        user_id: input.userId,
+        service_id: input.serviceId,
+        library_id: input.libraryId,
+        provider_resource_id: input.providerResourceId,
+        path: input.path,
+        size: input.size,
+        modified_at: input.modifiedAt,
+        etag: input.etag,
+        parser_version: input.parserVersion,
+        metadata_json: JSON.stringify(metadata),
+        created_at: now,
+        updated_at: now,
+      })
+      .onConflict(["user_id", "library_id", "provider_resource_id"])
+      .merge([
+        "service_id",
+        "path",
+        "size",
+        "modified_at",
+        "etag",
+        "parser_version",
+        "metadata_json",
+        "updated_at",
+      ]);
   }
 
   /** 若源文件属性和播放定位均未变化，只推进本轮扫描标记并返回现有记录。 */

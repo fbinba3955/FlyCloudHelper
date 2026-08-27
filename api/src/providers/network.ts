@@ -18,6 +18,20 @@ interface ResolvedProviderUrl {
 export const PROVIDER_RATE_LIMIT_MAX_RETRIES = 3;
 const PROVIDER_RATE_LIMIT_BASE_DELAY_MS = 2_000;
 const PROVIDER_RATE_LIMIT_MAX_DELAY_MS = 8_000;
+const PROVIDER_RATE_LIMIT_RECOVERY_WINDOW_MS = 5_000;
+const PROVIDER_RATE_LIMIT_RECOVERY_GAP_MS = 200;
+
+interface ProviderSharedRateLimitState {
+  /** 所有同源请求都必须等待到该时间之后再恢复。 */
+  cooldownUntilMs: number;
+  /** 冷却结束后的请求按此水位错峰释放，避免并发任务同时重试。 */
+  nextRequestAtMs: number;
+  /** 恢复窗口结束后删除状态，不影响Provider正常并发。 */
+  recoveryUntilMs: number;
+}
+
+// 关键变量：同一Provider上游共享冷却，避免多个目录请求分别退避后再次形成429请求风暴。
+const providerSharedRateLimits = new Map<string, ProviderSharedRateLimitState>();
 
 /** 读取 Provider 的 Retry-After，并在缺失时使用 2、4、8 秒指数退避。 */
 export function readProviderRateLimitDelayMs(value: string | null, retryCount: number): number {
@@ -51,6 +65,48 @@ export async function waitForProviderRateLimit(delayMs: number, signal?: AbortSi
     };
     signal?.addEventListener("abort", finish, { once: true });
   });
+}
+
+/** 使用协议和主机生成不包含路径、查询参数及凭据的共享限流键。 */
+function createProviderRateLimitKey(value: string | URL): string {
+  const url = value instanceof URL ? value : new URL(value);
+  return url.origin;
+}
+
+/** 记录Provider限流并延长同源请求的共享冷却窗口。 */
+export function registerProviderSharedRateLimit(value: string | URL, delayMs: number): number {
+  const key = createProviderRateLimitKey(value);
+  const now = Date.now();
+  const cooldownUntilMs = now + Math.max(0, delayMs);
+  const current = providerSharedRateLimits.get(key);
+  const nextState: ProviderSharedRateLimitState = {
+    cooldownUntilMs: Math.max(current?.cooldownUntilMs ?? 0, cooldownUntilMs),
+    nextRequestAtMs: Math.max(current?.nextRequestAtMs ?? 0, cooldownUntilMs),
+    recoveryUntilMs: Math.max(
+      current?.recoveryUntilMs ?? 0,
+      cooldownUntilMs + PROVIDER_RATE_LIMIT_RECOVERY_WINDOW_MS,
+    ),
+  };
+  providerSharedRateLimits.set(key, nextState);
+  return nextState.cooldownUntilMs;
+}
+
+/** 等待同源Provider共享冷却，并在恢复窗口内把并发请求按200ms错峰放行。 */
+export async function waitForProviderSharedRateLimit(
+  value: string | URL,
+  signal?: AbortSignal,
+): Promise<void> {
+  const key = createProviderRateLimitKey(value);
+  const state = providerSharedRateLimits.get(key);
+  if (!state) return;
+  const now = Date.now();
+  if (now >= state.recoveryUntilMs) {
+    providerSharedRateLimits.delete(key);
+    return;
+  }
+  const releaseAtMs = Math.max(now, state.cooldownUntilMs, state.nextRequestAtMs);
+  state.nextRequestAtMs = releaseAtMs + PROVIDER_RATE_LIMIT_RECOVERY_GAP_MS;
+  await waitForProviderRateLimit(releaseAtMs - now, signal);
 }
 
 /**
@@ -305,6 +361,7 @@ export async function providerFetch(
     let response: Response;
     while (true) {
       resolvedTarget = await resolveProviderUrl(currentUrl, options);
+      await waitForProviderSharedRateLimit(resolvedTarget.url, timeoutController.signal);
       response = await requestResolvedProvider(resolvedTarget, currentInit, timeoutController.signal);
       const requestMethod = String(currentInit.method ?? "GET").toUpperCase();
       if (response.status === 429 && rateLimitRetryCount < PROVIDER_RATE_LIMIT_MAX_RETRIES) {
@@ -314,8 +371,10 @@ export async function providerFetch(
           rateLimitRetryCount,
         );
         rateLimitRetryCount += 1;
+        const sharedCooldownUntilMs = registerProviderSharedRateLimit(resolvedTarget.url, retryDelayMs);
         options.logConnectionFailure?.({
           日志关键字: "codex-flycloud-provider-rate-limit",
+          性能日志关键字: "codex-flycloud-scan-performance",
           事件: "Provider请求被限流后等待重试",
           请求方法: requestMethod,
           请求路径: resolvedTarget.url.pathname,
@@ -323,9 +382,9 @@ export async function providerFetch(
           当前重试次数: rateLimitRetryCount,
           最大重试次数: PROVIDER_RATE_LIMIT_MAX_RETRIES,
           等待毫秒: retryDelayMs,
+          共享冷却截止时间: new Date(sharedCooldownUntilMs).toISOString(),
         });
         await response.body?.cancel();
-        await waitForProviderRateLimit(retryDelayMs, timeoutController.signal);
         continue;
       }
       const location = response.headers.get("location");
@@ -376,6 +435,7 @@ export async function providerFetch(
     if (response.status === 429) {
       options.logConnectionFailure?.({
         日志关键字: "codex-flycloud-provider-rate-limit",
+        性能日志关键字: "codex-flycloud-scan-performance",
         事件: "Provider限流重试后仍未恢复",
         请求方法: init.method ?? "GET",
         请求路径: resolvedTarget.url.pathname,

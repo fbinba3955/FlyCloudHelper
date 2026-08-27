@@ -14,7 +14,7 @@ import {
   type ProviderFileStreamAccess,
   type ProviderValidationResult,
   type ScanRoot,
-  createFlymbyRecommendedScanSettings,
+  createProviderRecommendedScanSettings,
   requireConnectionString,
   toFileSize,
 } from "./types.js";
@@ -110,7 +110,10 @@ export class WebDavProvider implements ProviderAdapter {
       "directDownload",
       "relayPlayback",
     ],
-    recommendedScanSettings: createFlymbyRecommendedScanSettings(),
+    recommendedScanSettings: createProviderRecommendedScanSettings({
+      scanDirectoryConcurrency: { default: 8, min: 1, max: 16 },
+      fullScanDirectoryConcurrency: 4,
+    }),
     connectionFields: [
       { name: "baseUrl", label: "WebDAV 地址", type: "url", required: true, secret: false },
       { name: "username", label: "用户名", type: "text", required: false, secret: false },

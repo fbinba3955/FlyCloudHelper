@@ -973,7 +973,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
             </div>
             <div className="rounded-xl border border-border bg-secondary/35 p-4">
               <div className="flex items-center justify-between gap-4">
-                <div><p className="text-sm font-medium">扫描时读取视频规格（ffprobe）</p><p className="mt-1 text-xs text-muted-foreground">{metadataSettings.analyzeMediaSpecs ? "后续扫描刮削会为新发现或变化的视频读取时长、编码、分辨率、音轨和字幕。" : "后续扫描刮削不读取视频规格，不影响已经入库的视频和已有规格结果。"}</p></div>
+                <div><p className="text-sm font-medium">扫描时读取视频规格（ffprobe）</p><p className="mt-1 text-xs text-muted-foreground">{metadataSettings.analyzeMediaSpecs ? "后续扫描刮削会为新发现或变化的视频自动读取时长、编码、分辨率、音轨和字幕。" : "后续扫描刮削不自动读取视频规格；已有规格仍会用于网页、Jellyfin 和 APP 展示。"}</p></div>
                 <button type="button" role="switch" aria-checked={metadataSettings.analyzeMediaSpecs} aria-label="分析视频规格" onClick={() => setMetadataSettings((current) => ({ ...current, analyzeMediaSpecs: !current.analyzeMediaSpecs }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.analyzeMediaSpecs ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
                   <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.analyzeMediaSpecs ? "translate-x-5" : "translate-x-0"}`} />
                 </button>

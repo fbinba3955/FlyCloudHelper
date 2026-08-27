@@ -97,6 +97,15 @@ export interface ServiceDetailRecord extends CloudServiceRecord {
   recentJobs: ScanJobRecord[];
 }
 
+export interface JobWaitTargetRecord {
+  id: string;
+  jobType: BackgroundJobType;
+  serviceId: string;
+  serviceName: string;
+  ownerUsername: string;
+  status: JobStatus;
+}
+
 export interface ScanJobRecord {
   id: string;
   /** 后台任务类型；保留 ScanJobRecord 名称兼容现有 APP 和接口。 */
@@ -137,6 +146,14 @@ export interface ScanJobRecord {
   finishedAt: string | null;
   /** 任务真正处于扫描刮削运行状态的累计时长，不包含排队、暂停和延迟恢复等待。 */
   elapsedMs: number;
+  /** 排队任务当前等待的原因；非排队任务始终为空。 */
+  waitingReason: "scan_worker_capacity" | "scan_queue_order" | "service_scan_priority" | "media_probe_worker_capacity" | "worker_dispatch" | null;
+  /** 当前权限范围内可以展示的阻塞任务。 */
+  waitingForJobs: JobWaitTargetRecord[];
+  /** 因账号隔离不能展示详情的阻塞任务数量。 */
+  hiddenWaitingJobCount: number;
+  /** 当前扫描任务之前尚未被领取的扫描任务数量。 */
+  queueAheadCount: number;
   updatedAt: string;
 }
 

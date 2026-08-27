@@ -78,11 +78,6 @@
     oklch(0.24 0.032 264 / 0.9),
     oklch(0.19 0.026 264 / 0.75)
   );
-  --gradient-glow: radial-gradient(
-    circle at 50% 0%,
-    oklch(0.533 0.245 262.5 / 0.35),
-    transparent 70%
-  );
   --shadow-elevated: 0 24px 60px -28px oklch(0.1 0.04 264 / 0.9);
   --shadow-glow: 0 0 0 1px oklch(0.533 0.245 262.5 / 0.35),
     0 18px 50px -22px oklch(0.533 0.245 262.5 / 0.55);

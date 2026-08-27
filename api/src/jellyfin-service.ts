@@ -25,8 +25,6 @@ export interface JellyfinContext extends JellyfinLibraryContext {
   accountId: string;
   accountUsername: string;
   accountHasPassword: boolean;
-  /** 当前服务是否启用了视频规格分析。 */
-  mediaSpecsEnabled: boolean;
   credentialRevision: number;
   accessToken: string;
 }
@@ -35,7 +33,7 @@ interface JellyfinFileSummary {
   fileId: string;
   name: string;
   size: number;
-  /** 当前源文件已经完成的 ffprobe 结果；未开启或仍在队列时为空。 */
+  /** 当前源文件已经完成的 ffprobe 结果；尚未完成或失败时为空。 */
   mediaProbe: MediaProbeResult | null;
 }
 
@@ -64,26 +62,19 @@ interface JellyfinSeasonReference {
   seasonNumber: number;
 }
 
-/** 读取服务当前元数据配置中的视频规格分析开关。 */
-function isJellyfinMediaSpecsEnabled(profileJson: unknown): boolean {
-  const profile = parseJsonObject(profileJson);
-  const profiles = profile.profiles && typeof profile.profiles === "object" && !Array.isArray(profile.profiles)
-    ? profile.profiles as Record<string, unknown>
-    : {};
-  const videoProfile = profiles.video && typeof profiles.video === "object" && !Array.isArray(profiles.video)
-    ? profiles.video as Record<string, unknown>
-    : {};
-  return videoProfile.analyzeMediaSpecs === true;
-}
-
 /** 把目录文件映射为不包含转码能力的标准 Jellyfin MediaSourceInfo。 */
-function mapCatalogMediaSource(file: JellyfinFileSummary, mediaSpecsReady: boolean): Record<string, unknown> {
+function mapCatalogMediaSource(
+  file: JellyfinFileSummary,
+  mediaSpecsReady: boolean,
+  protocolMediaSourceId: string,
+): Record<string, unknown> {
   const fileName = String(file.name || "video.mp4");
   const mediaProbe = mediaSpecsReady ? file.mediaProbe : null;
   const fileRunTimeTicks = mediaProbe?.runTimeTicks ?? 0;
   return {
     Protocol: "File",
-    Id: file.fileId,
+    // 关键变量：Jellyfin 客户端使用条目 ID 识别条目自身的主媒体源。
+    Id: protocolMediaSourceId,
     Path: fileName,
     EncoderPath: null,
     EncoderProtocol: null,
@@ -234,13 +225,10 @@ export class JellyfinCompatibilityService {
       .join("service_access_accounts as a", "a.id", "ps.account_id")
       .join("cloud_services as s", "s.id", "ps.service_id")
       .join("media_libraries as l", "l.id", "s.library_id")
-      .leftJoin("service_metadata_profiles as mp", function joinCurrentMetadataProfile() {
-        this.on("mp.service_id", "s.id").andOn("mp.revision", "s.metadata_profile_revision");
-      })
       .select(
         "ps.*", "a.username", "a.password_required", "a.credential_revision as account_revision",
         "a.status as account_status", "s.user_id", "s.library_id", "s.status as service_status",
-        "l.jellyfin_enabled", "l.jellyfin_region_libraries_enabled", "mp.configuration_json as metadata_profile_json",
+        "l.jellyfin_enabled", "l.jellyfin_region_libraries_enabled",
       )
       .where("ps.token_hash", hashSessionToken(token)).where("ps.service_id", serviceId).where("ps.protocol", "jellyfin").whereNull("ps.revoked_at").whereNull("s.deleted_at").first();
     if (!row || String(row.expires_at) <= new Date().toISOString() || Number(row.credential_revision) !== Number(row.account_revision)
@@ -256,7 +244,6 @@ export class JellyfinCompatibilityService {
       regionLibrariesEnabled: Number(row.jellyfin_region_libraries_enabled) === 1,
       accountId: String(row.account_id), accountUsername: String(row.username),
       accountHasPassword: Number(row.password_required ?? 1) !== 0,
-      mediaSpecsEnabled: isJellyfinMediaSpecsEnabled(row.metadata_profile_json),
       credentialRevision: Number(row.account_revision), accessToken: token,
     };
   }
@@ -432,14 +419,11 @@ export class JellyfinCompatibilityService {
           fileId: String(file.fileId),
           name: String(file.name ?? ""),
           size: Number(file.size ?? 0),
-          mediaProbe: context.mediaSpecsEnabled
-            ? parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult)
-            : null,
+          mediaProbe: parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult),
         }));
     }
-    // 关键变量：多版本影片必须所有实际文件都分析完成，协议才整体返回时长和视频规格。
-    const mediaSpecsReady = context.mediaSpecsEnabled
-      && itemFiles.length > 0
+    // 关键变量：规格分析开关只控制扫描后是否自动分析；Jellyfin 只判断现有数据是否完整。
+    const mediaSpecsReady = itemFiles.length > 0
       && itemFiles.every((file) => file.mediaProbe !== null);
     const runTimeTicks = mediaSpecsReady
       ? readJellyfinRunTimeTicks(itemFiles.map((file) => file.mediaProbe))
@@ -451,7 +435,7 @@ export class JellyfinCompatibilityService {
         事件: mediaSpecsReady ? "返回Jellyfin媒体规格" : "省略未完成的Jellyfin媒体规格",
         服务ID: context.serviceId,
         媒体条目ID: item.id,
-        规格分析开关: context.mediaSpecsEnabled,
+        实际文件数量: itemFiles.length,
         已完成规格文件数量: itemFiles.filter((file) => file.mediaProbe !== null).length,
       });
     }
@@ -471,7 +455,11 @@ export class JellyfinCompatibilityService {
       Container: primaryProbe?.container || undefined,
       Bitrate: primaryProbe?.bitRate || undefined,
       MediaStreams: primaryProbe?.mediaStreams,
-      MediaSources: itemFiles.map((file) => mapCatalogMediaSource(file, mediaSpecsReady)),
+      MediaSources: itemFiles.map((file, index) => mapCatalogMediaSource(
+        file,
+        mediaSpecsReady,
+        index === 0 ? item.id : file.fileId,
+      )),
       SeriesId: type === "Episode" ? parent?.id : undefined, SeriesName: type === "Episode" ? parent?.title ?? item.subtitle : undefined,
       ParentIndexNumber: type === "Episode" ? seasonNumber : undefined, IndexNumber: type === "Episode" ? episodeNumber : undefined,
       SeasonId: type === "Episode" && parent ? `season:${parent.id}:${seasonNumber}` : undefined,
@@ -814,7 +802,7 @@ export class JellyfinCompatibilityService {
     const item = await this.runtime.repository.getCatalogItem(itemId, context.ownerUserId);
     if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
     const progress = await this.readProgress(context, itemId);
-    const runTimeTicks = await this.readItemRunTimeTicks(context, item);
+    const runTimeTicks = await this.readItemRunTimeTicks(item);
     return this.mapUserData(progress, runTimeTicks);
   }
 
@@ -826,7 +814,7 @@ export class JellyfinCompatibilityService {
     const now = new Date().toISOString();
     const existing = await this.runtime.database.query("service_playback_progress")
       .where({ service_id: context.serviceId, account_id: context.accountId, item_id: itemId }).first();
-    const metadataDurationTicks = await this.readItemRunTimeTicks(context, item);
+    const metadataDurationTicks = await this.readItemRunTimeTicks(item);
     const patch = {
       position_ticks: positionTicks,
       played: 0,
@@ -869,7 +857,6 @@ export class JellyfinCompatibilityService {
     const positionTicks = Math.max(0, Math.floor(Number(body.PositionTicks ?? 0)));
     // 关键变量：播放进度只与服务端媒体库中的总时长计算，不接受非标准的客户端总时长字段。
     const durationTicks = await this.readItemRunTimeTicks(
-      context,
       item,
       body.MediaSourceId ? String(body.MediaSourceId) : undefined,
     );
@@ -939,20 +926,29 @@ export class JellyfinCompatibilityService {
 
   /** 读取电影或单集实际源文件时长，指定媒体源时只使用该版本。 */
   private async readItemRunTimeTicks(
-    context: JellyfinContext,
     item: MediaItemRecord,
     mediaSourceId?: string,
   ): Promise<number> {
-    if (!context.mediaSpecsEnabled) return 0;
     const query = this.runtime.database.query("file_links as fl")
-      .leftJoin("media_file_probes as p", "p.source_file_id", "fl.source_file_id")
+      .join("source_files as f", "f.id", "fl.source_file_id")
+      .leftJoin("media_file_probes as p", "p.source_file_id", "f.id")
       .select("fl.source_file_id", "p.status", "p.result_json")
-      .where({ "fl.user_id": item.userId, "fl.item_id": item.id });
+      // 关键变量：只按当前条目仍然有效的实际文件判断完整性，与条目详情和 PlaybackInfo 保持一致。
+      .where({
+        "fl.user_id": item.userId,
+        "fl.item_id": item.id,
+        "f.service_id": item.serviceId,
+        "f.status": "active",
+      })
+      .orderBy("f.path", "asc");
     const rows = await query;
     const probes = rows.map((row) => parseCompletedMediaProbeResult(row.status, row.result_json));
     if (rows.length === 0 || probes.some((probe) => probe === null)) return 0;
     if (mediaSourceId) {
-      const selectedIndex = rows.findIndex((row) => String(row.source_file_id) === mediaSourceId);
+      // 关键变量：客户端上报条目 ID 时，对应当前条目的主媒体源。
+      const selectedIndex = mediaSourceId === item.id
+        ? 0
+        : rows.findIndex((row) => String(row.source_file_id) === mediaSourceId);
       return selectedIndex >= 0 ? probes[selectedIndex]?.runTimeTicks ?? 0 : 0;
     }
     return readJellyfinRunTimeTicks(probes);
@@ -969,7 +965,10 @@ export class JellyfinCompatibilityService {
         .join("source_files as f", "f.id", "fl.source_file_id")
         .leftJoin("media_file_probes as p", "p.source_file_id", "f.id")
         .select("fl.item_id", "f.id as file_id", "f.name", "f.size", "p.status", "p.result_json")
-        .whereIn("fl.item_id", uniqueItemIds).where({ "f.service_id": context.serviceId, "f.status": "active" }),
+        .whereIn("fl.item_id", uniqueItemIds)
+        .where({ "f.service_id": context.serviceId, "f.status": "active" })
+        // 关键变量：列表和详情保持同一文件顺序，保证主媒体源选择稳定。
+        .orderBy("f.path", "asc"),
     ]);
     const progressByItemId = new Map(progressRows.map((row) => [String(row.item_id), row as Record<string, unknown>]));
     const filesByItemId = new Map<string, JellyfinFileSummary[]>();
@@ -980,9 +979,7 @@ export class JellyfinCompatibilityService {
         fileId: String(row.file_id),
         name: String(row.name ?? ""),
         size: Number(row.size ?? 0),
-        mediaProbe: context.mediaSpecsEnabled
-          ? parseCompletedMediaProbeResult(row.status, row.result_json)
-          : null,
+        mediaProbe: parseCompletedMediaProbeResult(row.status, row.result_json),
       });
       filesByItemId.set(itemId, files);
     }

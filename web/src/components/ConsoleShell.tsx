@@ -248,11 +248,6 @@ export function ConsoleShell({
 
   return (
     <div className="min-h-screen bg-background">
-      <div
-        className="pointer-events-none fixed inset-x-0 top-0 h-[420px]"
-        style={{ backgroundImage: "var(--gradient-glow)" }}
-      />
-
       <aside className="fixed top-0 bottom-0 left-0 z-30 hidden w-[248px] flex-col border-r border-sidebar-border bg-sidebar/80 px-4 py-6 backdrop-blur-xl lg:flex">
         <Brand />
         <div className="mt-9 flex-1 overflow-y-auto">

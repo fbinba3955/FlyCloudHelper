@@ -131,7 +131,10 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const logger = createBusinessLogger(server);
   const providers = new ProviderRegistry(config, (fields) => logger("warn", fields));
   const vault = new CredentialVault(config.credentialMasterKey);
-  const repository = new ServiceRepository(database, logger);
+  const repository = new ServiceRepository(database, logger, {
+    scanWorkerConcurrency: config.workerConcurrency,
+    mediaProbeConcurrency: config.mediaProbeConcurrency,
+  });
   const publicAccess = new PublicAccessService(database, config);
   const serviceAccess = new ServiceAccessService(database);
   const backfilledServiceAccessAccounts = await serviceAccess.ensureExistingServices();

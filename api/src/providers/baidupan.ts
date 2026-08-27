@@ -3,8 +3,9 @@ import {
   PROVIDER_RATE_LIMIT_MAX_RETRIES,
   providerFetch,
   readProviderRateLimitDelayMs,
+  registerProviderSharedRateLimit,
   validateProviderUrl,
-  waitForProviderRateLimit,
+  waitForProviderSharedRateLimit,
   type ProviderNetworkOptions,
 } from "./network.js";
 import {
@@ -19,7 +20,7 @@ import {
   type ProviderValidationResult,
   type ProviderFileStreamAccess,
   type ScanRoot,
-  createFlymbyRecommendedScanSettings,
+  createProviderRecommendedScanSettings,
   requireConnectionString,
   toFileSize,
 } from "./types.js";
@@ -45,7 +46,11 @@ export class BaiduPanProvider implements ProviderAdapter {
     adapterVersion: "1.0.0",
     credentialSchemaVersion: 2,
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
-    recommendedScanSettings: createFlymbyRecommendedScanSettings(),
+    recommendedScanSettings: createProviderRecommendedScanSettings({
+      // 百度单页可以读取 1000 项，但业务码 31034 对突发并发更敏感。
+      scanDirectoryConcurrency: { default: 4, min: 1, max: 4 },
+      fullScanDirectoryConcurrency: 2,
+    }),
     connectionFields: [
       { name: "accessToken", label: "Access Token", type: "password", required: true, secret: true },
       { name: "refreshToken", label: "Refresh Token", type: "password", required: true, secret: true },
@@ -297,6 +302,7 @@ export class BaiduPanProvider implements ProviderAdapter {
       if (retryCount >= PROVIDER_RATE_LIMIT_MAX_RETRIES || signal?.aborted) {
         this.networkOptions.logConnectionFailure?.({
           日志关键字: "codex-flycloud-provider-rate-limit",
+          性能日志关键字: "codex-flycloud-scan-performance",
           事件: "百度网盘业务限流重试后仍未恢复",
           请求路径: url.pathname,
           业务错误码: payload.errno,
@@ -306,16 +312,19 @@ export class BaiduPanProvider implements ProviderAdapter {
       }
       const retryDelayMs = readProviderRateLimitDelayMs(null, retryCount);
       retryCount += 1;
+      const sharedCooldownUntilMs = registerProviderSharedRateLimit(url, retryDelayMs);
       this.networkOptions.logConnectionFailure?.({
         日志关键字: "codex-flycloud-provider-rate-limit",
+        性能日志关键字: "codex-flycloud-scan-performance",
         事件: "百度网盘业务限流后等待重试",
         请求路径: url.pathname,
         业务错误码: payload.errno,
         当前重试次数: retryCount,
         最大重试次数: PROVIDER_RATE_LIMIT_MAX_RETRIES,
         等待毫秒: retryDelayMs,
+        共享冷却截止时间: new Date(sharedCooldownUntilMs).toISOString(),
       });
-      await waitForProviderRateLimit(retryDelayMs, signal);
+      await waitForProviderSharedRateLimit(url, signal);
     }
   }
 

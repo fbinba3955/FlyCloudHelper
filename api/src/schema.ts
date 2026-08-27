@@ -699,6 +699,27 @@ async function createCatalogTables(database: Knex): Promise<void> {
     table.integer("metadata_profile_revision").notNullable().defaultTo(0);
   });
 
+  if (!(await database.schema.hasTable("nfo_sidecar_cache"))) {
+    await database.schema.createTable("nfo_sidecar_cache", (table) => {
+      // 关键变量：缓存使用Provider稳定资源ID和文件指纹，未变化的NFO无需再次从网盘下载。
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.string("provider_resource_id", 512).notNullable();
+      table.text("path").notNullable();
+      table.bigInteger("size").notNullable();
+      table.string("modified_at", 40).nullable();
+      table.string("etag", 255).nullable();
+      table.string("parser_version", 40).notNullable();
+      table.text("metadata_json").notNullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["user_id", "library_id", "provider_resource_id"], { indexName: "uq_nfo_sidecar_cache_resource" });
+      table.index(["service_id", "library_id"], "idx_nfo_sidecar_cache_service_library");
+    });
+  }
+
   if (!(await database.schema.hasTable("media_probe_jobs"))) {
     await database.schema.createTable("media_probe_jobs", (table) => {
       table.string("id", 64).primary();

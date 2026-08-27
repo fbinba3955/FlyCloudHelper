@@ -19,6 +19,7 @@ import {
   retryScanJob,
   type JobStatus,
   type MediaProbeFailure,
+  type ScanJob,
   type ServiceListFilters,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
@@ -51,6 +52,9 @@ const backgroundJobTypeLabels = {
   scan: "扫描刮削",
   media_probe: "视频规格分析",
 } as const;
+
+type JobStatusFilter = "all" | "active" | JobStatus;
+type JobTypeFilter = "all" | keyof typeof backgroundJobTypeLabels;
 
 const providerTypeLabels: Record<string, string> = {
   webdav: "WebDAV",
@@ -169,9 +173,62 @@ function getJobTone(status: JobStatus): StatusTone {
   return "primary";
 }
 
+/** 生成排队任务的简短等待说明，列表和详情保持同一套含义。 */
+function getQueuedJobWaitSummary(job: ScanJob): string {
+  if (job.status !== "queued") return "";
+  const visibleTargets = job.waitingForJobs
+    .slice(0, 3)
+    .map((target) => `${target.serviceName}（${target.id.slice(0, 8)}）`);
+  const omittedTargetCount = Math.max(0, job.waitingForJobs.length - visibleTargets.length);
+  const targetParts = [...visibleTargets];
+  if (omittedTargetCount > 0) targetParts.push(`另 ${omittedTargetCount} 个`);
+  if (job.hiddenWaitingJobCount > 0) targetParts.push(`其他账号 ${job.hiddenWaitingJobCount} 个`);
+  const targetText = targetParts.length > 0 ? `：${targetParts.join("、")}` : "";
+  const queueText = job.queueAheadCount > 0 ? `，前方另有 ${job.queueAheadCount} 个扫描任务排队` : "";
+  if (job.waitingReason === "service_scan_priority") return `等待同服务扫描任务结束${targetText}`;
+  if (job.waitingReason === "scan_worker_capacity") return `等待任一运行中的扫描任务结束${targetText}${queueText}`;
+  if (job.waitingReason === "media_probe_worker_capacity") return `等待视频规格执行槽位${targetText}`;
+  if (job.waitingReason === "scan_queue_order") return `前方还有 ${job.queueAheadCount} 个扫描任务排队`;
+  return "等待后台 Worker 领取任务";
+}
+
+/** 判断任务是否支持重试；规格任务完成但包含失败文件时也可以只重试失败项。 */
+function canRetryJob(job: ScanJob): boolean {
+  return job.status === "failed" || job.status === "cancelled"
+    || (job.jobType === "media_probe" && job.status === "completed" && job.errorCount > 0);
+}
+
+/** 判断任务是否可以进入暂停状态。 */
+function canPauseJob(job: ScanJob): boolean {
+  return job.status === "queued" || job.status === "running" || job.status === "retry_waiting";
+}
+
+/** 判断任务是否可以继续执行。 */
+function canResumeJob(job: ScanJob): boolean {
+  return job.status === "paused";
+}
+
+/** 判断任务是否允许终止。 */
+function canCancelJob(job: ScanJob): boolean {
+  return ["queued", "running", "retry_waiting", "paused"].includes(job.status);
+}
+
+/** 判断任务是否已经进入允许删除的终态。 */
+function canDeleteJob(job: ScanJob): boolean {
+  return ["completed", "failed", "cancelled"].includes(job.status);
+}
+
 /** 渲染任务列表及选中任务详情。 */
 function JobsView({ admin }: { admin: boolean }) {
-  const resource = useApiResource(() => listJobs(admin), [admin]);
+  const [statusFilter, setStatusFilter] = useState<JobStatusFilter>("all");
+  const [jobTypeFilter, setJobTypeFilter] = useState<JobTypeFilter>("all");
+  const resource = useApiResource(
+    () => listJobs(admin, {
+      status: statusFilter === "all" ? undefined : statusFilter,
+      jobType: jobTypeFilter === "all" ? undefined : jobTypeFilter,
+    }),
+    [admin, statusFilter, jobTypeFilter],
+  );
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [mediaProbeFailures, setMediaProbeFailures] = useState<MediaProbeFailure[]>([]);
@@ -185,15 +242,12 @@ function JobsView({ admin }: { admin: boolean }) {
   const jobs = resource.data?.items ?? [];
   const activeJob = jobs.find((job) => job.id === selectedJobId) ?? jobs[0];
   const pendingActiveJobOperation = activeJob ? pendingJobOperations[activeJob.id] : undefined;
-  const serverControlPending = Boolean(activeJob && (activeJob.controlAction ?? "none") !== "none");
-  const activeJobOperationBlocked = Boolean(pendingActiveJobOperation || serverControlPending);
-  // 规格任务完成但含失败文件时只重试失败项；扫描任务仍沿用原终态规则。
-  const canRetryActiveJob = Boolean(activeJob && (activeJob.status === "failed" || activeJob.status === "cancelled"
-    || (activeJob.jobType === "media_probe" && activeJob.status === "completed" && activeJob.errorCount > 0)));
-  const canPauseActiveJob = activeJob?.status === "queued" || activeJob?.status === "running" || activeJob?.status === "retry_waiting";
-  const canResumeActiveJob = activeJob?.status === "paused";
-  const canCancelActiveJob = Boolean(activeJob && ["queued", "running", "retry_waiting", "paused"].includes(activeJob.status));
-  const canDeleteActiveJob = Boolean(activeJob && ["completed", "failed", "cancelled"].includes(activeJob.status));
+  const activeJobOperationBlocked = Boolean(activeJob && (pendingActiveJobOperation || activeJob.controlAction !== "none"));
+  const canRetryActiveJob = Boolean(activeJob && canRetryJob(activeJob));
+  const canPauseActiveJob = Boolean(activeJob && canPauseJob(activeJob));
+  const canResumeActiveJob = Boolean(activeJob && canResumeJob(activeJob));
+  const canCancelActiveJob = Boolean(activeJob && canCancelJob(activeJob));
+  const canDeleteActiveJob = Boolean(activeJob && canDeleteJob(activeJob));
   const canDownloadFailureReport = Boolean(activeJob && activeJob.jobType === "scan" && activeJob.status !== "queued");
   const snapshotFields = activeJob ? getJobSnapshotFields(activeJob.snapshot) : [];
   const pluginSnapshots = activeJob ? getJobPluginSnapshots(activeJob.snapshot) : [];
@@ -212,6 +266,15 @@ function JobsView({ admin }: { admin: boolean }) {
     if (!resource.error) return;
     console.warn("codex-job-progress-refresh", { "刷新错误": resource.error, "管理模式": admin });
   }, [admin, resource.error]);
+
+  useEffect(() => {
+    console.info("codex-job-list-filter", {
+      "事件": "切换后台任务筛选",
+      "管理模式": admin ? "管理员" : "用户",
+      "状态筛选": statusFilter,
+      "类型筛选": jobTypeFilter,
+    });
+  }, [admin, jobTypeFilter, statusFilter]);
 
   useEffect(() => {
     if (!activeJob || activeJob.jobType !== "media_probe" || activeJob.errorCount <= 0) {
@@ -262,9 +325,9 @@ function JobsView({ admin }: { admin: boolean }) {
   }
 
   /** 通过任务重试接口保留原任务关联并创建新任务。 */
-  async function retrySelectedJob(): Promise<void> {
-    if (!activeJob || !canRetryActiveJob) return;
-    const targetJobId = activeJob.id;
+  async function retryJob(targetJob: ScanJob): Promise<void> {
+    if (!canRetryJob(targetJob)) return;
+    const targetJobId = targetJob.id;
     if (!beginJobOperation(targetJobId, "retry")) return;
     setMessage("正在创建重试任务…");
     try {
@@ -280,10 +343,10 @@ function JobsView({ admin }: { admin: boolean }) {
   }
 
   /** 二次确认后向对应 Worker 提交后台任务终止请求。 */
-  async function cancelSelectedJob(): Promise<void> {
-    if (!activeJob || !canCancelActiveJob) return;
-    if (!window.confirm(`确定终止后台任务 ${activeJob.id} 吗？已经完成的处理结果不会自动回滚。`)) return;
-    const targetJobId = activeJob.id;
+  async function cancelJob(targetJob: ScanJob): Promise<void> {
+    if (!canCancelJob(targetJob)) return;
+    if (!window.confirm(`确定终止后台任务 ${targetJob.id} 吗？已经完成的处理结果不会自动回滚。`)) return;
+    const targetJobId = targetJob.id;
     if (!beginJobOperation(targetJobId, "cancel")) return;
     setMessage("正在提交终止请求…");
     try {
@@ -298,9 +361,9 @@ function JobsView({ admin }: { admin: boolean }) {
   }
 
   /** 请求对应 Worker 在安全边界暂停当前后台任务。 */
-  async function pauseSelectedJob(): Promise<void> {
-    if (!activeJob || !canPauseActiveJob) return;
-    const targetJobId = activeJob.id;
+  async function pauseJob(targetJob: ScanJob): Promise<void> {
+    if (!canPauseJob(targetJob)) return;
+    const targetJobId = targetJob.id;
     if (!beginJobOperation(targetJobId, "pause")) return;
     setMessage("正在提交暂停请求…");
     try {
@@ -315,9 +378,9 @@ function JobsView({ admin }: { admin: boolean }) {
   }
 
   /** 继续已暂停后台任务，扫描任务恢复目录游标，规格任务继续剩余文件。 */
-  async function resumeSelectedJob(): Promise<void> {
-    if (!activeJob || !canResumeActiveJob) return;
-    const targetJobId = activeJob.id;
+  async function resumeJob(targetJob: ScanJob): Promise<void> {
+    if (!canResumeJob(targetJob)) return;
+    const targetJobId = targetJob.id;
     if (!beginJobOperation(targetJobId, "resume")) return;
     setMessage("正在恢复后台任务…");
     try {
@@ -332,15 +395,15 @@ function JobsView({ admin }: { admin: boolean }) {
   }
 
   /** 二次确认后删除终态任务及其进度事件。 */
-  async function deleteSelectedJob(): Promise<void> {
-    if (!activeJob || !canDeleteActiveJob) return;
-    if (!window.confirm(`确定删除后台任务 ${activeJob.id} 吗？该任务的进度和错误记录将无法恢复。`)) return;
-    const targetJobId = activeJob.id;
+  async function deleteJob(targetJob: ScanJob): Promise<void> {
+    if (!canDeleteJob(targetJob)) return;
+    if (!window.confirm(`确定删除后台任务 ${targetJob.id} 吗？该任务的进度和错误记录将无法恢复。`)) return;
+    const targetJobId = targetJob.id;
     if (!beginJobOperation(targetJobId, "delete")) return;
     setMessage("正在删除任务…");
     try {
       await deleteScanJob(targetJobId, admin);
-      setSelectedJobId(null);
+      setSelectedJobId((currentJobId) => currentJobId === targetJobId ? null : currentJobId);
       setMessage(`任务 ${targetJobId} 已删除`);
       await resource.refresh();
     } catch (error) {
@@ -353,7 +416,7 @@ function JobsView({ admin }: { admin: boolean }) {
   /** 二次确认后清除权限范围内全部已完成任务，其他状态任务保持不变。 */
   async function clearCompletedJobs(): Promise<void> {
     if (clearingCompletedJobsRef.current) return;
-    if (!window.confirm("确定清除全部已完成任务吗？任务进度、事件与错误记录将无法恢复；失败、已取消和未结束任务不会被删除。")) return;
+    if (!window.confirm("确定清除全部已完成任务吗？本操作只删除状态为“已完成”的任务；失败、已取消、排队、运行、等待重试和暂停任务都会保留。")) return;
     clearingCompletedJobsRef.current = true;
     setClearingCompletedJobs(true);
     setMessage("正在清除已完成任务…");
@@ -393,20 +456,63 @@ function JobsView({ admin }: { admin: boolean }) {
         title={admin ? "全部后台任务" : "后台任务"}
         actions={<>
           <SecondaryButton onClick={() => void resource.refresh()}><Radio className="size-4" /> 每 5 秒刷新</SecondaryButton>
-          <SecondaryButton onClick={() => void pauseSelectedJob()} disabled={!canPauseActiveJob || activeJobOperationBlocked}><Pause className="size-4" /> {pendingActiveJobOperation === "pause" || activeJob?.controlAction === "pause" ? "暂停处理中…" : "暂停"}</SecondaryButton>
-          <SecondaryButton onClick={() => void resumeSelectedJob()} disabled={!canResumeActiveJob || activeJobOperationBlocked}><Play className="size-4" /> {pendingActiveJobOperation === "resume" ? "正在继续…" : "继续"}</SecondaryButton>
-          <SecondaryButton onClick={() => void cancelSelectedJob()} disabled={!canCancelActiveJob || activeJobOperationBlocked}><Square className="size-4" /> {pendingActiveJobOperation === "cancel" || activeJob?.controlAction === "cancel" ? "终止处理中…" : "终止任务"}</SecondaryButton>
-          <PrimaryButton onClick={() => void retrySelectedJob()} disabled={!canRetryActiveJob || activeJobOperationBlocked}><RotateCcw className="size-4" /> {pendingActiveJobOperation === "retry" ? "正在重试…" : "重试失败内容"}</PrimaryButton>
-          <button type="button" onClick={() => void deleteSelectedJob()} disabled={!canDeleteActiveJob || activeJobOperationBlocked} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {pendingActiveJobOperation === "delete" ? "正在删除…" : "删除任务"}</button>
+          <SecondaryButton onClick={() => { if (activeJob) void pauseJob(activeJob); }} disabled={!canPauseActiveJob || activeJobOperationBlocked}><Pause className="size-4" /> {pendingActiveJobOperation === "pause" || activeJob?.controlAction === "pause" ? "暂停处理中…" : "暂停"}</SecondaryButton>
+          <SecondaryButton onClick={() => { if (activeJob) void resumeJob(activeJob); }} disabled={!canResumeActiveJob || activeJobOperationBlocked}><Play className="size-4" /> {pendingActiveJobOperation === "resume" ? "正在继续…" : "继续"}</SecondaryButton>
+          <SecondaryButton onClick={() => { if (activeJob) void cancelJob(activeJob); }} disabled={!canCancelActiveJob || activeJobOperationBlocked}><Square className="size-4" /> {pendingActiveJobOperation === "cancel" || activeJob?.controlAction === "cancel" ? "终止处理中…" : "终止任务"}</SecondaryButton>
+          <PrimaryButton onClick={() => { if (activeJob) void retryJob(activeJob); }} disabled={!canRetryActiveJob || activeJobOperationBlocked}><RotateCcw className="size-4" /> {pendingActiveJobOperation === "retry" ? "正在重试…" : "重试失败内容"}</PrimaryButton>
+          <button type="button" onClick={() => { if (activeJob) void deleteJob(activeJob); }} disabled={!canDeleteActiveJob || activeJobOperationBlocked} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {pendingActiveJobOperation === "delete" ? "正在删除…" : "删除任务"}</button>
         </>}
       />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      {!activeJob ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "还没有后台任务"}</div></Panel> : (
+      <Panel className="mb-4" title="筛选任务">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="grid gap-1.5 text-xs text-muted-foreground">
+            任务状态
+            <select
+              value={statusFilter}
+              onChange={(event) => setStatusFilter(event.target.value as JobStatusFilter)}
+              className="rounded-lg border border-input bg-background/50 px-3 py-2 text-sm text-foreground outline-none focus:border-ring"
+            >
+              <option value="all">全部状态</option>
+              <option value="active">未结束</option>
+              <option value="queued">排队中</option>
+              <option value="running">运行中</option>
+              <option value="retry_waiting">等待重试</option>
+              <option value="paused">已暂停</option>
+              <option value="completed">已完成</option>
+              <option value="failed">失败</option>
+              <option value="cancelled">已取消</option>
+            </select>
+          </label>
+          <label className="grid gap-1.5 text-xs text-muted-foreground">
+            任务类型
+            <select
+              value={jobTypeFilter}
+              onChange={(event) => setJobTypeFilter(event.target.value as JobTypeFilter)}
+              className="rounded-lg border border-input bg-background/50 px-3 py-2 text-sm text-foreground outline-none focus:border-ring"
+            >
+              <option value="all">全部类型</option>
+              <option value="scan">扫描刮削</option>
+              <option value="media_probe">视频规格分析</option>
+            </select>
+          </label>
+        </div>
+      </Panel>
+      {!activeJob ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? (statusFilter === "all" && jobTypeFilter === "all" ? "还没有后台任务" : "当前筛选条件下没有任务")}</div></Panel> : (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
           <Panel title={`任务详情 ${activeJob.id}`} description={`${activeJob.serviceName} · ${activeJob.jobType === "media_probe" ? "视频规格分析" : `${activeJob.scanMode === "full" ? "全量" : "增量"}扫描刮削`}${admin ? ` · ${activeJob.ownerUsername}` : ""}`}>
             <div className="rounded-xl border border-primary/25 bg-primary/8 p-5">
               <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div><p className="text-xs text-muted-foreground">当前阶段</p><p className="font-display mt-1 text-2xl font-semibold">{getJobStageLabel(activeJob.stage)}</p><p className="mt-1 text-xs text-muted-foreground">{getJobDurationLabel(activeJob.status)}：{formatJobDuration(activeJob.elapsedMs)}</p></div><StatusPill tone={getJobTone(activeJob.status)}>{getJobStatusLabel(activeJob)}</StatusPill></div>
               <div className="mt-4"><ProgressMeter value={activeJob.status === "completed" ? 1 : activeJob.processedCount} total={activeJob.status === "completed" ? 1 : activeJob.totalCount} /></div>
+              {activeJob.status === "queued" && <div className="mt-3 rounded-lg border border-warning/30 bg-warning/8 px-3 py-2.5">
+                <p className="text-xs font-medium">{getQueuedJobWaitSummary(activeJob)}</p>
+                {activeJob.waitingForJobs.length > 0 && <ul className="mt-2 space-y-1.5">
+                  {activeJob.waitingForJobs.map((target) => <li key={`${target.jobType}:${target.id}`} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 text-[11px] text-muted-foreground">
+                    <span className="min-w-0 truncate" title={`${target.serviceName} · ${target.id}`}>{target.serviceName} · <span className="font-mono">{target.id}</span>{admin ? ` · ${target.ownerUsername}` : ""}</span>
+                    <span>{jobStatusLabels[target.status]}</span>
+                  </li>)}
+                </ul>}
+              </div>}
               <div className="mt-3 min-w-0 rounded-lg border border-border/70 bg-background/30 px-3 py-2">
                 <p className="text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" ? "当前分析文件" : "当前扫描路径"}</p>
                 <p className="mt-1 truncate font-mono text-xs" title={activeJob.currentPath ?? undefined}>{activeJob.currentPath || (activeJob.jobType === "media_probe" ? "等待领取视频文件" : "准备读取扫描目录")}</p>
@@ -460,10 +566,38 @@ function JobsView({ admin }: { admin: boolean }) {
           <Panel
             title="任务列表"
             description={`共 ${resource.data?.total ?? 0} 个任务`}
-            action={<button type="button" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除已完成"}</button>}
+            action={<button type="button" title="只清除状态为已完成的任务" onClick={() => void clearCompletedJobs()} disabled={clearingCompletedJobs} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/8 px-3 py-2 text-xs text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" /> {clearingCompletedJobs ? "正在清除…" : "清除已完成"}</button>}
           >
             <ul className="space-y-2">
-              {jobs.map((job) => <li key={job.id}><button type="button" onClick={() => setSelectedJobId(job.id)} className="w-full rounded-xl border border-border bg-secondary/40 p-3.5 text-left"><div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div className="min-w-0"><p className="truncate font-mono text-xs">{job.id}</p><p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.serviceName} · {backgroundJobTypeLabels[job.jobType]} · {job.jobType === "scan" ? `${job.scanMode === "full" ? "全量" : "增量"} · ` : ""}{getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p><p className="mt-1 text-[11px] text-muted-foreground">{getJobDurationLabel(job.status)}：{formatJobDuration(job.elapsedMs)}</p><div className="mt-1 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2"><span>开始时间：{formatJobDateTime(job.startedAt)}</span><span>结束时间：{formatJobDateTime(job.finishedAt)}</span></div></div><StatusPill tone={getJobTone(job.status)}>{getJobStatusLabel(job)}</StatusPill></div><div className="mt-2.5"><ProgressMeter value={job.status === "completed" ? 1 : job.processedCount} total={job.status === "completed" ? 1 : job.totalCount} /></div></button></li>)}
+              {jobs.map((job) => {
+                const selected = activeJob?.id === job.id;
+                const pendingOperation = pendingJobOperations[job.id];
+                const operationBlocked = Boolean(pendingOperation || job.controlAction !== "none");
+                return <li key={job.id}>
+                  <article className={`overflow-hidden rounded-xl border bg-secondary/40 transition-colors ${selected ? "border-foreground/45" : "border-border hover:border-foreground/25"}`}>
+                    <button type="button" aria-pressed={selected} onClick={() => setSelectedJobId(job.id)} className="w-full p-3.5 text-left">
+                      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate font-mono text-xs">{job.id}</p>
+                          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.serviceName} · {backgroundJobTypeLabels[job.jobType]} · {job.jobType === "scan" ? `${job.scanMode === "full" ? "全量" : "增量"} · ` : ""}{getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p>
+                          <p className="mt-1 text-[11px] text-muted-foreground">{getJobDurationLabel(job.status)}：{formatJobDuration(job.elapsedMs)}</p>
+                          {job.status === "queued" && <p className="mt-1 truncate text-[11px] text-warning" title={getQueuedJobWaitSummary(job)}>{getQueuedJobWaitSummary(job)}</p>}
+                          <div className="mt-1 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2"><span>开始时间：{formatJobDateTime(job.startedAt)}</span><span>结束时间：{formatJobDateTime(job.finishedAt)}</span></div>
+                        </div>
+                        <StatusPill tone={getJobTone(job.status)}>{getJobStatusLabel(job)}</StatusPill>
+                      </div>
+                      <div className="mt-2.5"><ProgressMeter value={job.status === "completed" ? 1 : job.processedCount} total={job.status === "completed" ? 1 : job.totalCount} /></div>
+                    </button>
+                    <div className="flex flex-wrap justify-end gap-2 border-t border-border/70 px-3.5 py-2.5">
+                      {canPauseJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void pauseJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><Pause className="size-3.5" />{pendingOperation === "pause" || job.controlAction === "pause" ? "暂停处理中…" : "暂停"}</button>}
+                      {canResumeJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void resumeJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><Play className="size-3.5" />{pendingOperation === "resume" ? "正在继续…" : "继续"}</button>}
+                      {canCancelJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void cancelJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/35 bg-destructive/8 px-2.5 py-1.5 text-[11px] text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Square className="size-3.5" />{pendingOperation === "cancel" || job.controlAction === "cancel" ? "终止处理中…" : "终止"}</button>}
+                      {canRetryJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void retryJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><RotateCcw className="size-3.5" />{pendingOperation === "retry" ? "正在重试…" : "重试"}</button>}
+                      {canDeleteJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void deleteJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/35 bg-destructive/8 px-2.5 py-1.5 text-[11px] text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" />{pendingOperation === "delete" ? "正在删除…" : "删除"}</button>}
+                    </div>
+                  </article>
+                </li>;
+              })}
             </ul>
           </Panel>
         </div>

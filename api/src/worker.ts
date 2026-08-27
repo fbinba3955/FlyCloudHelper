@@ -88,6 +88,9 @@ interface NfoSidecarEntry {
   metadata: FlymbyNfoMetadata;
 }
 
+// 关键变量：解析规则变化时提升版本，旧NFO缓存会自动失效并重新下载解析。
+const FLYMBY_NFO_PARSER_CACHE_VERSION = "flymby-nfo-v1";
+
 interface BusinessTaskProgress {
   /** 本次任务中需要处理的电影或节目聚合键。 */
   taskKeys: Set<string>;
@@ -577,6 +580,7 @@ export class ScanWorker {
 
   /** 完成 Provider 枚举、分类、刮削、持久化和 generation 对账。 */
   private async scan(job: ScanJobRecord, signal: AbortSignal): Promise<void> {
+    const scanStartedAt = Date.now();
     const runtime = await this.repository.getJobRuntimeConfiguration(job);
     const connection = this.vault.decrypt(runtime.encryptedConnection);
     const adapter = this.providers.get(runtime.providerType);
@@ -635,6 +639,9 @@ export class ScanWorker {
     let skippedCount = savedProgress.skippedCount;
     // 关键变量：统计本轮全量扫描直接复用的已匹配源文件，便于区分枚举耗时与重复刮削耗时。
     let reusedMatchedSourceFileCount = 0;
+    // 关键变量：区分NFO缓存命中和真实网盘下载，便于确认重复扫描的网络请求是否下降。
+    let reusedNfoSidecarCount = 0;
+    let downloadedNfoSidecarCount = 0;
     const providerWarningKeys = new Set(savedProgress.providerWarningKeys);
     let currentScanPath: string | null = savedProgress.currentScanPath;
     let lastProgressPublishedAt = 0;
@@ -662,7 +669,7 @@ export class ScanWorker {
       runtime.scanProfile.scanDirectoryConcurrency,
       recommendedSettings.scanDirectoryConcurrency,
     );
-    // 关键变量：Flymby APP 全量扫描固定为单目录并发，增量扫描才使用服务配置值。
+    // 关键变量：全量扫描按Provider独立上限运行，避免统一单目录串行，也防止高并发触发网盘限流。
     const effectiveScanDirectoryConcurrency = job.scanMode === "full"
       ? Math.min(configuredScanDirectoryConcurrency, recommendedSettings.fullScanDirectoryConcurrency)
       : configuredScanDirectoryConcurrency;
@@ -765,12 +772,14 @@ export class ScanWorker {
     };
     this.logger.info({
       日志关键字: "codex-flycloud-helper-worker-tuning",
+      性能日志关键字: "codex-flycloud-scan-performance",
       事件: "扫描刮削并发已确定",
       任务ID: job.id,
       网盘类型: runtime.providerType,
       扫描模式: job.scanMode,
       扫描配置并发: configuredScanDirectoryConcurrency,
       扫描实际并发: effectiveScanDirectoryConcurrency,
+      全量扫描并发上限: recommendedSettings.fullScanDirectoryConcurrency,
       刮削配置并发: configuredScrapeTaskConcurrency,
       影片任务实际并发: scrapeConcurrency,
       单任务文件落库并发: mediaFilePersistenceConcurrency,
@@ -1094,6 +1103,7 @@ export class ScanWorker {
             if (candidatesToPrepare.length >= 100 || sourceBatchElapsedMs >= 1_000) {
               this.logger.info({
                 日志关键字: "codex-flycloud-helper-source-batch",
+                性能日志关键字: "codex-flycloud-scan-performance",
                 事件: "目录源文件批量准备完成",
                 任务ID: job.id,
                 目录标识: flushedDirectoryKey,
@@ -1108,6 +1118,7 @@ export class ScanWorker {
             });
             this.logger.warn({
               日志关键字: "codex-flycloud-helper-source-batch",
+              性能日志关键字: "codex-flycloud-scan-performance",
               事件: "目录源文件批量准备失败",
               任务ID: job.id,
               目录标识: flushedDirectoryKey,
@@ -1383,15 +1394,64 @@ export class ScanWorker {
         skippedCount += 1;
         if (adapter.readText) {
           try {
-            const nfoText = await adapter.readText(connection, entry, signal);
             const nfoPath = path.posix.normalize(entry.path);
-            nfoSidecars.set(nfoPath, { path: nfoPath, metadata: parseFlymbyNfo(nfoText) });
+            // 关键变量：超长Provider资源ID先转为稳定摘要，和源文件表保持相同上限处理。
+            const nfoProviderResourceId = entry.resourceId.length <= 500
+              ? entry.resourceId
+              : createStableId("resource", entry.resourceId);
+            const cacheInput = {
+              userId: job.userId,
+              serviceId: job.serviceId,
+              libraryId: job.libraryId,
+              providerResourceId: nfoProviderResourceId,
+              path: nfoPath,
+              size: entry.size,
+              modifiedAt: entry.modifiedAt,
+              etag: entry.etag,
+              parserVersion: FLYMBY_NFO_PARSER_CACHE_VERSION,
+            };
+            let nfoMetadata: FlymbyNfoMetadata | null = null;
+            try {
+              nfoMetadata = await this.repository.readNfoSidecarCache(cacheInput);
+            } catch (cacheError) {
+              // 缓存异常只降低扫描速度，不影响NFO正常读取和影片刮削。
+              this.logger.warn({
+                日志关键字: "codex-flycloud-scan-performance",
+                事件: "读取NFO缓存失败并回退网盘下载",
+                任务ID: job.id,
+                NFO路径: nfoPath,
+                错误信息: cacheError instanceof Error ? cacheError.message : "未知缓存错误",
+              });
+            }
+            let nfoSource = "持久化缓存";
+            if (nfoMetadata) {
+              reusedNfoSidecarCount += 1;
+            } else {
+              const nfoText = await adapter.readText(connection, entry, signal);
+              nfoMetadata = parseFlymbyNfo(nfoText);
+              downloadedNfoSidecarCount += 1;
+              nfoSource = "网盘下载";
+              try {
+                await this.repository.saveNfoSidecarCache(cacheInput, nfoMetadata);
+              } catch (cacheError) {
+                // 写入缓存失败不改变本次NFO解析结果，下次扫描会重新尝试下载。
+                this.logger.warn({
+                  日志关键字: "codex-flycloud-scan-performance",
+                  事件: "保存NFO缓存失败",
+                  任务ID: job.id,
+                  NFO路径: nfoPath,
+                  错误信息: cacheError instanceof Error ? cacheError.message : "未知缓存错误",
+                });
+              }
+            }
+            nfoSidecars.set(nfoPath, { path: nfoPath, metadata: nfoMetadata });
             this.logger.info({
               日志关键字: "codex-flycloud-helper-scrape",
               事件: "读取NFO成功",
               任务ID: job.id,
               NFO路径: nfoPath,
-              NFO类型: nfoSidecars.get(nfoPath)?.metadata.rootType ?? "unknown",
+              NFO类型: nfoMetadata.rootType,
+              NFO来源: nfoSource,
             });
           } catch (error) {
             if (signal.aborted) throw error;
@@ -1638,6 +1698,7 @@ export class ScanWorker {
     });
     this.logger.info({
       日志关键字: "codex-flycloud-helper-task-count",
+      性能日志关键字: "codex-flycloud-scan-performance",
       事件: "扫描增量结果",
       任务ID: job.id,
       扫描模式: job.scanMode,
@@ -1651,8 +1712,12 @@ export class ScanWorker {
       Provider警告数量: providerWarningCount,
       跳过数量: skippedCount,
       复用已匹配文件数量: reusedMatchedSourceFileCount,
+      复用NFO缓存数量: reusedNfoSidecarCount,
+      下载NFO数量: downloadedNfoSidecarCount,
       当前扫描路径: currentScanPath,
       目录变化数量: changedItemIds.size,
+      扫描耗时毫秒: Date.now() - scanStartedAt,
+      平均每秒枚举文件数量: Number((enumeratedEntryCount / Math.max(1, (Date.now() - scanStartedAt) / 1_000)).toFixed(2)),
     });
     if (reusedMatchedSourceFileCount > 0) {
       this.logger.info({

@@ -98,6 +98,21 @@ export interface ProviderRecommendedScanSettings {
   fullScanDirectoryConcurrency: number;
 }
 
+/** 创建 Provider 独立扫描参数时使用的明确配置，避免不同网盘继续共用同一限流策略。 */
+export interface ProviderScanSettingsInput {
+  scanDirectoryConcurrency: {
+    default: number;
+    min: number;
+    max: number;
+  };
+  scrapeTaskConcurrency?: {
+    default: number;
+    min: number;
+    max: number;
+  };
+  fullScanDirectoryConcurrency: number;
+}
+
 /** Worker 交给 Provider 的单次枚举运行参数。 */
 export interface ProviderEnumerationOptions {
   directoryConcurrency: number;
@@ -195,6 +210,19 @@ export function createFlymbyRecommendedScanSettings(): ProviderRecommendedScanSe
     scanDirectoryConcurrency: { default: 8, min: 1, max: 16 },
     scrapeTaskConcurrency: { default: 4, min: 1, max: 4 },
     fullScanDirectoryConcurrency: 1,
+  };
+}
+
+/** 根据网盘自身分页和限流能力创建扫描参数；刮削并发未指定时继续沿用现有四任务配置。 */
+export function createProviderRecommendedScanSettings(
+  input: ProviderScanSettingsInput,
+): ProviderRecommendedScanSettings {
+  return {
+    scanDirectoryConcurrency: { ...input.scanDirectoryConcurrency },
+    scrapeTaskConcurrency: input.scrapeTaskConcurrency
+      ? { ...input.scrapeTaskConcurrency }
+      : { default: 4, min: 1, max: 4 },
+    fullScanDirectoryConcurrency: input.fullScanDirectoryConcurrency,
   };
 }
 

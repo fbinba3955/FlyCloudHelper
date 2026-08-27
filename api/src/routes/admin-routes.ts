@@ -1006,10 +1006,21 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
 
   server.get<{ Querystring: Record<string, unknown> }>("/api/v1/admin/jobs", async (request) => {
     await requireSuperAdmin(request, runtime.database);
+    const status = typeof request.query.status === "string" ? request.query.status : "";
+    const supportedStatuses: JobStatus[] = ["queued", "running", "retry_waiting", "paused", "completed", "failed", "cancelled"];
+    if (status && status !== "active" && !supportedStatuses.includes(status as JobStatus)) {
+      throw validationError("status", "任务状态筛选值无效");
+    }
+    const jobType = typeof request.query.jobType === "string" ? request.query.jobType : "";
+    if (jobType && jobType !== "scan" && jobType !== "media_probe") {
+      throw validationError("jobType", "任务类型筛选值无效");
+    }
     return runtime.repository.listJobs({
       userId: typeof request.query.userId === "string" ? request.query.userId : undefined,
       serviceId: typeof request.query.serviceId === "string" ? request.query.serviceId : undefined,
-      status: typeof request.query.status === "string" ? request.query.status as JobStatus : undefined,
+      status: status && status !== "active" ? status as JobStatus : undefined,
+      statuses: status === "active" ? ["queued", "running", "retry_waiting", "paused"] : undefined,
+      jobType: jobType ? jobType as "scan" | "media_probe" : undefined,
       ...readPagination(request.query),
     });
   });

@@ -412,7 +412,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
           <div className="flex items-center justify-between gap-4">
             <div>
               <p className="text-sm font-medium">Jellyfin 中转播放</p>
-              <p className="mt-1 text-xs text-muted-foreground">开启后，Jellyfin 自动模式可在原始地址不可用时通过 FlyCloudHelper 播放。</p>
+              <p className="mt-1 text-xs text-muted-foreground">开启后使用 FlyCloudHelper 标准视频入口中转，兼容不能携带网盘请求头的第三方播放器；关闭后优先跳转网盘原始地址。</p>
             </div>
             <button type="button" role="switch" aria-checked={settings.jellyfinRelayPlaybackEnabled} aria-label="启用 Jellyfin 中转播放" disabled={(!settings.relayPlaybackSupported && !settings.jellyfinRelayPlaybackEnabled) || updatingPlayback} onClick={() => void toggleJellyfinRelayPlayback()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinRelayPlaybackEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
               <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinRelayPlaybackEnabled ? "translate-x-5" : "translate-x-0"}`} />

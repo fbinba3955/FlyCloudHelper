@@ -7,7 +7,7 @@ import { parseCompletedMediaProbeResult, readJellyfinRunTimeTicks } from "../med
 import { hydrateRealtimeVideoDetails } from "../media/realtime-video-details.js";
 import { JellyfinCompatibilityService, type JellyfinContext, type JellyfinLibraryContext } from "../jellyfin-service.js";
 import { providerFetch, providerStream } from "../providers/network.js";
-import type { ProviderConnectionContext } from "../providers/types.js";
+import type { ProviderConnectionContext, ProviderFileAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
 import { buildUpstreamHeaders, copyMediaResponseHeaders, resolveRelayAccess, type RelayLibraryRow } from "./media-stream-routes.js";
 
@@ -16,10 +16,28 @@ function readQuery(request: FastifyRequest): Record<string, unknown> {
   return (request.query ?? {}) as Record<string, unknown>;
 }
 
-/** 读取 Jellyfin 官方小驼峰写法和旧客户端大驼峰写法的媒体源 ID。 */
+/** 读取 Jellyfin 查询参数或 PlaybackInfo POST 请求体中的媒体源 ID。 */
 function readMediaSourceId(request: FastifyRequest): string {
   const query = readQuery(request);
-  return String(query.mediaSourceId ?? query.MediaSourceId ?? "");
+  const body = request.body && typeof request.body === "object"
+    ? request.body as Record<string, unknown>
+    : {};
+  return String(query.mediaSourceId ?? query.MediaSourceId ?? body.MediaSourceId ?? body.mediaSourceId ?? "");
+}
+
+/** 返回条目主媒体源的 Jellyfin 协议 ID，其他文件版本继续使用文件 ID。 */
+function toProtocolMediaSourceId(itemId: string, primaryFileId: string, fileId: string): string {
+  return fileId === primaryFileId ? itemId : fileId;
+}
+
+/** 按 Jellyfin 媒体源 ID 找到真实文件，条目 ID 表示主媒体源。 */
+function findPlaybackFile(
+  files: Array<Record<string, unknown>>,
+  itemId: string,
+  mediaSourceId: string,
+): Record<string, unknown> | undefined {
+  if (!mediaSourceId || mediaSourceId === itemId) return files[0];
+  return files.find((candidate) => String(candidate.fileId) === mediaSourceId);
 }
 
 /** 确认 URL 中的用户 ID 就是当前服务访问账号。 */
@@ -42,6 +60,26 @@ function readPlaybackRoute(request: FastifyRequest): "auto" | "server" | "origin
   if (value === "server" || value === "origin") return value;
   if (value === "auto") return value;
   return "auto";
+}
+
+/** 构造官方 Jellyfin 服务内视频流地址，由服务端继续决定原始或中转。 */
+function buildJellyfinStreamUrl(
+  itemId: string,
+  mediaSourceId: string,
+  playbackRoute: "auto" | "server" | "origin",
+): string {
+  const query = new URLSearchParams({
+    static: "true",
+    mediaSourceId,
+    FlyCloudPlaybackRoute: playbackRoute,
+  });
+  // 关键变量：Jellyfin 客户端会把服务基址与 DirectStreamUrl 拼接，因此这里只能返回服务内相对路径。
+  return `/Videos/${encodeURIComponent(itemId)}/stream?${query.toString()}`;
+}
+
+/** 判断 Provider 原始地址是否依赖客户端额外携带请求头。 */
+function hasRequiredPlaybackHeaders(access: ProviderFileAccess): boolean {
+  return Object.keys(access.headers).length > 0;
 }
 
 /** 生成 Jellyfin 标准 MediaSourceInfo 的公共默认字段。 */
@@ -104,7 +142,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   const itemFiles = files.filter((candidate) => String(candidate.itemId) === itemId);
   const playableFiles = itemFiles;
   const requestedFile = requestedSource
-    ? playableFiles.find((candidate) => String(candidate.fileId) === requestedSource)
+    ? findPlaybackFile(playableFiles, itemId, requestedSource)
     : undefined;
   if (requestedSource && !requestedFile) throw new ApiError(404, "jellyfin_media_source_not_found", "指定媒体源不存在");
   // 客户端带 MediaSourceId 重试时只解析指定版本；首次请求则返回当前条目的全部实际文件版本。
@@ -114,17 +152,10 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   // 关键变量：Jellyfin 中转开关只约束服务器媒体入口，不影响临时原始地址直连。
   const jellyfinRelayPlaybackEnabled = Number(service.jellyfin_relay_playback_enabled) === 1
     || service.jellyfin_relay_playback_enabled === true;
-  if (preference === "server" && !jellyfinRelayPlaybackEnabled) {
-    throw new ApiError(409, "jellyfin_relay_playback_disabled", "当前媒体库未启用 Jellyfin 中转播放");
-  }
-  const itemMediaProbes = itemFiles.map((file) => (
-    context.mediaSpecsEnabled
-      ? parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult)
-      : null
-  ));
-  // 关键变量：多版本影片必须所有实际文件都完成分析，PlaybackInfo 才能返回任何规格字段。
-  const mediaSpecsReady = context.mediaSpecsEnabled
-    && itemFiles.length > 0
+  const itemMediaProbes = itemFiles.map((file) =>
+    parseCompletedMediaProbeResult(file.mediaProbeStatus, file.mediaProbeResult));
+  // 关键变量：规格开关只控制自动入队；已有规格完整时，PlaybackInfo 必须始终返回。
+  const mediaSpecsReady = itemFiles.length > 0
     && itemMediaProbes.every((probe) => probe !== null);
   const mediaProbeByFileId = new Map(itemFiles.map((file, index) => [
     String(file.fileId),
@@ -134,40 +165,56 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   const routeNames = new Set<string>();
   const mediaSources: Array<Record<string, unknown>> = [];
   for (const file of candidateFiles) {
-    const locator = (file.playbackLocator && typeof file.playbackLocator === "object" ? file.playbackLocator : {}) as Record<string, unknown>;
-    // 强制服务器直放时无需提前向网盘申请临时地址，真正开流时再解析，减少无效 Provider 调用。
-    const access = preference === "server"
-      ? null
-      : await resolveFileAccess(runtime, service, context.ownerUserId, locator, new AbortController().signal);
-    // 关键变量：Provider Token 只在云助手持久化，但允许随单次播放 URL 或 RequiredHttpHeaders 临时下发。
-    const originUrl = access && /^https?:\/\//iu.test(access.url) ? access.url : null;
-    if (preference === "origin" && !originUrl) continue;
-    const useOrigin = preference === "origin" || (preference === "auto" && Boolean(originUrl));
-    if (!useOrigin && !jellyfinRelayPlaybackEnabled) continue;
+    const protocolMediaSourceId = toProtocolMediaSourceId(
+      itemId,
+      String(playableFiles[0]?.fileId ?? ""),
+      String(file.fileId),
+    );
     const fileName = String(file.name ?? "video.mp4");
     const mediaProbe = mediaProbeByFileId.get(String(file.fileId)) ?? null;
-    const directStreamUrl = useOrigin
-      ? originUrl
-      : `/Videos/${encodeURIComponent(itemId)}/stream?static=true&mediaSourceId=${encodeURIComponent(String(file.fileId))}`;
-    routeNames.add(useOrigin ? "原始地址" : "服务器");
+    const locator = file.playbackLocator && typeof file.playbackLocator === "object"
+      ? file.playbackLocator as Record<string, unknown>
+      : {};
+    let originAccess: ProviderFileAccess | null = null;
+    // 自动模式开启 Jellyfin 中转时直接声明服务器媒体源；只有原始路线才预先申请 Provider 临时地址。
+    const selectedRoute = preference === "server" || (preference === "auto" && jellyfinRelayPlaybackEnabled)
+      ? "server"
+      : "origin";
+    if (selectedRoute === "origin") {
+      try {
+        originAccess = await resolveFileAccess(
+          runtime,
+          service,
+          context.ownerUserId,
+          locator,
+          new AbortController().signal,
+        );
+      } catch (error) {
+        if (preference === "origin" || !jellyfinRelayPlaybackEnabled) throw error;
+      }
+      if (originAccess && !/^https?:\/\//iu.test(originAccess.url)) originAccess = null;
+    }
+    if (selectedRoute === "origin" && !originAccess) continue;
+    const directStreamUrl = buildJellyfinStreamUrl(itemId, protocolMediaSourceId, preference);
+    routeNames.add(selectedRoute === "origin" ? "Jellyfin原始跳转" : "服务器中转");
     mediaSources.push({
       ...buildStandardMediaSourceDefaults(),
-      // 关键变量：服务器中转按服务端文件处理；原始地址和必要请求头只存在于本次 PlaybackInfo 响应中。
-      Protocol: useOrigin ? "Http" : "File", Id: String(file.fileId), Path: useOrigin ? originUrl : fileName,
+      // 关键变量：所有 Jellyfin 客户端统一接收标准 File 媒体源和服务内相对播放地址。
+      Protocol: "File", Id: protocolMediaSourceId, Path: fileName,
       Type: "Default", Container: mediaProbe?.container || undefined, Size: mediaProbe?.size || undefined, Name: fileName,
       Bitrate: mediaProbe?.bitRate || undefined,
-      IsRemote: useOrigin,
-      DirectStreamUrl: directStreamUrl, AddApiKeyToDirectStreamUrl: !useOrigin,
-      RequiredHttpHeaders: useOrigin && access ? access.headers : {},
+      IsRemote: false,
+      DirectStreamUrl: directStreamUrl, AddApiKeyToDirectStreamUrl: true,
+      RequiredHttpHeaders: {},
       RunTimeTicks: mediaProbe?.runTimeTicks || runTimeTicks || undefined,
       MediaStreams: mediaProbe?.mediaStreams ?? [],
     });
   }
   if (mediaSources.length === 0 && preference === "origin") {
-    throw new ApiError(409, "jellyfin_origin_direct_unavailable", "当前文件无法生成原始播放地址，请改用服务器直放");
+    throw new ApiError(409, "jellyfin_origin_direct_unavailable", "当前媒体文件无法生成网盘原始播放地址");
   }
-  if (mediaSources.length === 0 && !jellyfinRelayPlaybackEnabled) {
-    throw new ApiError(409, "jellyfin_relay_playback_disabled", "当前文件没有原始播放地址，且媒体库未启用 Jellyfin 中转播放");
+  if (mediaSources.length === 0 && preference === "auto" && !jellyfinRelayPlaybackEnabled) {
+    throw new ApiError(409, "jellyfin_playback_route_unavailable", "当前媒体文件没有可用原始地址，且媒体库未启用 Jellyfin 中转播放");
   }
   if (mediaSources.length === 0) throw new ApiError(409, "jellyfin_direct_play_unavailable", "当前媒体文件没有可用的直放地址");
   const playbackQuery = readQuery(request);
@@ -183,12 +230,8 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   runtime.logBusinessEvent("info", {
     日志关键字: "codex-jellyfin-compat", 事件: "生成Jellyfin直放信息", 服务ID: context.serviceId,
     媒体条目ID: itemId, 播放路由: [...routeNames].join("+"), 路由偏好: preference, 媒体源数量: mediaSources.length,
-    规格分析开关: context.mediaSpecsEnabled,
     影片规格是否全部完成: mediaSpecsReady,
     包含已完成规格媒体源数量: candidateFiles.filter((file) => mediaProbeByFileId.get(String(file.fileId)) !== null).length,
-    临时请求头媒体源数量: mediaSources.filter((source) => Object.keys(
-      source.RequiredHttpHeaders as Record<string, string>,
-    ).length > 0).length,
   });
   return {
     MediaSources: mediaSources, PlaySessionId: playSessionId, ErrorCode: null,
@@ -235,26 +278,59 @@ async function sendItemImage(compatibility: JellyfinCompatibilityService, contex
 /** 将 Provider 原始媒体流转发给 Jellyfin 客户端。 */
 async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, context: JellyfinContext, request: FastifyRequest, reply: FastifyReply, itemId: string) {
   const service = await compatibility.requireEnabledService(context.serviceId);
-  // Jellyfin 标准 Videos 接口使用独立媒体库开关，不受 APP 专用中转开关影响。
+  const requestedRoute = readPlaybackRoute(request);
+  // Jellyfin 标准 Videos 接口使用独立媒体库开关；自动模式开启时优先服务器中转，保证第三方客户端无需处理 Provider 请求头。
   const jellyfinRelayPlaybackEnabled = Number(service.jellyfin_relay_playback_enabled) === 1
     || service.jellyfin_relay_playback_enabled === true;
-  if (!jellyfinRelayPlaybackEnabled) {
-    throw new ApiError(409, "jellyfin_relay_playback_disabled", "当前媒体库未启用 Jellyfin 中转播放");
-  }
+  // 关键变量：媒体库开关决定普通客户端的自动路线；显式 server 表示当前客户端主动要求中转。
+  const effectiveRoute = requestedRoute === "auto"
+    ? jellyfinRelayPlaybackEnabled ? "server" : "origin"
+    : requestedRoute;
   const item = await runtime.repository.getCatalogItem(itemId, context.ownerUserId);
   if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
   const files = await runtime.repository.listItemFiles(itemId, context.ownerUserId);
   const fileId = readMediaSourceId(request);
   const itemFiles = files.filter((candidate) => String(candidate.itemId) === itemId);
-  const file = fileId ? itemFiles.find((candidate) => String(candidate.fileId) === fileId) : itemFiles[0];
+  const file = findPlaybackFile(itemFiles, itemId, fileId);
   if (!file) throw new ApiError(404, "jellyfin_media_source_not_found", "媒体源不存在");
+  const locator = file.playbackLocator && typeof file.playbackLocator === "object"
+    ? file.playbackLocator as Record<string, unknown>
+    : {};
   const abortController = new AbortController();
   const abort = () => abortController.abort();
   request.raw.once("aborted", abort); reply.raw.once("close", abort);
   let upstreamBody: IncomingMessage | null = null;
   try {
-    const access = await resolveRelayAccess(runtime, toRelayLibrary(service), context.ownerUserId,
-      (file.playbackLocator ?? {}) as Record<string, unknown>, abortController.signal);
+    let access: ProviderFileAccess;
+    if (effectiveRoute === "origin") {
+      const originAccess = await resolveFileAccess(
+        runtime,
+        service,
+        context.ownerUserId,
+        locator,
+        abortController.signal,
+      );
+      if (!originAccess || !/^https?:\/\//iu.test(originAccess.url)) {
+        throw new ApiError(409, "jellyfin_origin_direct_unavailable", "当前文件无法生成原始播放地址，请启用 Jellyfin 中转播放");
+      }
+      if (!hasRequiredPlaybackHeaders(originAccess)) {
+        reply.header("Cache-Control", "private, no-store");
+        return reply.redirect(originAccess.url, 307);
+      }
+      if (!jellyfinRelayPlaybackEnabled) {
+        throw new ApiError(409, "jellyfin_origin_headers_required", "当前网盘原始地址依赖专用请求头，请启用 Jellyfin 中转播放");
+      }
+      // 关键变量：标准播放器无法在 307 跳转时附加 Provider 请求头，此时自动改由云助手安全中转。
+      access = originAccess;
+    } else {
+      access = await resolveRelayAccess(
+        runtime,
+        toRelayLibrary(service),
+        context.ownerUserId,
+        locator,
+        abortController.signal,
+      );
+    }
     const upstream = await providerStream(access.url, { method: request.method, headers: buildUpstreamHeaders(request, access.headers) }, {
       allowInsecureHttp: runtime.config.allowInsecureProviderHttp,
       logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", fields),

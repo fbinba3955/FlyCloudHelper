@@ -13,7 +13,7 @@ import {
   type ProviderEnumerationWarning,
   type ProviderValidationResult,
   type ScanRoot,
-  createFlymbyRecommendedScanSettings,
+  createProviderRecommendedScanSettings,
   toFileSize,
 } from "./types.js";
 
@@ -189,7 +189,11 @@ export class GuangyaProvider implements ProviderAdapter {
       "directDownload",
       "relayPlayback",
     ],
-    recommendedScanSettings: createFlymbyRecommendedScanSettings(),
+    recommendedScanSettings: createProviderRecommendedScanSettings({
+      // 光鸭文件接口内部按 210ms 排队并可能返回业务 429，保持较低并发可避免重试抵消收益。
+      scanDirectoryConcurrency: { default: 4, min: 1, max: 4 },
+      fullScanDirectoryConcurrency: 2,
+    }),
     authenticationMode: "web_qr",
     connectionFields: [],
   };

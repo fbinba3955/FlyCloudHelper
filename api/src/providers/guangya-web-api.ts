@@ -3,7 +3,8 @@ import { ApiError } from "../errors.js";
 import {
   PROVIDER_RATE_LIMIT_MAX_RETRIES,
   readProviderRateLimitDelayMs,
-  waitForProviderRateLimit,
+  registerProviderSharedRateLimit,
+  waitForProviderSharedRateLimit,
 } from "./network.js";
 
 const GUANGYA_AUTH_BASE_URL = "https://account.guangyapan.com/v1/auth";
@@ -582,7 +583,9 @@ export class GuangyaWebApiClient {
       : "Bearer";
     const deviceId = typeof connection.deviceId === "string" ? connection.deviceId.trim() : "";
     if (!accessToken) throw new ApiError(410, "provider_authentication_failed", "光鸭登录已失效，请重新登录");
-    return this.requestJson(`${GUANGYA_WEB_API_BASE_URL}${path}`, {
+    const requestUrl = `${GUANGYA_WEB_API_BASE_URL}${path}`;
+    await waitForProviderSharedRateLimit(requestUrl, signal);
+    return this.requestJson(requestUrl, {
       method: "POST",
       headers: {
         Authorization: `${tokenType} ${accessToken}`,
@@ -612,6 +615,7 @@ export class GuangyaWebApiClient {
       if (retryCount >= PROVIDER_RATE_LIMIT_MAX_RETRIES) {
         this.logDiagnostic?.({
           日志关键字: "codex-flycloud-provider-rate-limit",
+          性能日志关键字: "codex-flycloud-scan-performance",
           事件: "光鸭网页API限流重试后仍未恢复",
           请求路径: path,
           已重试次数: retryCount,
@@ -620,15 +624,18 @@ export class GuangyaWebApiClient {
       }
       const retryDelayMs = readProviderRateLimitDelayMs(null, retryCount);
       retryCount += 1;
+      const sharedCooldownUntilMs = registerProviderSharedRateLimit(GUANGYA_WEB_API_BASE_URL, retryDelayMs);
       this.logDiagnostic?.({
         日志关键字: "codex-flycloud-provider-rate-limit",
+        性能日志关键字: "codex-flycloud-scan-performance",
         事件: "光鸭网页API请求被限流后等待重试",
         请求路径: path,
         当前重试次数: retryCount,
         最大重试次数: PROVIDER_RATE_LIMIT_MAX_RETRIES,
         等待毫秒: retryDelayMs,
+        共享冷却截止时间: new Date(sharedCooldownUntilMs).toISOString(),
       });
-      await waitForProviderRateLimit(retryDelayMs, signal);
+      await waitForProviderSharedRateLimit(GUANGYA_WEB_API_BASE_URL, signal);
     }
   }
 

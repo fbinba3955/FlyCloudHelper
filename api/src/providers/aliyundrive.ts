@@ -11,7 +11,7 @@ import {
   type ProviderValidationResult,
   type ProviderFileAccess,
   type ScanRoot,
-  createFlymbyRecommendedScanSettings,
+  createProviderRecommendedScanSettings,
   requireConnectionString,
   toFileSize,
 } from "./types.js";
@@ -46,7 +46,11 @@ export class AliyunDriveProvider implements ProviderAdapter {
     adapterVersion: "1.0.0",
     credentialSchemaVersion: 2,
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
-    recommendedScanSettings: createFlymbyRecommendedScanSettings(),
+    recommendedScanSettings: createProviderRecommendedScanSettings({
+      // 阿里开放接口单页最多读取 200 项，允许多个目录并行但限制峰值请求数。
+      scanDirectoryConcurrency: { default: 8, min: 1, max: 8 },
+      fullScanDirectoryConcurrency: 4,
+    }),
     connectionFields: [
       { name: "accessToken", label: "Access Token", type: "password", required: true, secret: true },
       { name: "refreshToken", label: "Refresh Token", type: "password", required: true, secret: true },

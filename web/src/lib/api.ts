@@ -296,6 +296,17 @@ export interface ScanJob {
   startedAt: string | null;
   finishedAt: string | null;
   elapsedMs: number;
+  waitingReason: "scan_worker_capacity" | "scan_queue_order" | "service_scan_priority" | "media_probe_worker_capacity" | "worker_dispatch" | null;
+  waitingForJobs: Array<{
+    id: string;
+    jobType: "scan" | "media_probe";
+    serviceId: string;
+    serviceName: string;
+    ownerUsername: string;
+    status: JobStatus;
+  }>;
+  hiddenWaitingJobCount: number;
+  queueAheadCount: number;
   updatedAt: string;
 }
 
@@ -1082,9 +1093,19 @@ export async function updateLibraryPlaybackSettings(
   return result.settings;
 }
 
-/** 读取用户或管理员作用域扫描任务。 */
-export function listJobs(admin = false): Promise<{ items: ScanJob[]; total: number }> {
-  return requestJson(admin ? "/api/v1/admin/jobs?limit=200" : "/api/v1/scan-jobs?limit=200");
+/** 后台任务列表支持的服务端筛选条件。 */
+export interface JobListFilters {
+  /** active 同时表示排队、运行、等待恢复和暂停。 */
+  status?: JobStatus | "active";
+  jobType?: "scan" | "media_probe";
+}
+
+/** 读取用户或管理员作用域后台任务，并由服务端完成状态和类型筛选。 */
+export function listJobs(admin = false, filters: JobListFilters = {}): Promise<{ items: ScanJob[]; total: number }> {
+  const query = new URLSearchParams({ limit: "200" });
+  if (filters.status) query.set("status", filters.status);
+  if (filters.jobType) query.set("jobType", filters.jobType);
+  return requestJson(`${admin ? "/api/v1/admin/jobs" : "/api/v1/scan-jobs"}?${query.toString()}`);
 }
 
 /** 读取视频规格后台任务最终失败的文件列表。 */

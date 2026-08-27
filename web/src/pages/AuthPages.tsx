@@ -103,10 +103,6 @@ function AuthIntroduction() {
 function AuthLayout({ children }: { children: ReactNode }) {
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden px-4 py-10">
-      <div
-        className="pointer-events-none absolute inset-x-0 top-0 h-[560px]"
-        style={{ backgroundImage: "var(--gradient-glow)" }}
-      />
       <div className="grid-noise pointer-events-none absolute inset-0 opacity-40" />
       <div className="relative grid w-full max-w-5xl gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,420px)] lg:items-center">
         <AuthIntroduction />
