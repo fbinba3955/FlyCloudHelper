@@ -15,6 +15,12 @@ export interface OpenAiCompatibleJsonResult {
   errorMessage: string | null;
 }
 
+/** 单次结构化业务请求的生成参数；可用性测试继续使用独立的小请求。 */
+export interface OpenAiCompatibleJsonRequestOptions {
+  maxTokens?: number;
+  temperature?: number;
+}
+
 interface StructuredJsonAttemptResult extends OpenAiCompatibleJsonResult {
   retryWithoutResponseFormat: boolean;
 }
@@ -233,6 +239,7 @@ async function executeStructuredJsonAttempt(
   systemPrompt: string,
   input: Record<string, unknown>,
   requireResponseFormat: boolean,
+  options: OpenAiCompatibleJsonRequestOptions,
   signal?: AbortSignal,
 ): Promise<StructuredJsonAttemptResult> {
   const startedAt = Date.now();
@@ -250,6 +257,8 @@ async function executeStructuredJsonAttempt(
       ],
       stream: false,
     };
+    if (typeof options.maxTokens === "number") requestBody.max_tokens = options.maxTokens;
+    if (typeof options.temperature === "number") requestBody.temperature = options.temperature;
     if (requireResponseFormat) requestBody.response_format = { type: "json_object" };
     const headers = new Headers({ "Content-Type": "application/json" });
     if (configuration.apiKey) headers.set("Authorization", `Bearer ${configuration.apiKey}`);
@@ -328,9 +337,10 @@ export async function requestOpenAiCompatibleJson(
   configuration: OpenAiCompatibleModelConfiguration,
   systemPrompt: string,
   input: Record<string, unknown>,
+  options: OpenAiCompatibleJsonRequestOptions = {},
   signal?: AbortSignal,
 ): Promise<OpenAiCompatibleJsonResult> {
-  const firstAttempt = await executeStructuredJsonAttempt(configuration, systemPrompt, input, true, signal);
+  const firstAttempt = await executeStructuredJsonAttempt(configuration, systemPrompt, input, true, options, signal);
   if (!firstAttempt.retryWithoutResponseFormat || signal?.aborted) {
     return {
       ok: firstAttempt.ok,
@@ -340,7 +350,7 @@ export async function requestOpenAiCompatibleJson(
       errorMessage: firstAttempt.errorMessage,
     };
   }
-  const fallbackAttempt = await executeStructuredJsonAttempt(configuration, systemPrompt, input, false, signal);
+  const fallbackAttempt = await executeStructuredJsonAttempt(configuration, systemPrompt, input, false, options, signal);
   return {
     ok: fallbackAttempt.ok,
     payload: fallbackAttempt.payload,

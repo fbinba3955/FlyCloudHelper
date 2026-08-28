@@ -1,7 +1,7 @@
 import path from "node:path";
 import type { ApiConfig } from "./config.js";
 import type { FlyCloudHelperDatabase } from "./database.js";
-import type { MediaType, ScanJobRecord, SourceFileRecord } from "./domain.js";
+import type { MediaItemRecord, MediaType, ScanJobRecord, SourceFileRecord } from "./domain.js";
 import { ApiError, toSafeErrorMessage } from "./errors.js";
 import {
   createStableId,
@@ -15,12 +15,14 @@ import {
   AiVideoNameCleaner,
   buildAiRecognitionRevision,
   buildAiVideoNameCandidateContexts,
+  createStoredAiVideoNameCandidateContext,
   readAiModelTaskSnapshot,
   type AiVideoNameCandidateContext,
+  type AiVideoNameCleanFailure,
   type AiVideoNameCleanResult,
 } from "./media/ai-video-name-cleaner.js";
 import type { AiModelManager } from "./ai/ai-model-manager.js";
-import { isWeakFlymbyScrapeTitle } from "./media/flymby-video-parser.js";
+import { isWeakFlymbyScrapeTitle, parseFlymbyVideoName } from "./media/flymby-video-parser.js";
 import { FlymbyVideoTitleCleaner } from "./media/flymby-video-title-cleaner.js";
 import {
   parseFlymbyNfo,
@@ -66,6 +68,11 @@ function readFailureCode(error: unknown, fallback: string): string {
     : fallback;
 }
 
+/** 判断任务是否只处理媒体库现有未匹配内容，不进入 Provider 扫描链路。 */
+function isStoredAiSupplementJob(job: ScanJobRecord): boolean {
+  return job.snapshot.taskPurpose === "ai_supplement_unmatched";
+}
+
 interface EnrichedMetadata {
   title: string;
   subtitle: string;
@@ -104,8 +111,28 @@ interface NfoSidecarEntry {
   metadata: FlymbyNfoMetadata;
 }
 
+interface StoredAiSupplementWorkItem {
+  /** 本批次待处理的媒体库顶层电影或节目。 */
+  item: MediaItemRecord;
+  /** 由数据库已保存目录和文件名构建的 AI 上下文。 */
+  context: AiVideoNameCandidateContext;
+  /** 第一条活动源文件只用于失败报告定位，不参与 Provider 访问。 */
+  sourcePath: { path: string; resourceId: string; name: string };
+}
+
+/** AI 补充元数据结果同时携带最终影视类型，供落库时纠正电影和节目结构。 */
+interface AiSupplementMetadataResolution {
+  metadata: EnrichedMetadata;
+  mediaType: "movie" | "tv";
+}
+
 // 关键变量：解析规则变化时提升版本，旧NFO缓存会自动失效并重新下载解析。
 const FLYMBY_NFO_PARSER_CACHE_VERSION = "flymby-nfo-v1";
+// 关键变量：数据库批量读取与模型请求分别限流，避免几千条未匹配内容一次性占满内存和连接池。
+const AI_SUPPLEMENT_DATABASE_BATCH_SIZE = 100;
+const AI_SUPPLEMENT_REQUEST_MAXIMUM_CANDIDATES = 10;
+const AI_SUPPLEMENT_MAXIMUM_FILE_NAMES_PER_CANDIDATE = 5;
+const AI_SUPPLEMENT_REQUEST_MAXIMUM_FILE_NAMES = 50;
 
 interface BusinessTaskProgress {
   /** 本次任务中需要处理的电影或节目聚合键。 */
@@ -525,12 +552,16 @@ export class ScanWorker {
     this.abortControllers.set(job.id, controller);
     this.logger.info({
       日志标记: "flycloud-helper-worker",
-      事件: "扫描任务开始",
+      事件: isStoredAiSupplementJob(job) ? "AI补充未匹配任务开始" : "扫描任务开始",
       任务ID: job.id,
       服务ID: job.serviceId,
     });
     try {
-      await this.scan(job, controller.signal);
+      if (isStoredAiSupplementJob(job)) {
+        await this.supplementStoredUnmatchedMedia(job, controller.signal);
+      } else {
+        await this.scan(job, controller.signal);
+      }
     } catch (error) {
       if (controller.signal.aborted) {
         await this.applyAbortedJobState(job, "任务执行异常出口");
@@ -575,19 +606,21 @@ export class ScanWorker {
       await this.repository.finishJob(job.id, {
         status: "failed",
         errorCode: code,
-        errorMessage: toSafeErrorMessage(error, "扫描任务失败"),
+        errorMessage: toSafeErrorMessage(error, isStoredAiSupplementJob(job) ? "AI 补充任务失败" : "扫描任务失败"),
       });
       await this.database.createNotificationSafely({
         userId: job.userId,
         category: "task",
         tone: "danger",
-        title: "扫描任务失败",
-        message: `服务“${job.serviceName}”的${job.scanMode === "full" ? "全量" : "增量"}扫描失败：${toSafeErrorMessage(error, "扫描任务失败")}`,
+        title: isStoredAiSupplementJob(job) ? "AI 补充任务失败" : "扫描任务失败",
+        message: isStoredAiSupplementJob(job)
+          ? `服务“${job.serviceName}”的未匹配内容 AI 补充失败：${toSafeErrorMessage(error, "AI 补充任务失败")}`
+          : `服务“${job.serviceName}”的${job.scanMode === "full" ? "全量" : "增量"}扫描失败：${toSafeErrorMessage(error, "扫描任务失败")}`,
         actionPath: "/app/jobs",
       });
       this.logger.warn({
         日志标记: "flycloud-helper-worker",
-        事件: "扫描任务失败",
+        事件: isStoredAiSupplementJob(job) ? "AI补充未匹配任务失败" : "扫描任务失败",
         任务ID: job.id,
         错误码: code,
       });
@@ -595,6 +628,597 @@ export class ScanWorker {
       this.abortControllers.delete(job.id);
       this.failureReports.release(job.id);
     }
+  }
+
+  /** 只读取媒体库未匹配条目及已保存文件名，通过 AI 查询词重新请求元数据，不访问 Provider。 */
+  private async supplementStoredUnmatchedMedia(job: ScanJobRecord, signal: AbortSignal): Promise<void> {
+    const metadataProfile = await this.repository.getJobMetadataConfiguration(job);
+    const profile = readMetadataProfile(metadataProfile, "video");
+    const providerId = readMetadataProviderId(profile);
+    const aiModelSnapshot = readAiModelTaskSnapshot(job.snapshot.aiModel);
+    if (!aiModelSnapshot) {
+      throw new ApiError(409, "ai_cleaning_snapshot_missing", "AI 补充任务缺少可用模型快照");
+    }
+
+    // 关键变量：先固定本任务开始时的未匹配顶层条目，后续逐条写入匹配结果不会影响分页范围。
+    const unmatchedItems: MediaItemRecord[] = [];
+    let offset = 0;
+    const pageSize = 500;
+    while (true) {
+      const page = await this.repository.listCatalogItems({
+        userId: job.userId,
+        serviceId: job.serviceId,
+        mediaType: "video",
+        categoryKey: "unrecognized",
+        sort: "updated_asc",
+        limit: pageSize,
+        offset,
+      });
+      unmatchedItems.push(...page.items.filter((item) =>
+        item.itemType === "video.movie" || item.itemType === "video.series"));
+      offset += page.items.length;
+      if (page.items.length === 0 || offset >= page.total) break;
+    }
+
+    await this.repository.updateJobProgress(job.id, {
+      stage: "classifying",
+      processedCount: 0,
+      totalCount: unmatchedItems.length,
+      discoveredCount: unmatchedItems.length,
+      matchedCount: 0,
+      unmatchedCount: 0,
+      errorCount: 0,
+      currentPath: "准备分批读取媒体库未匹配内容",
+    });
+    if (unmatchedItems.length === 0) {
+      await this.repository.finishJob(job.id, { status: "completed" });
+      this.logger.info({
+        日志关键字: "codex-flycloud-helper-ai-clean",
+        事件: "AI补充任务没有未匹配内容",
+        任务ID: job.id,
+        服务ID: job.serviceId,
+        是否访问Provider: false,
+      });
+      return;
+    }
+    if (await this.applyControlAction(job)) return;
+
+    const pluginSnapshots = Array.isArray(job.snapshot.pluginVersions)
+      ? job.snapshot.pluginVersions.filter((item): item is PluginTaskSnapshot => Boolean(item && typeof item === "object"))
+      : [];
+    const recognitionRevision = buildAiRecognitionRevision(Number(job.snapshot.metadataProfileRevision ?? 0), aiModelSnapshot);
+    const taskCache = new Map<string, Promise<AiVideoNameCleanResult | null>>();
+    // 关键变量：按候选保存模型请求或校验失败，避免失败报告只剩统一的“不可用”原因。
+    const taskFailures = new Map<string, AiVideoNameCleanFailure>();
+    let processedCount = 0;
+    let matchedCount = 0;
+    let unmatchedCount = 0;
+    let errorCount = 0;
+    let lastProgressPublishedAt = 0;
+    // 关键变量：跨数据库批次记住源文件第一次归属，用日志暴露历史脏关联，不在补充任务中擅自改库。
+    const firstItemIdBySourceFileId = new Map<string, string>();
+    const loggedDuplicateSourceFileIds = new Set<string>();
+    this.logger.info({
+      日志关键字: "codex-flycloud-helper-ai-clean",
+      事件: "AI补充未匹配任务参数已确认",
+      任务ID: job.id,
+      服务ID: job.serviceId,
+      待补充条目数量: unmatchedItems.length,
+      模型ID: aiModelSnapshot.modelId,
+      模型修订: aiModelSnapshot.configurationRevision,
+      数据库批次上限: AI_SUPPLEMENT_DATABASE_BATCH_SIZE,
+      AI单批候选上限: AI_SUPPLEMENT_REQUEST_MAXIMUM_CANDIDATES,
+      单候选文件样例上限: AI_SUPPLEMENT_MAXIMUM_FILE_NAMES_PER_CANDIDATE,
+      AI单批文件样例上限: AI_SUPPLEMENT_REQUEST_MAXIMUM_FILE_NAMES,
+      是否访问Provider: false,
+    });
+
+    /** 把 AI 补充未采用、未匹配或异常的媒体条目写入任务失败报告。 */
+    const recordAiSupplementFailure = async (input: {
+      item: MediaItemRecord;
+      errorCode: string;
+      error: unknown;
+      recovered: boolean;
+      processingResult: string;
+      sourcePath?: { path: string; resourceId: string; name: string };
+      ruleTitle?: string;
+      aiQuery?: string;
+      failureStage?: AiVideoNameCleanFailure["stage"] | "metadata";
+      ruleMediaType?: "movie" | "tv";
+      aiMediaType?: "movie" | "tv";
+    }): Promise<void> => {
+      await this.failureReports.record(job, {
+        stage: "scraping",
+        errorCode: input.errorCode,
+        error: input.error,
+        recovered: input.recovered,
+        mediaPath: input.sourcePath?.path ?? null,
+        resourceId: input.sourcePath?.resourceId ?? null,
+        fileName: input.sourcePath?.name ?? null,
+        itemType: input.item.itemType,
+        parsedTitle: input.item.title,
+        businessTaskKey: input.item.id,
+        context: {
+          任务类型: "AI补充未识别内容",
+          模型ID: aiModelSnapshot.modelId,
+          模型修订: aiModelSnapshot.configurationRevision,
+          规则查询词: input.ruleTitle ?? input.item.title,
+          AI查询词: input.aiQuery ?? "",
+          失败阶段: input.failureStage ?? "metadata",
+          规则媒体类型: input.ruleMediaType ?? (input.item.itemType === "video.series" ? "tv" : "movie"),
+          AI媒体类型: input.aiMediaType ?? "",
+          处理结果: input.processingResult,
+        },
+      });
+      this.logger.warn({
+        日志关键字: "codex-flycloud-helper-ai-clean",
+        事件: "AI补充失败内容已写入报告",
+        任务ID: job.id,
+        服务ID: job.serviceId,
+        媒体条目ID: input.item.id,
+        媒体标题: input.item.title,
+        错误码: input.errorCode,
+        失败阶段: input.failureStage ?? "metadata",
+        规则媒体类型: input.ruleMediaType ?? (input.item.itemType === "video.series" ? "tv" : "movie"),
+        AI媒体类型: input.aiMediaType ?? "",
+        是否后续重试: input.recovered,
+      });
+    };
+
+    /** 使用当前服务冻结的元数据来源处理单条 AI 建议。 */
+    const resolveSupplementMetadata = async (
+      workItem: StoredAiSupplementWorkItem,
+      aiResult: AiVideoNameCleanResult | null | undefined,
+    ): Promise<AiSupplementMetadataResolution | null> => {
+      if (!aiResult) return null;
+      this.logger.info({
+        日志关键字: "codex-flycloud-helper-ai-clean",
+        事件: "AI补充开始匹配元数据",
+        任务ID: job.id,
+        服务ID: job.serviceId,
+        媒体条目ID: workItem.item.id,
+        规则查询词: workItem.context.ruleTitle,
+        AI查询词: aiResult.cleanedTitle,
+        规则媒体类型: workItem.context.ruleMediaType,
+        AI媒体类型: aiResult.mediaType,
+        是否纠正媒体类型: workItem.context.ruleMediaType !== aiResult.mediaType,
+        元数据来源: providerId || "builtin.tmdb",
+      });
+      if (providerId.startsWith("plugin:")) {
+        const reference = providerId.slice("plugin:".length);
+        const separator = reference.lastIndexOf("@");
+        const pluginId = separator > 0 ? reference.slice(0, separator) : reference;
+        const requestedVersion = separator > 0 ? reference.slice(separator + 1) : null;
+        const snapshot = pluginSnapshots.find((value) => value.pluginId === pluginId
+          && (!requestedVersion || value.version === requestedVersion));
+        const pluginResult = snapshot ? await this.plugins.scrape(snapshot, {
+          mediaType: "video",
+          title: aiResult.cleanedTitle,
+          subtitle: workItem.item.subtitle,
+          year: aiResult.year ?? workItem.item.year,
+        }, signal) : null;
+        return pluginResult ? {
+          mediaType: aiResult.mediaType,
+          metadata: {
+            title: pluginResult.title,
+            subtitle: pluginResult.subtitle || workItem.item.subtitle,
+            year: pluginResult.year ?? workItem.item.year,
+            overview: pluginResult.overview,
+            posterUrl: pluginResult.posterUrl,
+            backdropUrl: pluginResult.backdropUrl,
+            matchState: "matched",
+            externalIds: pluginResult.externalId ? { [`plugin:${pluginId}`]: pluginResult.externalId } : {},
+            metadata: {
+              ...pluginResult.metadata,
+              matchedQuery: aiResult.cleanedTitle,
+              metadataPluginId: pluginId,
+              metadataPluginVersion: snapshot!.version,
+            },
+          },
+        } : null;
+      }
+      if (providerId && providerId !== "tmdb" && providerId !== "builtin.tmdb") return null;
+      const tmdbResult = await this.tmdb.scrapeVideo({
+        mediaType: aiResult.mediaType,
+        title: aiResult.cleanedTitle,
+        fallbackTitle: aiResult.alternateTitle || workItem.context.ruleTitle,
+        year: aiResult.year ?? workItem.item.year,
+        language: String(profile.language ?? "zh-CN"),
+        region: String(profile.region ?? "CN"),
+        includeDetails: profile.syncDetails === true,
+        cacheRevision: recognitionRevision,
+        signal,
+      });
+      return tmdbResult ? {
+        mediaType: tmdbResult.mediaType,
+        metadata: this.mapTmdbVideoMetadata(
+          tmdbResult,
+          tmdbResult.mediaType === "tv" ? "节目" : (tmdbResult.originalTitle || workItem.item.subtitle),
+        ),
+      } : null;
+    };
+
+    /** 把当前累计结果写入任务表，前端下一次轮询即可看到进度变化。 */
+    const publishBatchProgress = async (currentOperation: string, stage: "classifying" | "scraping"): Promise<void> => {
+      await this.repository.updateJobProgress(job.id, {
+        stage,
+        processedCount,
+        totalCount: unmatchedItems.length,
+        discoveredCount: unmatchedItems.length,
+        matchedCount,
+        unmatchedCount,
+        errorCount,
+        currentPath: currentOperation,
+      });
+    };
+
+    const databaseBatchCount = Math.ceil(unmatchedItems.length / AI_SUPPLEMENT_DATABASE_BATCH_SIZE);
+    for (let databaseBatchIndex = 0; databaseBatchIndex < databaseBatchCount; databaseBatchIndex += 1) {
+      if (signal.aborted) throw new Error("AI 补充任务已中断");
+      if (await this.applyControlAction(job)) return;
+      const databaseBatch = unmatchedItems.slice(
+        databaseBatchIndex * AI_SUPPLEMENT_DATABASE_BATCH_SIZE,
+        (databaseBatchIndex + 1) * AI_SUPPLEMENT_DATABASE_BATCH_SIZE,
+      );
+      const databaseBatchLabel = `${databaseBatchIndex + 1}/${databaseBatchCount}`;
+      await publishBatchProgress(`正在读取媒体库第 ${databaseBatchLabel} 批关联文件`, "classifying");
+      const sourcePathsByItemId = await this.repository.listAiSupplementCatalogPaths(
+        databaseBatch.map((item) => item.id),
+        job.userId,
+      );
+      const workItems: StoredAiSupplementWorkItem[] = [];
+      let missingSourceCount = 0;
+      for (const item of databaseBatch) {
+        const sourcePaths = sourcePathsByItemId.get(item.id) ?? [];
+        if (sourcePaths.length === 0) {
+          missingSourceCount += 1;
+          await recordAiSupplementFailure({
+            item,
+            errorCode: "ai_supplement_source_file_missing",
+            error: new Error("媒体条目没有关联的活动源文件，无法构建 AI 识别上下文"),
+            recovered: false,
+            processingResult: "保持未匹配",
+          });
+          continue;
+        }
+        const firstPath = sourcePaths[0]!.path;
+        const directoryPath = path.posix.dirname(firstPath);
+        const parentDirectoryPath = path.posix.dirname(directoryPath);
+        const metadataQuery = typeof item.metadata.query === "string" ? item.metadata.query.trim() : "";
+        const seriesTitle = typeof item.metadata.seriesTitle === "string" ? item.metadata.seriesTitle.trim() : "";
+        const fallbackQuery = typeof item.metadata.fallbackQuery === "string" ? item.metadata.fallbackQuery.trim() : "";
+        const ruleTitle = metadataQuery || seriesTitle || item.title;
+        const sampleSourcePaths = sourcePaths.slice(0, AI_SUPPLEMENT_MAXIMUM_FILE_NAMES_PER_CANDIDATE);
+        // 与 Flymby AI 辅助一致，先用本地规则解析代表文件，再把结构化结果作为 samplesJson 提交给模型。
+        const fileSamples = sampleSourcePaths.map((sourcePath) => {
+          const parsed = parseFlymbyVideoName({
+            resourceId: sourcePath.resourceId,
+            parentResourceId: null,
+            path: sourcePath.path,
+            name: sourcePath.name,
+            isDirectory: false,
+            size: sourcePath.size,
+            modifiedAt: sourcePath.modifiedAt,
+            etag: null,
+            locator: {},
+          }, "/");
+          const sampleParentPath = path.posix.dirname(sourcePath.path);
+          return {
+            name: sourcePath.name.slice(0, 500),
+            parentPath: sampleParentPath.slice(0, 600),
+            parentName: path.posix.basename(sampleParentPath).slice(0, 300),
+            parsedTitle: parsed.title.slice(0, 300),
+            parsedQuery: parsed.query.slice(0, 300),
+            parsedMediaType: parsed.mediaType,
+            year: parsed.year,
+            seasonNumber: parsed.seasonNumber,
+            episodeNumber: parsed.episodeNumber,
+            episodeNumbers: parsed.episodeNumbers.slice(0, 20),
+          };
+        });
+        const firstParsedSample = fileSamples[0];
+        const normalizedRuleTitle = FlymbyVideoTitleCleaner.normalizeSearchText(ruleTitle);
+        const normalizedFileTitle = FlymbyVideoTitleCleaner.normalizeSearchText(
+          firstParsedSample?.parsedQuery || firstParsedSample?.parsedTitle || "",
+        );
+        if (normalizedRuleTitle && normalizedFileTitle
+          && normalizedRuleTitle !== normalizedFileTitle
+          && !isWeakFlymbyScrapeTitle(firstParsedSample?.parsedQuery || firstParsedSample?.parsedTitle || "")) {
+          this.logger.warn({
+            日志关键字: "codex-flycloud-helper-ai-clean",
+            事件: "AI补充条目标题与源文件识别不一致",
+            任务ID: job.id,
+            服务ID: job.serviceId,
+            媒体条目ID: item.id,
+            条目规则标题: ruleTitle,
+            文件识别标题: firstParsedSample?.parsedQuery || firstParsedSample?.parsedTitle || "",
+            文件名: sampleSourcePaths[0]?.name ?? "",
+            文件路径: sampleSourcePaths[0]?.path ?? "",
+          });
+        }
+        for (const sourcePath of sourcePaths) {
+          const firstItemId = firstItemIdBySourceFileId.get(sourcePath.fileId);
+          if (firstItemId && firstItemId !== item.id && !loggedDuplicateSourceFileIds.has(sourcePath.fileId)) {
+            loggedDuplicateSourceFileIds.add(sourcePath.fileId);
+            this.logger.warn({
+              日志关键字: "codex-flycloud-helper-ai-clean",
+              事件: "AI补充发现源文件关联多个顶层条目",
+              任务ID: job.id,
+              服务ID: job.serviceId,
+              源文件ID: sourcePath.fileId,
+              源文件路径: sourcePath.path,
+              首次媒体条目ID: firstItemId,
+              当前媒体条目ID: item.id,
+            });
+          } else if (!firstItemId) {
+            firstItemIdBySourceFileId.set(sourcePath.fileId, item.id);
+          }
+        }
+        workItems.push({
+          item,
+          sourcePath: {
+            path: sourcePaths[0]!.path,
+            resourceId: sourcePaths[0]!.resourceId,
+            name: sourcePaths[0]!.name,
+          },
+          context: createStoredAiVideoNameCandidateContext({
+            currentDirectoryName: path.posix.basename(directoryPath).slice(0, 300),
+            parentDirectoryNames: [
+              path.posix.basename(parentDirectoryPath),
+              path.posix.basename(path.posix.dirname(parentDirectoryPath)),
+            ].filter(Boolean).map((directoryName) => directoryName.slice(0, 300)),
+            // 与 Flymby AI 辅助一致，每个电影或节目只提交前 5 个代表文件名。
+            fileNames: sampleSourcePaths
+              .map((sourcePath) => sourcePath.name.slice(0, 500)),
+            fileSamples,
+            ruleTitle: ruleTitle.slice(0, 300),
+            ruleAlternateTitle: fallbackQuery.slice(0, 300),
+            ruleYear: item.year,
+            ruleMediaType: item.itemType === "video.series" ? "tv" : "movie",
+            recognitionReason: "媒体库未匹配后手动补充",
+            resourceIds: sourcePaths.map((sourcePath) => sourcePath.resourceId),
+          }),
+        });
+      }
+
+      // 没有关联活动文件的条目无法构建 AI 上下文，但也必须计入本任务已处理和仍未匹配。
+      processedCount += missingSourceCount;
+      unmatchedCount += missingSourceCount;
+      const requestBatches: StoredAiSupplementWorkItem[][] = [];
+      let currentRequestBatch: StoredAiSupplementWorkItem[] = [];
+      let currentRequestFileCount = 0;
+      for (const workItem of workItems) {
+        const fileCount = workItem.context.fileNames.length;
+        if (currentRequestBatch.length >= AI_SUPPLEMENT_REQUEST_MAXIMUM_CANDIDATES
+          || currentRequestFileCount + fileCount > AI_SUPPLEMENT_REQUEST_MAXIMUM_FILE_NAMES) {
+          if (currentRequestBatch.length > 0) requestBatches.push(currentRequestBatch);
+          currentRequestBatch = [];
+          currentRequestFileCount = 0;
+        }
+        currentRequestBatch.push(workItem);
+        currentRequestFileCount += fileCount;
+      }
+      if (currentRequestBatch.length > 0) requestBatches.push(currentRequestBatch);
+
+      this.logger.info({
+        日志关键字: "codex-flycloud-helper-ai-clean",
+        事件: "读取AI补充媒体库批次完成",
+        任务ID: job.id,
+        服务ID: job.serviceId,
+        数据库批次: databaseBatchLabel,
+        条目数量: databaseBatch.length,
+        有效上下文数量: workItems.length,
+        无活动文件数量: missingSourceCount,
+        AI子批次数量: requestBatches.length,
+      });
+
+      for (let requestBatchIndex = 0; requestBatchIndex < requestBatches.length; requestBatchIndex += 1) {
+        if (signal.aborted) throw new Error("AI 补充任务已中断");
+        if (await this.applyControlAction(job)) return;
+        const requestBatch = requestBatches[requestBatchIndex]!;
+        const requestBatchLabel = `${requestBatchIndex + 1}/${requestBatches.length}`;
+        await publishBatchProgress(
+          `媒体库第 ${databaseBatchLabel} 批，正在执行 AI 子批次 ${requestBatchLabel}`,
+          "classifying",
+        );
+        this.logger.info({
+          日志关键字: "codex-flycloud-helper-ai-clean",
+          事件: "AI补充子批次开始",
+          任务ID: job.id,
+          服务ID: job.serviceId,
+          数据库批次: databaseBatchLabel,
+          AI子批次: requestBatchLabel,
+          候选数量: requestBatch.length,
+          文件样例数量: requestBatch.reduce((total, workItem) => total + workItem.context.fileNames.length, 0),
+        });
+        const aiResolution = await this.aiVideoNameCleaner.resolveStoredUnmatchedContexts({
+          contexts: requestBatch.map((workItem) => workItem.context),
+          snapshot: aiModelSnapshot,
+          jobId: job.id,
+          userId: job.userId,
+          serviceId: job.serviceId,
+          taskCache,
+          taskFailures,
+          signal,
+        });
+
+        for (let workItemIndex = 0; workItemIndex < requestBatch.length; workItemIndex += 1) {
+          const workItem = requestBatch[workItemIndex]!;
+          if (signal.aborted) throw new Error("AI 补充任务已中断");
+          const aiResult = aiResolution.results.get(workItem.context.cacheKey);
+          try {
+            if (!aiResult) {
+              const cleanFailure = aiResolution.failures.get(workItem.context.cacheKey);
+              unmatchedCount += 1;
+              await recordAiSupplementFailure({
+                item: workItem.item,
+                sourcePath: workItem.sourcePath,
+                errorCode: cleanFailure?.errorCode ?? "ai_supplement_clean_result_unavailable",
+                error: new Error(cleanFailure?.errorMessage ?? "AI 没有返回可采用的影视名称或类型结果"),
+                recovered: false,
+                ruleTitle: workItem.context.ruleTitle,
+                failureStage: cleanFailure?.stage ?? "validation",
+                ruleMediaType: workItem.context.ruleMediaType,
+                processingResult: "保持未匹配",
+              });
+            } else {
+              const metadataResolution = await resolveSupplementMetadata(workItem, aiResult);
+              if (metadataResolution) {
+                const enrichedMetadata = metadataResolution.metadata;
+                const applied = await this.repository.applyAiSupplementVideoMatch({
+                  itemId: workItem.item.id,
+                  userId: job.userId,
+                  mediaType: metadataResolution.mediaType,
+                  title: enrichedMetadata.title,
+                  subtitle: enrichedMetadata.subtitle,
+                  year: enrichedMetadata.year,
+                  overview: enrichedMetadata.overview,
+                  posterUrl: enrichedMetadata.posterUrl,
+                  backdropUrl: enrichedMetadata.backdropUrl,
+                  externalIds: enrichedMetadata.externalIds,
+                  metadata: enrichedMetadata.metadata,
+                });
+                if (applied) {
+                  matchedCount += 1;
+                  this.logger.info({
+                    日志关键字: "codex-flycloud-helper-ai-clean",
+                    事件: "AI补充元数据匹配并写入成功",
+                    任务ID: job.id,
+                    服务ID: job.serviceId,
+                    媒体条目ID: workItem.item.id,
+                    原媒体类型: workItem.context.ruleMediaType,
+                    最终媒体类型: metadataResolution.mediaType,
+                    是否纠正媒体类型: workItem.context.ruleMediaType !== metadataResolution.mediaType,
+                    AI查询词: aiResult.cleanedTitle,
+                    匹配标题: enrichedMetadata.title,
+                  });
+                }
+                // 任务运行期间已被其他操作匹配不属于 AI 补充失败，不写入失败报告。
+                else {
+                  unmatchedCount += 1;
+                  this.logger.info({
+                    日志关键字: "codex-flycloud-helper-ai-clean",
+                    事件: "AI补充跳过已被其他操作匹配的条目",
+                    任务ID: job.id,
+                    服务ID: job.serviceId,
+                    媒体条目ID: workItem.item.id,
+                  });
+                }
+              } else {
+                unmatchedCount += 1;
+                await recordAiSupplementFailure({
+                  item: workItem.item,
+                  sourcePath: workItem.sourcePath,
+                  errorCode: "ai_supplement_metadata_not_matched",
+                  error: new Error("AI 已生成查询词，但没有匹配到影视元数据"),
+                  recovered: false,
+                  ruleTitle: workItem.context.ruleTitle,
+                  aiQuery: aiResult.cleanedTitle,
+                  failureStage: "metadata",
+                  ruleMediaType: workItem.context.ruleMediaType,
+                  aiMediaType: aiResult.mediaType,
+                  processingResult: "保持未匹配",
+                });
+              }
+            }
+          } catch (error) {
+            if (isTmdbTemporarilyUnavailableError(error)) {
+              await recordAiSupplementFailure({
+                item: workItem.item,
+                sourcePath: workItem.sourcePath,
+                errorCode: error.code,
+                error,
+                recovered: true,
+                ruleTitle: workItem.context.ruleTitle,
+                aiQuery: aiResult?.cleanedTitle,
+                failureStage: "request",
+                ruleMediaType: workItem.context.ruleMediaType,
+                aiMediaType: aiResult?.mediaType,
+                processingResult: "等待任务自动重试",
+              });
+              throw error;
+            }
+            errorCount += 1;
+            await recordAiSupplementFailure({
+              item: workItem.item,
+              sourcePath: workItem.sourcePath,
+              errorCode: readFailureCode(error, "ai_supplement_item_failed"),
+              error,
+              recovered: false,
+              ruleTitle: workItem.context.ruleTitle,
+              aiQuery: aiResult?.cleanedTitle,
+              failureStage: "metadata",
+              ruleMediaType: workItem.context.ruleMediaType,
+              aiMediaType: aiResult?.mediaType,
+              processingResult: "本条处理失败",
+            });
+            this.logger.warn({
+              日志关键字: "codex-flycloud-helper-ai-clean",
+              事件: "单条未匹配内容AI补充失败",
+              任务ID: job.id,
+              服务ID: job.serviceId,
+              媒体条目ID: workItem.item.id,
+              媒体标题: workItem.item.title,
+              规则媒体类型: workItem.context.ruleMediaType,
+              AI媒体类型: aiResult?.mediaType ?? "",
+              错误码: readFailureCode(error, "ai_supplement_item_failed"),
+              错误信息: error instanceof Error ? error.message : "未知错误",
+            });
+          }
+          processedCount += 1;
+          if (Date.now() - lastProgressPublishedAt >= 5_000) {
+            await publishBatchProgress(
+              `媒体库第 ${databaseBatchLabel} 批，正在匹配 AI 子批次 ${requestBatchLabel}（${workItemIndex + 1}/${requestBatch.length}）`,
+              "scraping",
+            );
+            lastProgressPublishedAt = Date.now();
+          }
+        }
+        await publishBatchProgress(
+          `媒体库第 ${databaseBatchLabel} 批，AI 子批次 ${requestBatchLabel} 已完成`,
+          "scraping",
+        );
+        lastProgressPublishedAt = Date.now();
+        this.logger.info({
+          日志关键字: "codex-flycloud-helper-ai-clean",
+          事件: "AI补充子批次完成",
+          任务ID: job.id,
+          服务ID: job.serviceId,
+          数据库批次: databaseBatchLabel,
+          AI子批次: requestBatchLabel,
+          本批条目数量: requestBatch.length,
+          累计处理数量: processedCount,
+          累计匹配数量: matchedCount,
+          累计未匹配数量: unmatchedCount,
+          累计错误数量: errorCount,
+        });
+      }
+      if (requestBatches.length === 0) {
+        await publishBatchProgress(`媒体库第 ${databaseBatchLabel} 批已完成`, "scraping");
+      }
+    }
+
+    await this.repository.updateJobProgress(job.id, { stage: "persisting", currentPath: null });
+    await this.repository.finishJob(job.id, { status: "completed" });
+    await this.database.createNotificationSafely({
+      userId: job.userId,
+      category: "task",
+      tone: errorCount > 0 ? "warning" : "success",
+      title: "AI 补充未识别内容完成",
+      message: `服务“${job.serviceName}”共处理 ${processedCount} 条，新增匹配 ${matchedCount} 条，仍未匹配 ${unmatchedCount} 条，错误 ${errorCount} 条。`,
+      actionPath: "/app/jobs",
+    });
+    this.logger.info({
+      日志关键字: "codex-flycloud-helper-ai-clean",
+      事件: "AI补充未匹配任务完成",
+      任务ID: job.id,
+      服务ID: job.serviceId,
+      处理数量: processedCount,
+      新增匹配数量: matchedCount,
+      仍未匹配数量: unmatchedCount,
+      错误数量: errorCount,
+      是否访问Provider: false,
+    });
   }
 
   /** 完成 Provider 枚举、分类、刮削、持久化和 generation 对账。 */
@@ -1682,19 +2306,19 @@ export class ScanWorker {
       任务ID: job.id,
       目录变化数量: changedItemIds.size,
     });
-    const removedRootPolicy = String(runtime.scanProfile.removedRootPolicy ?? "protect");
     const providerWarningCount = providerWarningKeys.size;
     const completedRootRuns = await this.repository.listCompletedScanRootRuns(job.id);
     // 关键变量：全局排除项清理仍要求所有根完整；缺失文件只对各自完整根执行。
     const allowDestructiveCleanup = providerWarningCount === 0 && completedRootRuns.length === roots.length;
     if (!allowDestructiveCleanup) {
       this.logger.warn({
-        日志关键字: "codex-flycloud-helper-scrape-flow",
-        事件: "目录枚举不完整已跳过过期数据清理",
+        日志关键字: "codex-flycloud-scan-reconcile",
+        事件: "目录枚举不完整已限制对账范围",
         任务ID: job.id,
         Provider警告数量: providerWarningCount,
         配置扫描根数量: roots.length,
         完整扫描根数量: completedRootRuns.length,
+        缺失文件处理范围: "仅完整扫描根",
       });
     }
     this.logger.info({
@@ -1704,9 +2328,7 @@ export class ScanWorker {
       配置扫描根数量: roots.length,
       完整扫描根数量: completedRootRuns.length,
       不完整目录警告数量: providerWarningCount,
-      执行缺失对账: job.scanMode === "full"
-        && removedRootPolicy === "delete_missing"
-        && completedRootRuns.length > 0,
+      执行缺失对账: completedRootRuns.length > 0,
     });
     if (signal.aborted) {
       await this.applyAbortedJobState(job, "目录对账前");
@@ -1721,18 +2343,21 @@ export class ScanWorker {
         rootKey: rootRun.rootKey,
         generationId: rootRun.generationId,
       })),
-      // 带警告根不会进入 completedRootRuns，因此不会据此判断该根文件已经消失。
-      deleteMissing: job.scanMode === "full"
-        && removedRootPolicy === "delete_missing"
-        && completedRootRuns.length > 0,
+      // 每个成功完整枚举的扫描根都必须与 Provider 当前内容一致；带警告根不会进入列表，不执行删除。
+      deleteMissing: completedRootRuns.length > 0,
       allowDestructiveCleanup,
       changedItemIds: [...changedItemIds],
     });
     this.logger.info({
-      日志关键字: "codex-flycloud-file-link-repair",
-      事件: "扫描收尾文件唯一归属对账完成",
+      日志关键字: "codex-flycloud-scan-reconcile",
+      事件: "扫描成功后媒体目录与Provider对账完成",
       任务ID: job.id,
       媒体库ID: job.libraryId,
+      扫描模式: job.scanMode,
+      完整扫描根数量: completedRootRuns.length,
+      停用缺失源文件数量: finalization.missingSourceCount,
+      刷新剩余版本条目数量: finalization.updatedMissingItemCount,
+      删除无版本条目数量: finalization.deletedMissingItemCount,
       删除无文件子条目数量: finalization.deletedOrphanLeafCount,
       删除无内容父条目数量: finalization.deletedOrphanParentCount,
       最新目录版本: finalization.catalogVersion,
@@ -2248,19 +2873,25 @@ export class ScanWorker {
         explicitTmdbId,
         includeDetails: synchronizeDetails,
         cacheRevision: recognitionRevision,
-        resolveSecondSearchTitle: aiModelSnapshot?.triggerMode === "weak_or_unmatched"
+        resolveSecondSearchSuggestion: aiModelSnapshot?.triggerMode === "weak_or_unmatched"
           && explicitTmdbId <= 0
           && !imdbId
           && aiContext
-          ? () => this.aiVideoNameCleaner.resolveSecondSearchTitle({
-            context: aiContext,
-            snapshot: aiModelSnapshot,
-            jobId,
-            userId: cache.aiUsageOwner.userId,
-            serviceId: cache.aiUsageOwner.serviceId,
-            taskCache: cache.aiResults,
-            signal,
-          })
+          ? async () => {
+            const suggestion = await this.aiVideoNameCleaner.resolveSecondSearchSuggestion({
+              context: aiContext,
+              snapshot: aiModelSnapshot,
+              jobId,
+              userId: cache.aiUsageOwner.userId,
+              serviceId: cache.aiUsageOwner.serviceId,
+              taskCache: cache.aiResults,
+              signal,
+            });
+            return suggestion ? {
+              title: suggestion.cleanedTitle,
+              mediaType: suggestion.mediaType,
+            } : null;
+          }
           : undefined,
         signal,
       });

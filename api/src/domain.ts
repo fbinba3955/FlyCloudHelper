@@ -382,6 +382,8 @@ export interface AiModelTaskSnapshot {
   promptVersion: string;
   triggerMode: AiCleaningTriggerMode;
   minConfidence: number;
+  /** 手动补充时跳过持久化成功缓存，确保未识别内容重新请求模型。 */
+  forceRefresh?: boolean;
 }
 
 export interface AuditRecord {

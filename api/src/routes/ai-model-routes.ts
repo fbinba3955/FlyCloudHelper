@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { CreateAiModelInput, UpdateAiModelInput } from "../ai/ai-model-manager.js";
 import { readAiCleaningSettings } from "../ai/ai-model-manager.js";
-import type { AiModelRecord } from "../domain.js";
-import { requireRequestUser, requireSuperAdmin } from "../http.js";
+import type { AiModelRecord, ServiceDetailRecord } from "../domain.js";
+import { ApiError } from "../errors.js";
+import { requireRequestUser, requireString, requireSuperAdmin } from "../http.js";
 import type { ApiRuntime } from "../runtime.js";
 
 /** 写入 AI 模型管理审计，不保存地址、API Key 或请求响应原文。 */
@@ -89,6 +90,54 @@ async function readJobAiSupplements(
   };
 }
 
+/** 为媒体库现有未识别内容创建一次不访问 Provider 的 AI 补充后台任务。 */
+async function createManualAiSupplementJob(
+  runtime: ApiRuntime,
+  service: ServiceDetailRecord,
+  requestedByUserId: string,
+  body: Record<string, unknown>,
+) {
+  const unfinishedJob = await runtime.repository.findUnfinishedScanJob(service.id, service.userId);
+  if (service.status === "scanning" || unfinishedJob) {
+    throw new ApiError(409, "scan_job_conflict", "当前服务正在扫描或已有未结束任务，不能启动 AI 补充");
+  }
+  const configuredSnapshot = await runtime.aiModels.buildUnmatchedSupplementTaskSnapshot(service.metadataProfile);
+  if (!configuredSnapshot) {
+    throw new ApiError(409, "ai_cleaning_not_enabled", "请先在服务元数据配置中启用 AI 目录文件清洗");
+  }
+  // 关键变量：手动任务直接处理数据库未匹配记录，并强制跳过此前成功的 AI 清洗缓存。
+  const manualSnapshot = configuredSnapshot;
+  const job = await runtime.repository.createScanJob({
+    jobId: randomUUID(),
+    userId: service.userId,
+    serviceId: service.id,
+    requestedByUserId,
+    requestId: requireString(body, "requestId", "请求 ID", 200),
+    clientDeviceId: requireString(body, "clientDeviceId", "客户端设备 ID", 200),
+    // 保留数据库现有必填字段；Worker 根据 taskPurpose 进入独立流程，不读取该扫描模式和扫描路径。
+    scanMode: "incremental",
+    runtimeRevision: "scanner-worker-v1",
+    tmdbKeyPoolRevision: runtime.tmdb.revision,
+    aiModel: manualSnapshot,
+    taskPurpose: "ai_supplement_unmatched",
+    pluginVersions: await runtime.plugins.buildTaskSnapshots(service.metadataProfile),
+  });
+  runtime.logBusinessEvent("info", {
+    日志关键字: "codex-flycloud-helper-ai-clean",
+    事件: "手动创建未识别内容AI补充任务",
+    操作用户ID: requestedByUserId,
+    归属用户ID: service.userId,
+    服务ID: service.id,
+    任务ID: job.id,
+    内容来源: "媒体库未匹配记录",
+    是否访问Provider: false,
+    模型ID: manualSnapshot.modelId,
+    模型修订: manualSnapshot.configurationRevision,
+    跳过AI缓存: true,
+  });
+  return job;
+}
+
 /** 注册超级管理员 AI 模型配置、启停和可用性测试接口。 */
 export async function registerAiModelRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   /** 返回服务配置页可选择的模型；已停用但仍被服务选中的模型仅用于回显。 */
@@ -114,6 +163,26 @@ export async function registerAiModelRoutes(server: FastifyInstance, runtime: Ap
     await requireSuperAdmin(request, runtime.database);
     return readJobAiSupplements(runtime, request.params.jobId);
   });
+
+  server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/services/:serviceId/ai-supplements/retry",
+    async (request, reply) => {
+      const user = await requireRequestUser(request, runtime.database);
+      const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+      const job = await createManualAiSupplementJob(runtime, service, user.id, request.body ?? {});
+      return reply.status(202).send({ job });
+    },
+  );
+
+  server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(
+    "/api/v1/admin/services/:serviceId/ai-supplements/retry",
+    async (request, reply) => {
+      const operator = await requireSuperAdmin(request, runtime.database);
+      const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+      const job = await createManualAiSupplementJob(runtime, service, operator.id, request.body ?? {});
+      return reply.status(202).send({ job });
+    },
+  );
 
   server.get("/api/v1/admin/ai-models", async (request) => {
     await requireSuperAdmin(request, runtime.database);

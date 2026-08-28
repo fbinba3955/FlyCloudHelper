@@ -19,6 +19,7 @@ import {
   purgeAdminUser,
   revokeAdminUserSessions,
   updateAdminUserStatus,
+  updateAdminTmdbBaseUrls,
   updateAdminTmdbKeys,
   updateAdminPublicBaseUrl,
   updatePluginStatus,
@@ -327,6 +328,22 @@ export function AdminConfigurationPage() {
     } catch (error) { setMessage(error instanceof Error ? error.message : "公开访问地址保存失败"); }
   }
 
+  /** 保存 TMDB API 与图片代理地址，空输入由服务端恢复为默认地址。 */
+  async function saveTmdbBaseUrls(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const formData = new FormData(event.currentTarget);
+    const apiBaseUrl = String(formData.get("tmdbApiBaseUrl") ?? "").trim();
+    const imageBaseUrl = String(formData.get("tmdbImageBaseUrl") ?? "").trim();
+    setMessage("正在保存 TMDB 代理地址…");
+    try {
+      const tmdb = await updateAdminTmdbBaseUrls(apiBaseUrl, imageBaseUrl);
+      setMessage(tmdb.baseUrlSource === "database" ? "TMDB 代理地址已保存并即时生效" : "已恢复 TMDB 默认地址");
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "TMDB 代理地址保存失败");
+    }
+  }
+
   /** 二次确认后使用表单中的完整列表替换 TMDB Key 池。 */
   async function saveTmdbKeys(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
@@ -394,6 +411,28 @@ export function AdminConfigurationPage() {
         </form>
         <p className="mt-3 text-xs text-muted-foreground">作用：仅当使用反向代理、HTTPS 域名，或外部端口与云助手 API 实际地址不一致时填写。系统会在该地址后自动追加媒体库设置中的 /j/{`{自定义后缀}`}；清空不会影响 Jellyfin 的启用和访问。</p>
         <p className="mt-2 text-xs text-muted-foreground">配置来源：{resource.data?.publicAccess.source === "environment" ? "环境变量（控制台只读）" : resource.data?.publicAccess.source === "database" ? "数据库" : "未设置（使用云助手 API 地址）"}</p>
+      </Panel>
+      <Panel title="TMDB 代理地址" description="配置云助手服务端访问 TMDB API 和图片资源时使用的基础地址。" className="mt-4">
+        <form
+          key={`${resource.data?.tmdb.apiBaseUrl ?? "default"}|${resource.data?.tmdb.imageBaseUrl ?? "default"}`}
+          onSubmit={(event) => void saveTmdbBaseUrls(event)}
+          className="grid gap-4"
+        >
+          <label className="block">
+            <span className="text-xs font-medium">TMDB API 地址</span>
+            <span className="mt-1 block text-[11px] text-muted-foreground">需要填写包含 API 版本路径的完整地址，例如 https://api.tmdb.org/3。</span>
+            <input name="tmdbApiBaseUrl" type="url" defaultValue={resource.data?.tmdb.apiBaseUrl ?? "https://api.tmdb.org/3"} placeholder="https://api.tmdb.org/3" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" />
+          </label>
+          <label className="block">
+            <span className="text-xs font-medium">TMDB 图片地址</span>
+            <span className="mt-1 block text-[11px] text-muted-foreground">需要填写包含图片路径的完整地址，例如 https://image.tmdb.org/t/p。</span>
+            <input name="tmdbImageBaseUrl" type="url" defaultValue={resource.data?.tmdb.imageBaseUrl ?? "https://image.tmdb.org/t/p"} placeholder="https://image.tmdb.org/t/p" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" />
+          </label>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs text-muted-foreground">配置来源：{resource.data?.tmdb.baseUrlSource === "database" ? `系统设置 · r${resource.data.tmdb.baseUrlConfigurationRevision}` : "默认地址"}；保存后后续 TMDB 请求立即使用新地址。</p>
+            <PrimaryButton type="submit"><Save className="size-4" /> 保存代理地址</PrimaryButton>
+          </div>
+        </form>
       </Panel>
       <Panel title="TMDB Key 配置" description="支持 API Key 或 Read Access Token；每行一个，也可以使用英文逗号分隔。" className="mt-4">
         <form onSubmit={(event) => void saveTmdbKeys(event)} className="grid gap-4">

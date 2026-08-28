@@ -9,7 +9,12 @@ import { JellyfinCompatibilityService, type JellyfinContext, type JellyfinLibrar
 import { providerFetch, providerStream } from "../providers/network.js";
 import type { ProviderConnectionContext, ProviderFileAccess } from "../providers/types.js";
 import type { ApiRuntime } from "../runtime.js";
-import { buildUpstreamHeaders, copyMediaResponseHeaders, resolveRelayAccess, type RelayLibraryRow } from "./media-stream-routes.js";
+import {
+  buildUpstreamHeaders,
+  copyMediaResponseHeaders,
+  resolveRelayAccess,
+  type RelayLibraryRow,
+} from "./media-stream-routes.js";
 
 /** 统一读取任意 Jellyfin 查询参数。 */
 function readQuery(request: FastifyRequest): Record<string, unknown> {
@@ -154,23 +159,20 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
   const requestedFile = requestedSource
     ? findPlaybackFile(playableFiles, internalItemId, internalRequestedSource)
     : undefined;
-  // 关键变量：当前主文件是标准主媒体源的首选文件，Provider 确认删除后再尝试同条目的其他文件。
-  const currentPrimaryFile = playableFiles[0];
-  if (!currentPrimaryFile) {
+  if (playableFiles.length === 0) {
     throw new ApiError(404, "jellyfin_media_source_not_found", "媒体条目没有可播放文件");
   }
   if (requestedSource && !requestedFile) {
     throw new ApiError(404, "jellyfin_media_source_not_found", "指定媒体源不存在");
   }
-  // 关键变量：Jellyfin 使用条目 ID 表示主媒体源，主文件失效后允许继续尝试同一条目的其他当前文件。
-  const requestedPrimarySource = requestedSource.length > 0 && internalRequestedSource === internalItemId;
-  // 主媒体源请求按当前文件顺序寻找首个可用文件；显式指定其他有效版本时只解析该版本。
-  const candidateFiles = requestedPrimarySource
-    ? [currentPrimaryFile, ...playableFiles.filter((file) => file !== currentPrimaryFile)]
-    : requestedFile
-      ? [requestedFile]
-      : playableFiles;
-  const shouldStopAfterFirstUsableSource = requestedPrimarySource;
+  // 指定版本失效时只允许尝试同路径的替换文件，不能切换到同一集的其他版本。
+  const candidateFiles = requestedFile
+    ? [
+      requestedFile,
+      ...playableFiles.filter((file) => file !== requestedFile && String(file.path) === String(requestedFile.path)),
+    ]
+    : playableFiles;
+  const shouldStopAfterFirstUsableSource = Boolean(requestedFile);
   const preference = readPlaybackRoute(request);
   // 关键变量：Jellyfin 中转开关只约束服务器媒体入口，不影响临时原始地址直连。
   const jellyfinRelayPlaybackEnabled = Number(service.jellyfin_relay_playback_enabled) === 1
@@ -240,7 +242,7 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
     if (shouldStopAfterFirstUsableSource) break;
   }
   if (missingProviderFileCount === candidateFiles.length) {
-    throw new ApiError(404, "jellyfin_provider_file_not_found", "当前影片关联的网盘文件均已删除");
+    throw new ApiError(404, "jellyfin_provider_file_not_found", "当前播放版本对应的网盘文件已删除");
   }
   if (mediaSources.length === 0 && preference === "origin") {
     throw new ApiError(409, "jellyfin_origin_direct_unavailable", "当前媒体文件无法生成网盘原始播放地址");
@@ -338,19 +340,12 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompa
   const fileId = compatibility.toInternalMediaSourceId(internalItemId, requestedSource);
   const itemFiles = files.filter((candidate) => String(candidate.itemId) === internalItemId);
   const requestedFile = findPlaybackFile(itemFiles, internalItemId, fileId);
-  const currentPrimaryFile = itemFiles[0];
-  if (!currentPrimaryFile) throw new ApiError(404, "jellyfin_media_source_not_found", "媒体源不存在");
-  if (requestedSource && !requestedFile) {
-    throw new ApiError(404, "jellyfin_media_source_not_found", "媒体源不存在");
-  }
-  // 关键变量：标准主媒体源使用条目 ID，原主文件删除后继续尝试同一条目的其他当前文件。
-  const requestedPrimarySource = requestedSource.length > 0 && fileId === internalItemId;
-  const shouldTryAlternateFiles = requestedSource.length === 0 || requestedPrimarySource;
-  const candidateFiles = shouldTryAlternateFiles
-    ? [currentPrimaryFile, ...itemFiles.filter((file) => file !== currentPrimaryFile)]
-    : requestedFile
-      ? [requestedFile]
-      : [currentPrimaryFile];
+  if (!requestedFile) throw new ApiError(404, "jellyfin_media_source_not_found", "媒体源不存在");
+  // 指定版本失效时只允许尝试同路径的替换文件，不能切换到同一集的其他版本。
+  const candidateFiles = [
+    requestedFile,
+    ...itemFiles.filter((file) => file !== requestedFile && String(file.path) === String(requestedFile.path)),
+  ];
   const abortController = new AbortController();
   const abort = () => abortController.abort();
   request.raw.once("aborted", abort); reply.raw.once("close", abort);
@@ -399,7 +394,7 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompa
       }
     }
     if (!file || !access) {
-      throw new ApiError(404, "jellyfin_provider_file_not_found", "当前影片关联的网盘文件均已删除");
+      throw new ApiError(404, "jellyfin_provider_file_not_found", "当前播放版本对应的网盘文件已删除");
     }
     const upstream = await providerStream(access.url, { method: request.method, headers: buildUpstreamHeaders(request, access.headers) }, {
       allowInsecureHttp: runtime.config.allowInsecureProviderHttp,

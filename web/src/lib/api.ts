@@ -166,6 +166,10 @@ export interface AdminConfigStatus {
     coolingCount: number;
     disabledCount: number;
     effectiveConcurrency: number;
+    apiBaseUrl: string;
+    imageBaseUrl: string;
+    baseUrlSource: "default" | "database";
+    baseUrlConfigurationRevision: number;
     revision: string;
   };
   publicAccess: {
@@ -937,7 +941,7 @@ export async function clearCompletedScanJobs(admin = false): Promise<number> {
   return result.deletedCount;
 }
 
-/** 下载任务级扫描刮削失败报告，并使用服务端文件名保存到本地。 */
+/** 下载任务级扫描或 AI 补充失败报告，并使用服务端文件名保存到本地。 */
 export async function downloadScanFailureReport(jobId: string, admin = false): Promise<void> {
   let response: Response;
   try {
@@ -968,7 +972,8 @@ export async function downloadScanFailureReport(jobId: string, admin = false): P
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(objectUrl);
+  // 浏览器需要在点击事件结束后继续读取 Blob URL，延迟释放可避免部分环境没有实际触发下载。
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
 }
 
 /** 读取当前任务 AI 补充查询词的总数和最近 20 条采用记录。 */
@@ -978,6 +983,23 @@ export function getJobAiSupplements(jobId: string, admin = false): Promise<JobAi
       ? `/api/v1/admin/jobs/${encodeURIComponent(jobId)}/ai-supplements`
       : `/api/v1/scan-jobs/${encodeURIComponent(jobId)}/ai-supplements`,
   );
+}
+
+/** 创建一次只读取媒体库未匹配记录、并强制刷新 AI 结果的后台任务。 */
+export async function createManualAiSupplementJob(serviceId: string, admin = false): Promise<ScanJob> {
+  const result = await requestJson<{ job: ScanJob }>(
+    admin
+      ? `/api/v1/admin/services/${encodeURIComponent(serviceId)}/ai-supplements/retry`
+      : `/api/v1/services/${encodeURIComponent(serviceId)}/ai-supplements/retry`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        requestId: createRequestId(),
+        clientDeviceId: "flycloud-helper-web",
+      }),
+    },
+  );
+  return result.job;
 }
 
 /** 清空单个服务的扫描与刮削结果，保留服务连接和配置。 */
@@ -1437,6 +1459,18 @@ export async function updateAdminTmdbKeys(keys: string[]): Promise<AdminConfigSt
   const result = await requestJson<{ tmdb: AdminConfigStatus["tmdb"] }>("/api/v1/admin/config/tmdb-keys", {
     method: "PUT",
     body: JSON.stringify({ keys }),
+  });
+  return result.tmdb;
+}
+
+/** 保存 TMDB API 与图片代理地址；两个地址留空时恢复默认值。 */
+export async function updateAdminTmdbBaseUrls(
+  apiBaseUrl: string,
+  imageBaseUrl: string,
+): Promise<AdminConfigStatus["tmdb"]> {
+  const result = await requestJson<{ tmdb: AdminConfigStatus["tmdb"] }>("/api/v1/admin/config/tmdb-base-urls", {
+    method: "PUT",
+    body: JSON.stringify({ apiBaseUrl, imageBaseUrl }),
   });
   return result.tmdb;
 }

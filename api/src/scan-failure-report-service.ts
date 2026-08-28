@@ -45,7 +45,7 @@ function toSafePathSegment(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-/** 管理按扫描任务追加的 JSON Lines 失败报告。 */
+/** 管理按扫描或 AI 补充任务追加的 JSON Lines 失败报告。 */
 export class ScanFailureReportService {
   private readonly config: ApiConfig;
   private readonly logger: FailureReportLogger;
@@ -93,7 +93,7 @@ export class ScanFailureReportService {
       return reportPath;
     } catch (error) {
       if (error instanceof ApiError) throw error;
-      throw new ApiError(404, "scan_failure_report_not_found", "当前扫描任务还没有失败报告");
+      throw new ApiError(404, "scan_failure_report_not_found", "当前任务还没有可下载的失败内容");
     }
   }
 
@@ -133,6 +133,7 @@ export class ScanFailureReportService {
       服务名称: job.serviceName,
       Provider类型: typeof job.snapshot.providerType === "string" ? job.snapshot.providerType : "unknown",
       扫描模式: job.scanMode,
+      任务用途: job.snapshot.taskPurpose === "ai_supplement_unmatched" ? "AI补充未识别内容" : "扫描刮削",
       创建时间: createdAt,
       安全说明: "不包含服务凭据、Token、请求头和播放定位信息",
     };

@@ -8,6 +8,7 @@ import { Panel, ProgressMeter, StatusPill, type StatusTone } from "@/components/
 import {
   cancelScanJob,
   clearCompletedScanJobs,
+  createManualAiSupplementJob,
   deleteScanJob,
   downloadScanFailureReport,
   getJobAiSupplements,
@@ -55,6 +56,13 @@ const backgroundJobTypeLabels = {
   scan: "扫描刮削",
   media_probe: "视频规格分析",
 } as const;
+
+/** 区分普通扫描和手动 AI 补充任务，避免任务列表只显示为全量扫描。 */
+function getBackgroundJobLabel(job: ScanJob): string {
+  if (job.jobType === "media_probe") return backgroundJobTypeLabels.media_probe;
+  if (job.snapshot.taskPurpose === "ai_supplement_unmatched") return "AI补充未识别内容";
+  return `${job.scanMode === "full" ? "全量" : "增量"}扫描刮削`;
+}
 
 type JobStatusFilter = "all" | "active" | JobStatus;
 type JobTypeFilter = "all" | keyof typeof backgroundJobTypeLabels;
@@ -145,6 +153,7 @@ function getJobSnapshotFields(snapshot: Record<string, unknown>): JobSnapshotFie
     providerType ? { label: "网盘类型", value: providerTypeLabels[providerType] ?? providerType } : null,
     typeof snapshot.runtimeRevision === "string" ? { label: "扫描程序版本", value: snapshot.runtimeRevision } : null,
     typeof snapshot.tmdbKeyPoolRevision === "string" ? { label: "TMDB Key 池版本", value: snapshot.tmdbKeyPoolRevision } : null,
+    snapshot.taskPurpose === "ai_supplement_unmatched" ? { label: "任务用途", value: "AI补充未识别内容" } : null,
     typeof snapshot.triggerType === "string" ? { label: "触发方式", value: snapshot.triggerType === "manual_backfill" ? "手动分析已有视频" : snapshot.triggerType === "scan_completed" ? "扫描完成" : snapshot.triggerType === "retry" ? "重试失败文件" : snapshot.triggerType === "reauthorized" ? "重新授权后恢复" : "服务恢复" } : null,
     typeof snapshot.sourceScanJobId === "string" && snapshot.sourceScanJobId ? { label: "来源后台任务", value: snapshot.sourceScanJobId } : null,
     typeof snapshot.retryOfJobId === "string" && snapshot.retryOfJobId ? { label: "重试来源任务", value: snapshot.retryOfJobId } : null,
@@ -238,9 +247,18 @@ function JobsView({ admin }: { admin: boolean }) {
   const [mediaProbeFailuresLoaded, setMediaProbeFailuresLoaded] = useState(false);
   const [aiSupplementDialogOpen, setAiSupplementDialogOpen] = useState(false);
   const [aiSupplementDialogJobId, setAiSupplementDialogJobId] = useState("");
+  const [aiSupplementDialogServiceId, setAiSupplementDialogServiceId] = useState("");
   const [aiSupplementResult, setAiSupplementResult] = useState<JobAiSupplementResult | null>(null);
   const [aiSupplementLoading, setAiSupplementLoading] = useState(false);
   const [aiSupplementError, setAiSupplementError] = useState<string | null>(null);
+  const [aiSupplementTriggering, setAiSupplementTriggering] = useState(false);
+  const [aiSupplementTriggerError, setAiSupplementTriggerError] = useState<string | null>(null);
+  // 关键变量：下载状态跟随任务 ID，切换任务后不会把上一任务的提示显示到当前详情。
+  const [failureReportState, setFailureReportState] = useState<{
+    jobId: string;
+    downloading: boolean;
+    message: string;
+  } | null>(null);
   const [pendingJobOperations, setPendingJobOperations] = useState<Record<string, JobOperation>>({});
   const [clearingCompletedJobs, setClearingCompletedJobs] = useState(false);
   // 关键变量：引用中的任务操作会在事件处理入口同步写入，阻止 React 状态刷新前发生的连续点击。
@@ -249,9 +267,12 @@ function JobsView({ admin }: { admin: boolean }) {
   const clearingCompletedJobsRef = useRef(false);
   // 关键变量：Dialog 请求归属任务，切换任务或关闭后忽略旧请求返回。
   const aiSupplementRequestJobIdRef = useRef<string | null>(null);
+  // 关键变量：同步占用手动补充请求，阻止按钮状态刷新前的连续点击。
+  const aiSupplementTriggeringRef = useRef(false);
   const jobs = resource.data?.items ?? [];
   const activeJob = jobs.find((job) => job.id === selectedJobId) ?? jobs[0];
   const pendingActiveJobOperation = activeJob ? pendingJobOperations[activeJob.id] : undefined;
+  const activeJobIsAiSupplement = activeJob?.snapshot.taskPurpose === "ai_supplement_unmatched";
   const activeJobOperationBlocked = Boolean(activeJob && (pendingActiveJobOperation || activeJob.controlAction !== "none"));
   const canRetryActiveJob = Boolean(activeJob && canRetryJob(activeJob));
   const canPauseActiveJob = Boolean(activeJob && canPauseJob(activeJob));
@@ -443,20 +464,28 @@ function JobsView({ admin }: { admin: boolean }) {
     }
   }
 
-  /** 下载任务扫描、识别和刮削阶段产生的脱敏失败报告。 */
+  /** 下载任务扫描或 AI 补充阶段产生的脱敏失败报告，并在按钮旁显示结果。 */
   async function downloadSelectedFailureReport(): Promise<void> {
     if (!activeJob || !canDownloadFailureReport) return;
-    setMessage("正在下载扫描失败报告…");
+    const targetJob = activeJob;
+    const aiSupplementTask = targetJob.snapshot.taskPurpose === "ai_supplement_unmatched";
+    const downloadingMessage = aiSupplementTask ? "正在下载 AI 补充失败报告…" : "正在下载扫描失败报告…";
+    setFailureReportState({ jobId: targetJob.id, downloading: true, message: downloadingMessage });
+    setMessage(downloadingMessage);
     try {
-      await downloadScanFailureReport(activeJob.id, admin);
-      setMessage(`任务 ${activeJob.id} 的失败报告已开始下载`);
+      await downloadScanFailureReport(targetJob.id, admin);
+      const successMessage = aiSupplementTask ? "AI 补充失败报告已开始下载" : "扫描失败报告已开始下载";
+      setFailureReportState({ jobId: targetJob.id, downloading: false, message: successMessage });
+      setMessage(`任务 ${targetJob.id} 的失败报告已开始下载`);
     } catch (error) {
-      console.warn("codex-scan-failure-report", {
-        "事件": "扫描失败报告下载失败",
-        "任务ID": activeJob.id,
+      const errorMessage = error instanceof Error ? error.message : "失败报告下载失败";
+      console.warn(aiSupplementTask ? "codex-flycloud-helper-ai-clean" : "codex-scan-failure-report", {
+        "事件": aiSupplementTask ? "AI补充失败报告下载失败" : "扫描失败报告下载失败",
+        "任务ID": targetJob.id,
         "错误信息": error instanceof Error ? error.message : "未知错误",
       });
-      setMessage(error instanceof Error ? error.message : "扫描失败报告下载失败");
+      setFailureReportState({ jobId: targetJob.id, downloading: false, message: errorMessage });
+      setMessage(errorMessage);
     }
   }
 
@@ -466,9 +495,11 @@ function JobsView({ admin }: { admin: boolean }) {
     const targetJobId = activeJob.id;
     aiSupplementRequestJobIdRef.current = targetJobId;
     setAiSupplementDialogJobId(targetJobId);
+    setAiSupplementDialogServiceId(activeJob.serviceId);
     setAiSupplementDialogOpen(true);
     setAiSupplementLoading(true);
     setAiSupplementError(null);
+    setAiSupplementTriggerError(null);
     setAiSupplementResult(null);
     try {
       const result = await getJobAiSupplements(targetJobId, admin);
@@ -488,6 +519,33 @@ function JobsView({ admin }: { admin: boolean }) {
     }
   }
 
+  /** 为当前任务所属媒体库创建一次只重试未识别内容的 AI 补充任务。 */
+  async function triggerManualAiSupplement(): Promise<void> {
+    if (!aiSupplementDialogServiceId || aiSupplementTriggeringRef.current) return;
+    aiSupplementTriggeringRef.current = true;
+    setAiSupplementTriggering(true);
+    setAiSupplementTriggerError(null);
+    try {
+      const job = await createManualAiSupplementJob(aiSupplementDialogServiceId, admin);
+      setMessage(`已创建 AI 补充任务 ${job.id}，只处理媒体库现有未匹配内容，不会重新扫描网盘`);
+      aiSupplementRequestJobIdRef.current = null;
+      setAiSupplementDialogOpen(false);
+      await resource.refresh();
+      setSelectedJobId(job.id);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "创建 AI 补充任务失败";
+      console.warn("codex-flycloud-helper-ai-clean", {
+        事件: "手动创建未识别内容AI补充任务失败",
+        服务ID: aiSupplementDialogServiceId,
+        错误信息: errorMessage,
+      });
+      setAiSupplementTriggerError(errorMessage);
+    } finally {
+      aiSupplementTriggeringRef.current = false;
+      setAiSupplementTriggering(false);
+    }
+  }
+
   /** 关闭 AI 补充详情并使尚未完成的旧请求失效。 */
   function closeAiSupplementDialog(): void {
     aiSupplementRequestJobIdRef.current = null;
@@ -503,7 +561,7 @@ function JobsView({ admin }: { admin: boolean }) {
           <SecondaryButton onClick={() => { if (activeJob) void pauseJob(activeJob); }} disabled={!canPauseActiveJob || activeJobOperationBlocked}><Pause className="size-4" /> {pendingActiveJobOperation === "pause" || activeJob?.controlAction === "pause" ? "暂停处理中…" : "暂停"}</SecondaryButton>
           <SecondaryButton onClick={() => { if (activeJob) void resumeJob(activeJob); }} disabled={!canResumeActiveJob || activeJobOperationBlocked}><Play className="size-4" /> {pendingActiveJobOperation === "resume" ? "正在继续…" : "继续"}</SecondaryButton>
           <SecondaryButton onClick={() => { if (activeJob) void cancelJob(activeJob); }} disabled={!canCancelActiveJob || activeJobOperationBlocked}><Square className="size-4" /> {pendingActiveJobOperation === "cancel" || activeJob?.controlAction === "cancel" ? "终止处理中…" : "终止任务"}</SecondaryButton>
-          <PrimaryButton onClick={() => { if (activeJob) void retryJob(activeJob); }} disabled={!canRetryActiveJob || activeJobOperationBlocked}><RotateCcw className="size-4" /> {pendingActiveJobOperation === "retry" ? "正在重试…" : "重试失败内容"}</PrimaryButton>
+          <PrimaryButton onClick={() => { if (activeJob) void retryJob(activeJob); }} disabled={!canRetryActiveJob || activeJobOperationBlocked}><RotateCcw className="size-4" /> {pendingActiveJobOperation === "retry" ? "正在重试…" : activeJobIsAiSupplement ? "重试AI补充" : "重试失败内容"}</PrimaryButton>
           <button type="button" onClick={() => { if (activeJob) void deleteJob(activeJob); }} disabled={!canDeleteActiveJob || activeJobOperationBlocked} className="inline-flex items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {pendingActiveJobOperation === "delete" ? "正在删除…" : "删除任务"}</button>
         </>}
       />
@@ -544,7 +602,7 @@ function JobsView({ admin }: { admin: boolean }) {
       </Panel>
       {!activeJob ? <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? (statusFilter === "all" && jobTypeFilter === "all" ? "还没有后台任务" : "当前筛选条件下没有任务")}</div></Panel> : (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
-          <Panel title={`任务详情 ${activeJob.id}`} description={`${activeJob.serviceName} · ${activeJob.jobType === "media_probe" ? "视频规格分析" : `${activeJob.scanMode === "full" ? "全量" : "增量"}扫描刮削`}${admin ? ` · ${activeJob.ownerUsername}` : ""}`}>
+          <Panel title={`任务详情 ${activeJob.id}`} description={`${activeJob.serviceName} · ${getBackgroundJobLabel(activeJob)}${admin ? ` · ${activeJob.ownerUsername}` : ""}`}>
             <div className="rounded-xl border border-primary/25 bg-primary/8 p-5">
               <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3"><div><p className="text-xs text-muted-foreground">当前阶段</p><p className="font-display mt-1 text-2xl font-semibold">{getJobStageLabel(activeJob.stage)}</p><p className="mt-1 text-xs text-muted-foreground">{getJobDurationLabel(activeJob.status)}：{formatJobDuration(activeJob.elapsedMs)}</p></div><StatusPill tone={getJobTone(activeJob.status)}>{getJobStatusLabel(activeJob)}</StatusPill></div>
               <div className="mt-4"><ProgressMeter value={activeJob.status === "completed" ? 1 : activeJob.processedCount} total={activeJob.status === "completed" ? 1 : activeJob.totalCount} /></div>
@@ -558,8 +616,8 @@ function JobsView({ admin }: { admin: boolean }) {
                 </ul>}
               </div>}
               <div className="mt-3 min-w-0 rounded-lg border border-border/70 bg-background/30 px-3 py-2">
-                <p className="text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" ? "当前分析文件" : "当前扫描路径"}</p>
-                <p className="mt-1 truncate font-mono text-xs" title={activeJob.currentPath ?? undefined}>{activeJob.currentPath || (activeJob.jobType === "media_probe" ? "等待领取视频文件" : "准备读取扫描目录")}</p>
+                <p className="text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" ? "当前分析文件" : activeJobIsAiSupplement ? "当前处理内容" : "当前扫描路径"}</p>
+                <p className="mt-1 truncate font-mono text-xs" title={activeJob.currentPath ?? undefined}>{activeJob.currentPath || (activeJob.jobType === "media_probe" ? "等待领取视频文件" : activeJobIsAiSupplement ? "准备读取媒体库未匹配内容" : "准备读取扫描目录")}</p>
                 {activeJob.jobType === "scan" && activeJob.resumeSupported && <p className="mt-2 text-[11px] text-muted-foreground">可恢复检查点：{formatCheckpointTime(activeJob.checkpointUpdatedAt)}</p>}
               </div>
               {activeJob.status === "retry_waiting" && <div className="mt-3 rounded-lg border border-warning/30 bg-warning/8 px-3 py-2"><p className="text-sm font-medium">{activeJob.jobType === "media_probe" ? activeJob.errorCode === "provider_authentication_failed" ? "Provider 登录已失效，等待 APP 同步有效登录信息" : "上游地址或文件读取暂时失败，任务会自动重试" : "TMDB 暂时不可用，任务会自动恢复"}</p><p className="mt-1 text-[11px] text-muted-foreground">{activeJob.jobType === "media_probe" && activeJob.errorCode === "provider_authentication_failed" ? "同步成功后后台任务会自动继续" : <>预计恢复时间：{formatCheckpointTime(activeJob.nextRetryAt)}{activeJob.jobType === "scan" ? ` · 已等待 ${activeJob.retryCount.toLocaleString()} 次` : ""}</>}</p></div>}
@@ -571,8 +629,8 @@ function JobsView({ admin }: { admin: boolean }) {
                 </div>
               ) : (
                 <div className="mt-3 grid grid-cols-2 gap-3 font-mono text-[11px] text-muted-foreground sm:grid-cols-5">
-                  <span title="扫描路径中识别出的可处理媒体文件数量">{getScannedMediaLabel(activeJob.dataType)} {getScannedMediaCount(activeJob).toLocaleString()}</span>
-                  <span title="按 Flymby APP 刮削任务聚合后，已经成功处理或最终失败的完整电影、节目数量">{getProcessedMediaLabel(activeJob.dataType)} {activeJob.processedCount.toLocaleString()}</span>
+                  <span title={activeJobIsAiSupplement ? "任务开始时媒体库中未匹配的电影或节目数量" : "扫描路径中识别出的可处理媒体文件数量"}>{activeJobIsAiSupplement ? "待补充" : getScannedMediaLabel(activeJob.dataType)} {getScannedMediaCount(activeJob).toLocaleString()}</span>
+                  <span title={activeJobIsAiSupplement ? "已经完成 AI 补充处理的电影或节目数量" : "按 Flymby APP 刮削任务聚合后，已经成功处理或最终失败的完整电影、节目数量"}>{activeJobIsAiSupplement ? "已处理" : getProcessedMediaLabel(activeJob.dataType)} {activeJob.processedCount.toLocaleString()}</span>
                   <span title="完整电影或节目中取得元数据匹配结果的数量">已匹配 {formatOptionalCount(activeJob.matchedCount)}</span>
                   <span title="完整电影或节目中已处理但没有取得元数据匹配结果的数量">未匹配 {formatOptionalCount(activeJob.unmatchedCount)}</span>
                   <span title="完整电影或节目处理失败的数量">错误 {activeJob.errorCount.toLocaleString()}</span>
@@ -582,10 +640,18 @@ function JobsView({ admin }: { admin: boolean }) {
                 <SecondaryButton onClick={() => void openAiSupplementDialog()}>
                   <Sparkles className="size-4" /> AI补充详情
                 </SecondaryButton>
-                <SecondaryButton onClick={() => void downloadSelectedFailureReport()} disabled={!canDownloadFailureReport}>
-                  <Download className="size-4" /> 下载失败报告
+                <SecondaryButton
+                  onClick={() => void downloadSelectedFailureReport()}
+                  disabled={!canDownloadFailureReport || (failureReportState?.jobId === activeJob.id && failureReportState.downloading)}
+                >
+                  <Download className="size-4" /> {failureReportState?.jobId === activeJob.id && failureReportState.downloading
+                    ? "正在下载…"
+                    : activeJobIsAiSupplement ? "下载AI补充失败报告" : "下载失败报告"}
                 </SecondaryButton>
               </div>}
+              {activeJob.jobType === "scan" && failureReportState?.jobId === activeJob.id && (
+                <p className="mt-2 text-right text-xs text-muted-foreground">{failureReportState.message}</p>
+              )}
             </div>
             <h3 className="mt-6 mb-3 text-sm font-semibold">配置快照（只读）</h3>
             <div className="rounded-xl border border-border bg-secondary/40 p-4">
@@ -626,7 +692,7 @@ function JobsView({ admin }: { admin: boolean }) {
                       <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
                         <div className="min-w-0">
                           <p className="truncate font-mono text-xs">{job.id}</p>
-                          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.serviceName} · {backgroundJobTypeLabels[job.jobType]} · {job.jobType === "scan" ? `${job.scanMode === "full" ? "全量" : "增量"} · ` : ""}{getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p>
+                          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{job.serviceName} · {getBackgroundJobLabel(job)} · {getJobStageLabel(job.stage)}{admin ? ` · ${job.ownerUsername}` : ""}</p>
                           <p className="mt-1 text-[11px] text-muted-foreground">{getJobDurationLabel(job.status)}：{formatJobDuration(job.elapsedMs)}</p>
                           {job.status === "queued" && <p className="mt-1 truncate text-[11px] text-warning" title={getQueuedJobWaitSummary(job)}>{getQueuedJobWaitSummary(job)}</p>}
                           <div className="mt-1 grid gap-1 text-[11px] text-muted-foreground sm:grid-cols-2"><span>开始时间：{formatJobDateTime(job.startedAt)}</span><span>结束时间：{formatJobDateTime(job.finishedAt)}</span></div>
@@ -639,7 +705,7 @@ function JobsView({ admin }: { admin: boolean }) {
                       {canPauseJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void pauseJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><Pause className="size-3.5" />{pendingOperation === "pause" || job.controlAction === "pause" ? "暂停处理中…" : "暂停"}</button>}
                       {canResumeJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void resumeJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><Play className="size-3.5" />{pendingOperation === "resume" ? "正在继续…" : "继续"}</button>}
                       {canCancelJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void cancelJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/35 bg-destructive/8 px-2.5 py-1.5 text-[11px] text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Square className="size-3.5" />{pendingOperation === "cancel" || job.controlAction === "cancel" ? "终止处理中…" : "终止"}</button>}
-                      {canRetryJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void retryJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><RotateCcw className="size-3.5" />{pendingOperation === "retry" ? "正在重试…" : "重试"}</button>}
+                      {canRetryJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void retryJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/35 px-2.5 py-1.5 text-[11px] text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-40"><RotateCcw className="size-3.5" />{pendingOperation === "retry" ? "正在重试…" : job.snapshot.taskPurpose === "ai_supplement_unmatched" ? "重试AI补充" : "重试"}</button>}
                       {canDeleteJob(job) && <button type="button" onClick={() => { setSelectedJobId(job.id); void deleteJob(job); }} disabled={operationBlocked} className="inline-flex items-center gap-1.5 rounded-lg border border-destructive/35 bg-destructive/8 px-2.5 py-1.5 text-[11px] text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" />{pendingOperation === "delete" ? "正在删除…" : "删除"}</button>}
                     </div>
                   </article>
@@ -655,6 +721,9 @@ function JobsView({ admin }: { admin: boolean }) {
         error: aiSupplementError,
         jobId: aiSupplementDialogJobId,
         result: aiSupplementResult,
+        triggering: aiSupplementTriggering,
+        triggerError: aiSupplementTriggerError,
+        onTrigger: () => void triggerManualAiSupplement(),
         onClose: closeAiSupplementDialog,
       }} />
     </>

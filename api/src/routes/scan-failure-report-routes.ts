@@ -4,7 +4,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import { requireRequestUser, requireSuperAdmin } from "../http.js";
 import type { ApiRuntime } from "../runtime.js";
 
-/** 发送已完成归属校验的扫描失败报告文件。 */
+/** 发送已完成归属校验的扫描或 AI 补充失败报告文件。 */
 async function sendFailureReport(
   runtime: ApiRuntime,
   reply: FastifyReply,
@@ -13,13 +13,14 @@ async function sendFailureReport(
 ): Promise<FastifyReply> {
   const job = await runtime.repository.getJob(jobId, userId);
   const filePath = await runtime.failureReports.getDownloadPath(job);
-  const downloadFileName = `scan-failures-${path.basename(filePath)}`;
+  const aiSupplementTask = job.snapshot.taskPurpose === "ai_supplement_unmatched";
+  const downloadFileName = `${aiSupplementTask ? "ai-supplement-failures" : "scan-failures"}-${path.basename(filePath)}`;
   reply.header("Content-Type", "application/x-ndjson; charset=utf-8");
   reply.header("Content-Disposition", `attachment; filename="${downloadFileName}"`);
   reply.header("Cache-Control", "private, no-store");
   runtime.logBusinessEvent("info", {
-    日志关键字: "codex-scan-failure-report",
-    事件: "下载扫描失败报告",
+    日志关键字: aiSupplementTask ? "codex-flycloud-helper-ai-clean" : "codex-scan-failure-report",
+    事件: aiSupplementTask ? "下载AI补充失败报告" : "下载扫描失败报告",
     任务ID: job.id,
     服务ID: job.serviceId,
     用户ID: job.userId,
@@ -27,7 +28,7 @@ async function sendFailureReport(
   return reply.send(fs.createReadStream(filePath));
 }
 
-/** 注册普通用户和超级管理员的扫描失败报告下载接口。 */
+/** 注册普通用户和超级管理员的任务失败报告下载接口。 */
 export async function registerScanFailureReportRoutes(
   server: FastifyInstance,
   runtime: ApiRuntime,

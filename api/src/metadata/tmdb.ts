@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 import type { ApiConfig } from "../config.js";
 import { FlymbyVideoTitleCleaner } from "../media/flymby-video-title-cleaner.js";
+import {
+  tmdbDefaultApiBaseUrl,
+  tmdbDefaultImageBaseUrl,
+  type TmdbBaseUrlSettings,
+} from "../system-settings.js";
 import type { TmdbMetadataCache } from "./tmdb-cache.js";
 
 interface TmdbKeyState {
@@ -132,8 +137,11 @@ export interface TmdbVideoQuery {
   title: string;
   /** 目录标题无候选时使用的文件名查询词。 */
   fallbackTitle?: string;
-  /** 首次标题没有候选时，延迟生成第二查询词；用于避免正常命中时调用 AI。 */
-  resolveSecondSearchTitle?: () => Promise<string>;
+  /** 首次标题没有候选时，延迟生成 AI 第二查询建议；允许同时纠正电影或节目类型。 */
+  resolveSecondSearchSuggestion?: () => Promise<{
+    title: string;
+    mediaType: "movie" | "tv";
+  } | null>;
   /** 会影响动态第二查询词的识别修订，参与部署级公共缓存键。 */
   cacheRevision?: string;
   year: number | null;
@@ -165,6 +173,10 @@ export class TmdbKeyPool {
   private readonly maxConcurrency: number;
   private readonly diagnosticLogger: TmdbDiagnosticLogger;
   private readonly persistentCache?: TmdbMetadataCache;
+  /** 当前 TMDB JSON API 基础地址，可由系统设置即时替换。 */
+  private apiBaseUrl: string;
+  /** 当前 TMDB 图片基础地址，可由系统设置即时替换。 */
+  private imageBaseUrl: string;
   private revisionValue: string;
 
   public constructor(
@@ -172,6 +184,10 @@ export class TmdbKeyPool {
     keys: string[] = [],
     diagnosticLogger: TmdbDiagnosticLogger = () => undefined,
     persistentCache?: TmdbMetadataCache,
+    baseUrls: Pick<TmdbBaseUrlSettings, "apiBaseUrl" | "imageBaseUrl"> = {
+      apiBaseUrl: tmdbDefaultApiBaseUrl,
+      imageBaseUrl: tmdbDefaultImageBaseUrl,
+    },
   ) {
     this.states = keys.map((key) => ({
       key,
@@ -185,7 +201,9 @@ export class TmdbKeyPool {
     this.maxConcurrency = config.tmdbMaxConcurrency;
     this.diagnosticLogger = diagnosticLogger;
     this.persistentCache = persistentCache;
-    this.revisionValue = this.createRevision(keys);
+    this.apiBaseUrl = baseUrls.apiBaseUrl;
+    this.imageBaseUrl = baseUrls.imageBaseUrl;
+    this.revisionValue = this.createRevision(keys, this.apiBaseUrl, this.imageBaseUrl);
   }
 
   /** 返回当前 Key 池修订，不包含 Key 原文。 */
@@ -204,7 +222,33 @@ export class TmdbKeyPool {
       temporaryFailureCount: 0,
       temporaryReason: null,
     });
-    this.revisionValue = this.createRevision(keys);
+    this.revisionValue = this.createRevision(keys, this.apiBaseUrl, this.imageBaseUrl);
+  }
+
+  /** 即时替换 TMDB API 与图片基础地址，后续请求和缓存键立即使用新配置。 */
+  public replaceBaseUrls(baseUrls: Pick<TmdbBaseUrlSettings, "apiBaseUrl" | "imageBaseUrl">): void {
+    const apiBaseUrlChanged = this.apiBaseUrl !== baseUrls.apiBaseUrl;
+    const imageBaseUrlChanged = this.imageBaseUrl !== baseUrls.imageBaseUrl;
+    this.apiBaseUrl = baseUrls.apiBaseUrl;
+    this.imageBaseUrl = baseUrls.imageBaseUrl;
+    this.revisionValue = this.createRevision(this.states.map((state) => state.key), this.apiBaseUrl, this.imageBaseUrl);
+    if (apiBaseUrlChanged) {
+      // API 地址切换后清除临时网络冷却；无效 Key 仍保持禁用，避免地址修复后继续等待旧故障窗口。
+      this.states.forEach((state) => {
+        if (state.disabled) return;
+        state.cooldownUntil = 0;
+        state.temporaryFailureCount = 0;
+        state.temporaryReason = null;
+      });
+    }
+    this.diagnosticLogger({
+      日志关键字: "codex-flycloud-helper-tmdb-proxy",
+      事件: "TMDB代理地址已即时更新",
+      API地址是否变化: apiBaseUrlChanged,
+      图片地址是否变化: imageBaseUrlChanged,
+      API是否使用默认地址: this.apiBaseUrl === tmdbDefaultApiBaseUrl,
+      图片是否使用默认地址: this.imageBaseUrl === tmdbDefaultImageBaseUrl,
+    });
   }
 
   /** 返回不含 Key 内容的运行状态。 */
@@ -218,6 +262,8 @@ export class TmdbKeyPool {
       coolingCount: cooling,
       disabledCount: this.states.filter((state) => state.disabled).length,
       effectiveConcurrency: Math.min(this.maxConcurrency, healthy * this.perKeyConcurrency),
+      apiBaseUrl: this.apiBaseUrl,
+      imageBaseUrl: this.imageBaseUrl,
       revision: this.revision,
     };
   }
@@ -346,9 +392,10 @@ export class TmdbKeyPool {
       );
     }
     // 关键变量：只有第一次 TMDB 搜索确实没有候选时才延迟请求 AI，仍保持最多两次 TMDB 搜索。
-    const aiSecondTitle = query.resolveSecondSearchTitle
-      ? String(await query.resolveSecondSearchTitle()).trim()
-      : "";
+    const aiSecondSuggestion = query.resolveSecondSearchSuggestion
+      ? await query.resolveSecondSearchSuggestion()
+      : null;
+    const aiSecondTitle = String(aiSecondSuggestion?.title ?? "").trim();
     // 关键变量：文件名回退优先于普通简化标题，并与主查询去重。
     const fileFallbackTitle = String(query.fallbackTitle ?? "").trim();
     const simplifiedTitle = FlymbyVideoTitleCleaner.buildAlternateTmdbSearchQuery(primaryTitle);
@@ -356,10 +403,26 @@ export class TmdbKeyPool {
       ? this.buildFirstSeriesTitleFallback(primaryTitle)
       : "";
     const normalizedPrimaryTitle = FlymbyVideoTitleCleaner.normalizeSearchText(primaryTitle);
+    const aiMediaTypeChanged = Boolean(aiSecondSuggestion && aiSecondSuggestion.mediaType !== query.mediaType);
     const validAiSecondTitle = FlymbyVideoTitleCleaner.normalizeSearchText(aiSecondTitle) === normalizedPrimaryTitle
+      && !aiMediaTypeChanged
       ? ""
       : aiSecondTitle;
     const alternateTitle = validAiSecondTitle || fileFallbackTitle || simplifiedTitle || firstSeriesFallback;
+    // 关键变量：只有实际采用 AI 第二查询词时才切换类型，普通文件名回退仍使用原规则类型。
+    const alternateMediaType = validAiSecondTitle && aiSecondSuggestion
+      ? aiSecondSuggestion.mediaType
+      : query.mediaType;
+    if (validAiSecondTitle && alternateMediaType !== query.mediaType) {
+      this.diagnosticLogger({
+        日志关键字: "codex-flycloud-helper-ai-clean",
+        事件: "TMDB第二次查询采用AI纠正类型",
+        原媒体类型: query.mediaType,
+        AI媒体类型: alternateMediaType,
+        原查询标题: primaryTitle,
+        AI查询标题: validAiSecondTitle,
+      });
+    }
     const attempts: Array<{ title: string; year: number | null }> = [];
     // 关键变量：第二次查询同时放宽标题和年份，保持每个任务最多两次 TMDB 搜索。
     const relaxedTitle = alternateTitle || (query.year !== null ? primaryTitle : "");
@@ -367,7 +430,7 @@ export class TmdbKeyPool {
     for (let attemptIndex = 0; attemptIndex < attempts.length; attemptIndex += 1) {
       const attempt = attempts[attemptIndex]!;
       const candidates = await this.searchCandidates(
-        query.mediaType,
+        alternateMediaType,
         attempt.title,
         attempt.year,
         query.language,
@@ -375,12 +438,12 @@ export class TmdbKeyPool {
         query.signal,
       );
       if (candidates.length === 0) continue;
-      const candidate = this.pickCandidate(query.mediaType, candidates, attempt.title, attempt.year);
+      const candidate = this.pickCandidate(alternateMediaType, candidates, attempt.title, attempt.year);
       if (query.includeDetails === false) {
-        return this.mapSearchCandidateMetadata(query.mediaType, candidate, attempt.title, candidates.length);
+        return this.mapSearchCandidateMetadata(alternateMediaType, candidate, attempt.title, candidates.length);
       }
       return this.readDetails(
-        query.mediaType,
+        alternateMediaType,
         candidate.id,
         attempt.title,
         candidates.length,
@@ -430,8 +493,8 @@ export class TmdbKeyPool {
       overview: candidate.overview,
       year: extractDateYear(candidate.date),
       releaseDate: candidate.date,
-      posterUrl: buildImageUrl(candidate.posterPath, "w500"),
-      backdropUrl: buildImageUrl(candidate.backdropPath, "w1280"),
+      posterUrl: buildImageUrl(candidate.posterPath, "w500", this.imageBaseUrl),
+      backdropUrl: buildImageUrl(candidate.backdropPath, "w1280", this.imageBaseUrl),
       rating: candidate.voteAverage,
       popularity: candidate.popularity,
     }));
@@ -487,7 +550,7 @@ export class TmdbKeyPool {
         overview: toText(item.overview),
         airDate: toText(item.air_date),
         rating: toNumber(item.vote_average),
-        stillUrl: buildImageUrl(toText(item.still_path), "w780"),
+        stillUrl: buildImageUrl(toText(item.still_path), "w780", this.imageBaseUrl),
         durationMs: runtime * 60_000,
       }];
     });
@@ -544,7 +607,10 @@ export class TmdbKeyPool {
 
   /** 对结构化参数计算 SHA-256，数据库不保存原始查询标题。 */
   private createMetadataCacheKey(parts: Array<string | number | null>): string {
-    return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+    // 关键变量：图片基础地址参与缓存键，切换代理后不会继续返回旧图片域名组成的缓存结果。
+    return createHash("sha256")
+      .update(JSON.stringify([this.apiBaseUrl, this.imageBaseUrl, ...parts]))
+      .digest("hex");
   }
 
   /** 只统一 Unicode、大小写和连续空白，避免过度清洗让不同查询误用同一缓存。 */
@@ -787,10 +853,10 @@ export class TmdbKeyPool {
         : detailOriginCountries.length > 0
           ? detailOriginCountries
           : fallbackCandidate?.originCountries ?? [],
-      posterUrl: buildImageUrl(posterPath, "w500"),
-      backdropUrl: buildImageUrl(backdropPath, "w1280"),
+      posterUrl: buildImageUrl(posterPath, "w500", this.imageBaseUrl),
+      backdropUrl: buildImageUrl(backdropPath, "w1280", this.imageBaseUrl),
       episodeCount: isMovie ? 0 : toPositiveNumber(details.number_of_episodes),
-      people: readPeople(isMovie ? details.credits : details.aggregate_credits),
+      people: readPeople(isMovie ? details.credits : details.aggregate_credits, this.imageBaseUrl),
       matchedQuery,
       candidateCount,
       detailsSynchronized: Boolean(payload),
@@ -815,8 +881,8 @@ export class TmdbKeyPool {
       rating: candidate.voteAverage,
       genres: readGenres(undefined, candidate.genreIds, mediaType),
       originCountries: mediaType === "tv" ? candidate.originCountries : [],
-      posterUrl: buildImageUrl(candidate.posterPath, "w500"),
-      backdropUrl: buildImageUrl(candidate.backdropPath, "w1280"),
+      posterUrl: buildImageUrl(candidate.posterPath, "w500", this.imageBaseUrl),
+      backdropUrl: buildImageUrl(candidate.backdropPath, "w1280", this.imageBaseUrl),
       episodeCount: 0,
       people: [],
       matchedQuery,
@@ -854,7 +920,7 @@ export class TmdbKeyPool {
       attemptedKeys.add(state.key);
       const requestSignal = createTimedRequestSignal(signal, TMDB_REQUEST_TIMEOUT_MS);
       try {
-        const url = new URL(`https://api.themoviedb.org/3${pathname}`);
+        const url = new URL(`${this.apiBaseUrl}${pathname}`);
         Object.entries(params).forEach(([key, value]) => {
           if (value) url.searchParams.set(key, value);
         });
@@ -945,8 +1011,11 @@ export class TmdbKeyPool {
   }
 
   /** 根据 Key 顺序生成只供任务快照比对的池修订。 */
-  private createRevision(keys: string[]): string {
-    return createHash("sha256").update(keys.join("\u0000")).digest("hex").slice(0, 16);
+  private createRevision(keys: string[], apiBaseUrl: string, imageBaseUrl: string): string {
+    return createHash("sha256")
+      .update([apiBaseUrl, imageBaseUrl, ...keys].join("\u0000"))
+      .digest("hex")
+      .slice(0, 16);
   }
 
   /** 记录单 Key 临时退出调度池的原因，不输出 Key 原文。 */
@@ -1051,8 +1120,8 @@ function readCountryCodes(value: unknown): string[] {
 }
 
 /** 将 TMDB 图片路径转换为公开图片地址。 */
-function buildImageUrl(filePath: string, size: string): string | null {
-  return filePath ? `https://image.tmdb.org/t/p/${size}${filePath}` : null;
+function buildImageUrl(filePath: string, size: string, imageBaseUrl: string): string | null {
+  return filePath ? `${imageBaseUrl}/${size}${filePath}` : null;
 }
 
 /** 从 TMDB 日期读取年份。 */
@@ -1071,7 +1140,7 @@ function readGenres(value: unknown, fallbackIds: number[], mediaType: "movie" | 
 }
 
 /** 读取电影 credits 或节目 aggregate_credits 中的主要演职人员。 */
-function readPeople(value: unknown): TmdbPersonMetadata[] {
+function readPeople(value: unknown, imageBaseUrl: string): TmdbPersonMetadata[] {
   const credits = asRecord(value);
   const people: TmdbPersonMetadata[] = [];
   const cast = Array.isArray(credits.cast) ? credits.cast.slice(0, 16) : [];
@@ -1084,7 +1153,7 @@ function readPeople(value: unknown): TmdbPersonMetadata[] {
       name: toText(item.name),
       role: toText(item.character) || toText(firstRole.character),
       type: "cast",
-      profileUrl: buildImageUrl(toText(item.profile_path), "w185"),
+      profileUrl: buildImageUrl(toText(item.profile_path), "w185", imageBaseUrl),
       order: toNonNegativeNumber(item.order, index),
     });
   });
@@ -1098,7 +1167,7 @@ function readPeople(value: unknown): TmdbPersonMetadata[] {
         name: toText(item.name),
         role: toText(item.job),
         type: "crew",
-        profileUrl: buildImageUrl(toText(item.profile_path), "w185"),
+        profileUrl: buildImageUrl(toText(item.profile_path), "w185", imageBaseUrl),
         order: 100 + index,
       });
     });

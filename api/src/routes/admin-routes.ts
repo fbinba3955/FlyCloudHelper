@@ -20,7 +20,13 @@ import {
 } from "../media/manual-video-match.js";
 import { hydrateRealtimeVideoDetails } from "../media/realtime-video-details.js";
 import type { ApiRuntime } from "../runtime.js";
-import { tmdbKeySettingName, validateTmdbKeyList } from "../system-settings.js";
+import {
+  loadTmdbBaseUrls,
+  saveTmdbBaseUrls,
+  tmdbBaseUrlSettingName,
+  tmdbKeySettingName,
+  validateTmdbKeyList,
+} from "../system-settings.js";
 import { streamJobEvents } from "./event-stream.js";
 import {
   consumeProviderAuthorization,
@@ -80,11 +86,16 @@ async function removeUserOwnedDirectory(rootDirectory: string, userId: string): 
 
 /** 返回不含 Key 原文或局部值的 TMDB 系统配置状态。 */
 async function getTmdbConfigurationStatus(runtime: ApiRuntime) {
-  const setting = await runtime.database.getSystemSecretSetting(tmdbKeySettingName);
+  const [setting, baseUrlSettings] = await Promise.all([
+    runtime.database.getSystemSecretSetting(tmdbKeySettingName),
+    loadTmdbBaseUrls(runtime.database),
+  ]);
   const status = runtime.tmdb.getStatus();
   return {
     source: status.configuredCount > 0 ? "system" : "missing",
     configurationRevision: setting?.revision ?? 0,
+    baseUrlSource: baseUrlSettings.source,
+    baseUrlConfigurationRevision: baseUrlSettings.configurationRevision,
     ...status,
   };
 }
@@ -167,6 +178,29 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     await audit(runtime, operator, "update_tmdb_keys", "system_configuration", tmdbKeySettingName, {
       配置修订: configurationRevision,
       Key数量: keys.length,
+    });
+    return { tmdb: await getTmdbConfigurationStatus(runtime) };
+  });
+
+  /** 保存 TMDB API 与图片代理地址，并即时更新当前进程中的后续请求。 */
+  server.put<{ Body: Record<string, unknown> }>("/api/v1/admin/config/tmdb-base-urls", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const settings = await saveTmdbBaseUrls(runtime.database, {
+      apiBaseUrl: request.body.apiBaseUrl,
+      imageBaseUrl: request.body.imageBaseUrl,
+      updatedByUserId: operator.id,
+    });
+    runtime.tmdb.replaceBaseUrls(settings);
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-tmdb-proxy",
+      事件: settings.source === "default" ? "恢复TMDB默认地址" : "更新TMDB代理地址",
+      用户ID: operator.id,
+      配置来源: settings.source === "database" ? "系统设置" : "默认地址",
+      配置修订: settings.configurationRevision,
+    });
+    await audit(runtime, operator, "update_tmdb_base_urls", "system_configuration", tmdbBaseUrlSettingName, {
+      配置来源: settings.source === "database" ? "系统设置" : "默认地址",
+      配置修订: settings.configurationRevision,
     });
     return { tmdb: await getTmdbConfigurationStatus(runtime) };
   });
@@ -1147,6 +1181,13 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       throw new ApiError(409, "job_not_retryable", "只有失败或已取消任务可以重试");
     }
     const service = await runtime.repository.getServiceDetail(sourceJob.serviceId, sourceJob.userId);
+    const retriesAiSupplement = sourceJob.snapshot.taskPurpose === "ai_supplement_unmatched";
+    const aiModelSnapshot = retriesAiSupplement
+      ? await runtime.aiModels.buildUnmatchedSupplementTaskSnapshot(service.metadataProfile)
+      : await runtime.aiModels.buildTaskSnapshot(service.metadataProfile);
+    if (retriesAiSupplement && !aiModelSnapshot) {
+      throw new ApiError(409, "ai_cleaning_not_enabled", "请先在服务元数据配置中启用 AI 目录文件清洗");
+    }
     const job = await runtime.repository.createScanJob({
       jobId: randomUUID(),
       userId: sourceJob.userId,
@@ -1157,13 +1198,14 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       scanMode: sourceJob.scanMode,
       runtimeRevision: "scanner-worker-v1",
       tmdbKeyPoolRevision: runtime.tmdb.revision,
-      aiModel: await runtime.aiModels.buildTaskSnapshot(service.metadataProfile),
+      aiModel: aiModelSnapshot,
+      taskPurpose: retriesAiSupplement ? "ai_supplement_unmatched" : "standard",
       retryOfJobId: sourceJob.id,
       pluginVersions: await runtime.plugins.buildTaskSnapshots(service.metadataProfile),
     });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-retry",
-      事件: "管理员重试扫描任务",
+      事件: retriesAiSupplement ? "管理员重试AI补充未匹配任务" : "管理员重试扫描任务",
       管理员ID: operator.id,
       原任务ID: sourceJob.id,
       新任务ID: job.id,

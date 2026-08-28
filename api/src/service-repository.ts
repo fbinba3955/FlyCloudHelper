@@ -437,7 +437,7 @@ function mapScanJobCheckpoint(row: Record<string, unknown>): ScanJobCheckpointRe
 // 关键变量：每条目录变化包含 7 个绑定值，400 条可兼容 SQLite、PostgreSQL 和 MySQL 的参数上限。
 const CATALOG_CHANGE_INSERT_BATCH_SIZE = 400;
 
-interface CatalogPathRow {
+export interface CatalogPathRow {
   fileId: string;
   resourceId: string;
   linkedItemId: string;
@@ -959,6 +959,23 @@ export class ServiceRepository {
     };
   }
 
+  /** 只读取 AI 补充任务冻结的元数据配置，不读取 Provider 凭据和扫描配置。 */
+  public async getJobMetadataConfiguration(job: ScanJobRecord): Promise<Record<string, unknown>> {
+    const metadataProfileRevision = Number(job.snapshot.metadataProfileRevision);
+    const [service, metadataProfile] = await Promise.all([
+      this.database.query("cloud_services").where({ id: job.serviceId, user_id: job.userId }).whereNull("deleted_at").first(),
+      this.database.query("service_metadata_profiles").where({
+        service_id: job.serviceId,
+        user_id: job.userId,
+        revision: metadataProfileRevision,
+      }).first(),
+    ]);
+    if (!service || !metadataProfile) {
+      throw new ApiError(410, "job_metadata_configuration_unavailable", "任务冻结的元数据配置已经不可用");
+    }
+    return parseJsonObject(metadataProfile.configuration_json);
+  }
+
   /** 读取服务当前活动凭据密文，供扫描根更新前执行真实访问校验。 */
   public async getActiveEncryptedConnection(serviceId: string, userId: string): Promise<string> {
     const service = await this.database.query("cloud_services")
@@ -1250,6 +1267,7 @@ export class ServiceRepository {
     runtimeRevision: string;
     tmdbKeyPoolRevision: string;
     aiModel: AiModelTaskSnapshot | null;
+    taskPurpose?: "standard" | "ai_supplement_unmatched";
     retryOfJobId?: string;
     pluginVersions: Array<{
       pluginId: string;
@@ -1295,6 +1313,7 @@ export class ServiceRepository {
           runtimeRevision: input.runtimeRevision,
           tmdbKeyPoolRevision: input.tmdbKeyPoolRevision,
           aiModel: input.aiModel,
+          taskPurpose: input.taskPurpose ?? "standard",
           retryOfJobId: input.retryOfJobId ?? null,
           pluginVersions: input.pluginVersions,
         };
@@ -1906,7 +1925,10 @@ export class ServiceRepository {
         connection_status: input.errorCode === "provider_authentication_failed" ? "reauthorization_required" : "valid",
         updated_at: now,
       };
-      if (input.status === "completed") servicePatch.last_scan_at = now;
+      // AI 补充只处理数据库现有未匹配内容，完成时不能伪造一次网盘扫描时间。
+      if (input.status === "completed" && current.snapshot.taskPurpose !== "ai_supplement_unmatched") {
+        servicePatch.last_scan_at = now;
+      }
       await transaction("cloud_services").where({ id: current.serviceId }).update(servicePatch);
       if (input.status === "completed" || input.status === "cancelled") {
         await transaction("scan_job_checkpoints").where({ job_id: current.id }).delete();
@@ -2539,6 +2561,52 @@ export class ServiceRepository {
     // 关键变量：同一目录偶尔可能返回重复资源，只允许一条记录参与批量 Upsert。
     const uniqueInputs = [...new Map(inputs.map((input) => [input.providerResourceId, input])).values()];
     return this.database.query.transaction(async (transaction) => {
+      // 同一路径只出现一个当前资源时，资源 ID 变化表示文件被替换；路径相同的旧资源不能继续参与播放。
+      const currentResourceIdsByPath = new Map<string, Set<string>>();
+      for (const input of uniqueInputs) {
+        const resourceIds = currentResourceIdsByPath.get(input.path) ?? new Set<string>();
+        resourceIds.add(input.providerResourceId);
+        currentResourceIdsByPath.set(input.path, resourceIds);
+      }
+      const replacementPathSet = new Set<string>();
+      const replacedSamePathSourceIds: string[] = [];
+      const candidateReplacementPaths = [...currentResourceIdsByPath]
+        .filter(([, resourceIds]) => resourceIds.size === 1)
+        .map(([filePath]) => filePath);
+      for (const pathBatch of chunkStrings(candidateReplacementPaths, 200)) {
+        const samePathRows = await transaction("source_files")
+          .select("id", "path", "provider_resource_id")
+          .where({
+            user_id: firstInput.userId,
+            service_id: firstInput.serviceId,
+            library_id: firstInput.libraryId,
+            status: "active",
+          })
+          .whereIn("path", pathBatch);
+        for (const row of samePathRows) {
+          const currentResourceIds = currentResourceIdsByPath.get(String(row.path));
+          if (!currentResourceIds || currentResourceIds.has(String(row.provider_resource_id))) continue;
+          replacementPathSet.add(String(row.path));
+          replacedSamePathSourceIds.push(String(row.id));
+        }
+      }
+      for (const sourceFileIdBatch of chunkStrings([...new Set(replacedSamePathSourceIds)], 200)) {
+        await transaction("source_files").whereIn("id", sourceFileIdBatch).update({
+          status: "missing",
+          updated_at: new Date().toISOString(),
+        });
+      }
+      if (replacedSamePathSourceIds.length > 0) {
+        this.logger?.("warn", {
+          日志关键字: "codex-flycloud-source-replacement",
+          事件: "扫描准备阶段停用同路径旧源文件",
+          用户ID: firstInput.userId,
+          媒体库ID: firstInput.libraryId,
+          替换路径数量: replacementPathSet.size,
+          被替换源文件数量: new Set(replacedSamePathSourceIds).size,
+        });
+      }
+
       const existingRows: Record<string, unknown>[] = [];
       for (const resourceIdBatch of chunkStrings(uniqueInputs.map((input) => input.providerResourceId), 200)) {
         const rows = await transaction("source_files")
@@ -2605,6 +2673,7 @@ export class ServiceRepository {
           || storedRecognitionRevision === input.recognitionRevision;
         reusableByResourceId.set(input.providerResourceId, Boolean(existing)
           && fingerprintUnchangedByResourceId.get(input.providerResourceId) === true
+          && !replacementPathSet.has(input.path)
           && revisionMatches
           && recognitionRevisionMatches
           && reusableItemIdBySourceFileId.has(String(existing!.id)));
@@ -3312,7 +3381,7 @@ export class ServiceRepository {
 
   /**
    * 关联媒体条目与源文件定位。
-   * 返回被当前归属替换的旧条目 ID；同一个媒体库内一个源文件始终只能归属一个条目。
+   * 返回发生文件归属或同路径替换的条目 ID；同一个媒体库内一个源文件始终只能归属一个条目。
    */
   public async linkItemFile(input: {
     userId: string;
@@ -3349,6 +3418,46 @@ export class ServiceRepository {
         if (episodeLink) targetItemId = String(episodeLink.child_item_id);
       }
 
+      const currentSourceRow = await transaction("source_files")
+        .select("path")
+        .where({
+          id: input.sourceFileId,
+          user_id: input.userId,
+          library_id: input.libraryId,
+        })
+        .first();
+      // 同一条目下路径相同但资源 ID 不同，表示网盘文件被替换；其他路径仍是独立媒体版本。
+      const replacedSamePathRows = currentSourceRow
+        ? await transaction("file_links as fl")
+          .join("source_files as f", "f.id", "fl.source_file_id")
+          .select("fl.id as file_link_id", "fl.source_file_id")
+          .where({
+            "fl.user_id": input.userId,
+            "fl.library_id": input.libraryId,
+            "fl.item_id": targetItemId,
+            "f.path": String(currentSourceRow.path),
+          })
+          .whereNot("fl.source_file_id", input.sourceFileId)
+        : [];
+      if (replacedSamePathRows.length > 0) {
+        const replacedLinkIds = replacedSamePathRows.map((row) => String(row.file_link_id));
+        const replacedSourceFileIds = replacedSamePathRows.map((row) => String(row.source_file_id));
+        await transaction("file_links").whereIn("id", replacedLinkIds).delete();
+        await transaction("source_files").whereIn("id", replacedSourceFileIds).update({
+          status: "missing",
+          updated_at: new Date().toISOString(),
+        });
+        this.logger?.("warn", {
+          日志关键字: "codex-flycloud-source-replacement",
+          事件: "扫描发现同路径新文件并停用旧源文件",
+          用户ID: input.userId,
+          媒体库ID: input.libraryId,
+          媒体条目ID: targetItemId,
+          新源文件ID: input.sourceFileId,
+          被替换源文件数量: replacedSourceFileIds.length,
+        });
+      }
+
       // 关键变量：旧条目 ID 用于扫描收尾清理空条目并推进 APP 可见的目录版本。
       const previousRows = await transaction("file_links")
         .distinct("item_id")
@@ -3377,7 +3486,10 @@ export class ServiceRepository {
         })
         .onConflict(["user_id", "item_id", "source_file_id"])
         .merge({ locator_json: JSON.stringify(input.locator) });
-      return previousItemIds;
+      return [...new Set([
+        ...previousItemIds,
+        ...(replacedSamePathRows.length > 0 ? [targetItemId] : []),
+      ])];
     });
   }
 
@@ -3448,7 +3560,7 @@ export class ServiceRepository {
     return [];
   }
 
-  /** 在成功 generation 后执行删除保护对账并推进目录版本。 */
+  /** 在成功 generation 后执行扫描结果对账并推进目录版本。 */
   public async finalizeGeneration(input: {
     userId: string;
     serviceId: string;
@@ -3460,10 +3572,17 @@ export class ServiceRepository {
     /** 枚举不完整时为 false，禁止执行任何可能删除已有目录内容的清理。 */
     allowDestructiveCleanup: boolean;
     changedItemIds: string[];
-  }): Promise<{ catalogVersion: number; deletedOrphanLeafCount: number; deletedOrphanParentCount: number }> {
+  }): Promise<{
+    catalogVersion: number;
+    missingSourceCount: number;
+    updatedMissingItemCount: number;
+    deletedMissingItemCount: number;
+    deletedOrphanLeafCount: number;
+    deletedOrphanParentCount: number;
+  }> {
     return this.database.query.transaction(async (transaction) => {
       const now = new Date().toISOString();
-      const missingGenerationItemIds = input.deleteMissing
+      const missingGenerationResult = input.deleteMissing
         ? await this.cleanupCompletedRootMissingFiles(
           transaction,
           input.userId,
@@ -3471,7 +3590,7 @@ export class ServiceRepository {
           input.completedRootGenerations,
           now,
         )
-        : [];
+        : { missingSourceCount: 0, affectedItemIds: [], deletedItemIds: [] };
       // Flymby APP 在任一目录枚举失败后跳过本轮过期清理，避免把未访问目录中的旧数据误删。
       const excludedItemIds = input.allowDestructiveCleanup
         ? await this.cleanupExcludedCatalogPaths(transaction, input.userId, input.libraryId, now)
@@ -3490,12 +3609,16 @@ export class ServiceRepository {
       if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
       const previousCatalogVersion = Number(library.catalog_version);
       const deletedItemIds = new Set([
-        ...missingGenerationItemIds,
+        ...missingGenerationResult.deletedItemIds,
         ...excludedItemIds,
         ...orphanLeafIds,
         ...orphanParentIds,
       ]);
-      const changedItemIds = [...new Set(input.changedItemIds)].filter((itemId) => !deletedItemIds.has(itemId));
+      // 缺失的只是某个播放版本时条目仍然存在，也必须写入 upsert，让 APP 重新同步剩余版本。
+      const changedItemIds = [...new Set([
+        ...input.changedItemIds,
+        ...missingGenerationResult.affectedItemIds,
+      ])].filter((itemId) => !deletedItemIds.has(itemId));
       const changes = [
         ...changedItemIds.map((entityId) => ({ entityId, changeType: "upsert" })),
         ...[...deletedItemIds].map((entityId) => ({ entityId, changeType: "delete" })),
@@ -3520,6 +3643,10 @@ export class ServiceRepository {
       await transaction("cloud_services").where({ id: input.serviceId }).update({ last_scan_at: now, updated_at: now });
       return {
         catalogVersion,
+        missingSourceCount: missingGenerationResult.missingSourceCount,
+        updatedMissingItemCount: missingGenerationResult.affectedItemIds.length
+          - missingGenerationResult.deletedItemIds.length,
+        deletedMissingItemCount: missingGenerationResult.deletedItemIds.length,
         deletedOrphanLeafCount: orphanLeafIds.length,
         deletedOrphanParentCount: orphanParentIds.length,
       };
@@ -3533,7 +3660,7 @@ export class ServiceRepository {
     libraryId: string,
     completedRoots: Array<{ rootKey: string; generationId: string }>,
     now: string,
-  ): Promise<string[]> {
+  ): Promise<{ missingSourceCount: number; affectedItemIds: string[]; deletedItemIds: string[] }> {
     const missingSourceIds: string[] = [];
     for (const root of completedRoots) {
       const rows = await transaction("source_files")
@@ -3547,7 +3674,9 @@ export class ServiceRepository {
         .whereNot({ generation_id: root.generationId });
       missingSourceIds.push(...rows.map((row) => String(row.id)));
     }
-    if (missingSourceIds.length === 0) return [];
+    if (missingSourceIds.length === 0) {
+      return { missingSourceCount: 0, affectedItemIds: [], deletedItemIds: [] };
+    }
 
     const linkedItemIds: string[] = [];
     for (const sourceIdChunk of chunkStrings([...new Set(missingSourceIds)])) {
@@ -3558,7 +3687,13 @@ export class ServiceRepository {
       await transaction("source_files").whereIn("id", sourceIdChunk).update({ status: "missing", updated_at: now });
     }
     const candidateItemIds = [...new Set(linkedItemIds)];
-    if (candidateItemIds.length === 0) return [];
+    if (candidateItemIds.length === 0) {
+      return {
+        missingSourceCount: new Set(missingSourceIds).size,
+        affectedItemIds: [],
+        deletedItemIds: [],
+      };
+    }
 
     const activeItemIds = new Set<string>();
     for (const itemIdChunk of chunkStrings(candidateItemIds)) {
@@ -3576,7 +3711,11 @@ export class ServiceRepository {
         .whereNull("deleted_at")
         .update({ deleted_at: now, updated_at: now });
     }
-    return deletedItemIds;
+    return {
+      missingSourceCount: new Set(missingSourceIds).size,
+      affectedItemIds: candidateItemIds,
+      deletedItemIds,
+    };
   }
 
   /** 把 APP 默认排除目录中的旧扫描文件标记缺失，并软删除已经没有活动文件的媒体条目。 */
@@ -4005,6 +4144,87 @@ export class ServiceRepository {
     return [...uniqueRows.values()];
   }
 
+  /** 批量读取多个顶层电影或节目及其直接子项的活动源文件，避免 AI 补充逐条查询数据库。 */
+  public async listAiSupplementCatalogPaths(
+    itemIds: string[],
+    userId: string,
+  ): Promise<Map<string, CatalogPathRow[]>> {
+    const uniqueItemIds = [...new Set(itemIds.filter(Boolean))];
+    const emptyResult = new Map(uniqueItemIds.map((itemId) => [itemId, [] as CatalogPathRow[]]));
+    if (uniqueItemIds.length === 0) return emptyResult;
+
+    const relationRows: Array<{ parent_item_id: string; child_item_id: string }> = [];
+    for (const itemIdChunk of chunkStrings(uniqueItemIds)) {
+      const rows = await this.database.query("media_relations")
+        .select("parent_item_id", "child_item_id")
+        .where({ user_id: userId })
+        .whereIn("parent_item_id", itemIdChunk);
+      relationRows.push(...rows.map((row) => ({
+        parent_item_id: String(row.parent_item_id),
+        child_item_id: String(row.child_item_id),
+      })));
+    }
+
+    // 关键变量：电影源文件直接挂在顶层条目，节目源文件通常挂在其直接单集子项。
+    const parentItemIdByLinkedItemId = new Map<string, string>(uniqueItemIds.map((itemId) => [itemId, itemId]));
+    for (const relation of relationRows) {
+      parentItemIdByLinkedItemId.set(relation.child_item_id, relation.parent_item_id);
+    }
+    const linkedItemIds = [...parentItemIdByLinkedItemId.keys()];
+    const linkedRows: LinkedSourceRow[] = [];
+    for (const linkedItemIdChunk of chunkStrings(linkedItemIds)) {
+      const rows = await this.database.query("file_links as fl")
+        .join("source_files as f", "f.id", "fl.source_file_id")
+        .join("media_items as linked", "linked.id", "fl.item_id")
+        .select(
+          "fl.id as file_link_id",
+          "fl.item_id as linked_item_id",
+          "fl.source_file_id",
+          "fl.locator_json",
+          "f.locator_json as source_locator_json",
+          "f.provider_resource_id",
+          "f.path",
+          "f.name",
+          "f.size",
+          "f.modified_at",
+          "p.status as media_probe_status",
+          "p.result_json as media_probe_result_json",
+          "linked.title as linked_item_title",
+        )
+        .leftJoin("media_file_probes as p", "p.source_file_id", "f.id")
+        .where("fl.user_id", userId)
+        .whereIn("fl.item_id", linkedItemIdChunk)
+        .where("f.status", "active")
+        .orderBy("f.path", "asc");
+      linkedRows.push(...rows as LinkedSourceRow[]);
+    }
+
+    const uniqueRowsByParentItemId = new Map<string, Map<string, CatalogPathRow>>();
+    for (const row of linkedRows) {
+      const parentItemId = parentItemIdByLinkedItemId.get(String(row.linked_item_id));
+      if (!parentItemId) continue;
+      const uniqueRows = uniqueRowsByParentItemId.get(parentItemId) ?? new Map<string, CatalogPathRow>();
+      if (!uniqueRows.has(String(row.source_file_id))) {
+        uniqueRows.set(String(row.source_file_id), {
+          fileId: String(row.source_file_id),
+          resourceId: String(row.provider_resource_id),
+          linkedItemId: String(row.linked_item_id),
+          linkedItemTitle: String(row.linked_item_title ?? ""),
+          path: String(row.path),
+          name: String(row.name),
+          size: Number(row.size ?? 0),
+          modifiedAt: row.modified_at ? String(row.modified_at) : null,
+          mediaProbe: parseMediaProbeResult(row.media_probe_result_json),
+        });
+      }
+      uniqueRowsByParentItemId.set(parentItemId, uniqueRows);
+    }
+    for (const itemId of uniqueItemIds) {
+      emptyResult.set(itemId, [...(uniqueRowsByParentItemId.get(itemId)?.values() ?? [])]);
+    }
+    return emptyResult;
+  }
+
   /** 将打开详情时实时读取的 TMDB 完整信息合并回顶层电影或节目。 */
   public async applyRealtimeVideoDetails(input: {
     itemId: string;
@@ -4055,6 +4275,86 @@ export class ServiceRepository {
       await this.recordCatalogItemChanges(transaction, input.userId, String(row.library_id), [input.itemId], now);
     });
     return this.getCatalogItem(input.itemId, input.userId);
+  }
+
+  /** 将 AI 补充取得的元数据写回未匹配顶层条目，并按最终类型重建电影或节目结构。 */
+  public async applyAiSupplementVideoMatch(input: {
+    itemId: string;
+    userId: string;
+    mediaType: "movie" | "tv";
+    title: string;
+    subtitle: string;
+    year: number | null;
+    overview: string;
+    posterUrl: string | null;
+    backdropUrl: string | null;
+    externalIds: Record<string, string>;
+    metadata: Record<string, unknown>;
+  }): Promise<boolean> {
+    return this.database.query.transaction(async (transaction) => {
+      const row = await transaction("media_items")
+        .where({ id: input.itemId, user_id: input.userId })
+        .whereNull("deleted_at")
+        .first();
+      if (!row) throw new ApiError(404, "media_item_not_found", "媒体条目不存在");
+      // 关键变量：任务运行期间如果条目已被其他操作匹配，不允许 AI 补充覆盖较新的结果。
+      if (String(row.match_state) === "matched") return false;
+      const sourceRows = await this.readLinkedSourceRows(transaction, input.itemId, input.userId);
+      // 关键变量：最终类型以元数据匹配结果为准，用于真正纠正规则误判的电影或节目结构。
+      const nextItemType = input.mediaType === "tv" ? "video.series" : "video.movie";
+      const now = new Date().toISOString();
+      const changedItemIds = await this.rebuildManualVideoStructure(
+        transaction,
+        row,
+        nextItemType,
+        sourceRows,
+        null,
+        input.title,
+        now,
+      );
+      const currentMetadata = parseJsonObject(row.metadata_json);
+      const currentExternalIds = parseJsonObject(row.external_ids_json);
+      const nextMetadata = {
+        ...currentMetadata,
+        ...input.metadata,
+        aiSupplementedAt: now,
+        aiSupplementedOriginalItemType: String(row.item_type),
+        aiSupplementedMediaType: input.mediaType,
+      };
+      await transaction("media_items").where({ id: input.itemId, user_id: input.userId }).update({
+        item_type: nextItemType,
+        title: input.title,
+        sort_title: input.title,
+        subtitle: input.subtitle,
+        year: input.year,
+        premiere_date: readMediaPremiereDate(nextMetadata) ?? row.premiere_date ?? null,
+        overview: input.overview,
+        poster_url: input.posterUrl,
+        backdrop_url: input.backdropUrl,
+        match_state: "matched",
+        external_ids_json: JSON.stringify({ ...currentExternalIds, ...input.externalIds }),
+        metadata_json: JSON.stringify(nextMetadata),
+        region_group: readVideoRegionGroup(nextItemType, nextMetadata),
+        updated_at: now,
+      });
+      await this.recordCatalogItemChanges(
+        transaction,
+        input.userId,
+        String(row.library_id),
+        [input.itemId, ...changedItemIds],
+        now,
+      );
+      this.logger?.("info", {
+        日志关键字: "codex-flycloud-helper-ai-clean",
+        事件: "AI补充影视类型结构写入完成",
+        媒体条目ID: input.itemId,
+        原条目类型: String(row.item_type),
+        最终条目类型: nextItemType,
+        是否纠正媒体类型: String(row.item_type) !== nextItemType,
+        关联结构变更数量: changedItemIds.length,
+      });
+      return true;
+    });
   }
 
   /** 将 Jellyfin 协议实时读取的 TMDB 单集信息合并回单集目录记录。 */

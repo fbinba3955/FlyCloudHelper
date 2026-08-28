@@ -175,7 +175,11 @@ export class AliyunDriveProvider implements ProviderAdapter {
   ): AsyncGenerator<ProviderEntry> {
     const defaultDriveId = await this.resolveDefaultDriveId(connection, signal, options?.persistConnection);
     const selectedRoots = roots.length > 0 ? roots : [{ resourceId: "root", driveId: defaultDriveId }];
-    for (const root of selectedRoots) {
+    for (let rootIndex = 0; rootIndex < selectedRoots.length; rootIndex += 1) {
+      const root = selectedRoots[rootIndex];
+      if (!root) continue;
+      // 根目录只有完整枚举后才允许扫描收尾清理旧文件；中止或异常不会提交完成状态。
+      await options?.onRootStart?.({ rootIndex, root, warningCount: 0 });
       const driveId = root.driveId || defaultDriveId;
       const queue: Array<{ id: string; path: string }> = [{
         id: root.resourceId || "root",
@@ -224,6 +228,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
           }
         }
       }
+      await options?.onRootComplete?.({ rootIndex, root, warningCount: 0 });
     }
   }
 

@@ -9,6 +9,9 @@ interface AiSupplementDialogState {
   error: string | null;
   jobId: string;
   result: JobAiSupplementResult | null;
+  triggering: boolean;
+  triggerError: string | null;
+  onTrigger: () => void;
   onClose: () => void;
 }
 
@@ -35,10 +38,16 @@ export function AiSupplementDialog({ state }: { state: AiSupplementDialogState }
             <div className="flex items-center gap-2"><Sparkles className="size-5" /><h2 className="text-lg font-semibold">AI补充详情</h2></div>
             <p className="mt-1 font-mono text-[11px] text-muted-foreground">任务 {state.jobId}</p>
           </div>
-          <button type="button" aria-label="关闭AI补充详情" onClick={state.onClose} className="rounded-lg border border-border p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"><X className="size-4" /></button>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <button type="button" onClick={state.onTrigger} disabled={state.triggering} className="inline-flex items-center justify-center gap-2 rounded-lg border border-foreground/25 bg-foreground px-3.5 py-2 text-sm text-background transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-45">
+              <Sparkles className="size-4" /> {state.triggering ? "正在创建任务…" : "AI补充未识别内容"}
+            </button>
+            <button type="button" aria-label="关闭AI补充详情" onClick={state.onClose} className="rounded-lg border border-border p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"><X className="size-4" /></button>
+          </div>
         </header>
 
         <div className="overflow-y-auto p-5">
+          {state.triggerError && <p className="mb-4 rounded-xl border border-destructive/30 bg-destructive/8 p-4 text-sm text-destructive">{state.triggerError}</p>}
           <div className="rounded-xl border border-border bg-secondary/35 p-5">
             <p className="text-xs text-muted-foreground">本任务总计 AI 补充</p>
             <p className="mt-2 font-display text-3xl font-semibold">{state.loading ? "—" : (state.result?.total ?? 0).toLocaleString()} <span className="text-base font-normal text-muted-foreground">部影片或节目</span></p>

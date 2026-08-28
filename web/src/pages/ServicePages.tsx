@@ -1,5 +1,5 @@
 import { Link, useNavigate } from "@tanstack/react-router";
-import { CalendarClock, Plus, RefreshCw, ScanLine, Settings2, Trash2 } from "lucide-react";
+import { CalendarClock, Plus, RefreshCw, ScanLine, Settings2, Sparkles, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
@@ -11,6 +11,7 @@ import { Panel, StatCard, StatusPill, type StatusTone } from "@/components/ui-ki
 import {
   ApiClientError,
   backfillExistingMediaProbes,
+  createManualAiSupplementJob,
   createScanJob,
   createService,
   deleteCloudService,
@@ -633,6 +634,9 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   const deletingServiceRef = useRef(false);
   const [creatingScanMode, setCreatingScanMode] = useState<"full" | "incremental" | null>(null);
   const creatingScanModeRef = useRef<"full" | "incremental" | null>(null);
+  const [creatingAiSupplement, setCreatingAiSupplement] = useState(false);
+  // 关键变量：同步占用手动 AI 补充入口，避免与扫描按钮在状态刷新前同时创建任务。
+  const creatingAiSupplementRef = useRef(false);
   const [backfillingMediaSpecs, setBackfillingMediaSpecs] = useState(false);
   const backfillingMediaSpecsRef = useRef(false);
   const service = resource.data;
@@ -675,11 +679,11 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
 
   /** 从详情页创建用户选择的扫描任务。 */
   async function trigger(mode: "incremental" | "full"): Promise<void> {
-    if (creatingScanModeRef.current) {
+    if (creatingScanModeRef.current || creatingAiSupplementRef.current) {
       console.warn("codex-flycloud-helper-job-operation", {
         事件: "拦截重复创建扫描任务",
         服务ID: serviceId,
-        正在创建模式: creatingScanModeRef.current,
+        正在创建模式: creatingAiSupplementRef.current ? "AI补充未识别内容" : creatingScanModeRef.current,
         本次模式: mode,
       });
       return;
@@ -696,6 +700,37 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     } finally {
       creatingScanModeRef.current = null;
       setCreatingScanMode(null);
+    }
+  }
+
+  /** 从服务详情页手动创建未识别内容 AI 补充任务。 */
+  async function triggerAiSupplement(): Promise<void> {
+    if (creatingAiSupplementRef.current || creatingScanModeRef.current) {
+      console.warn("codex-flycloud-helper-ai-clean", {
+        事件: "拦截重复创建未识别内容AI补充任务",
+        服务ID: serviceId,
+        正在创建扫描模式: creatingScanModeRef.current ?? "AI补充未识别内容",
+      });
+      return;
+    }
+    creatingAiSupplementRef.current = true;
+    setCreatingAiSupplement(true);
+    setMessage("正在创建 AI 补充任务…");
+    try {
+      const job = await createManualAiSupplementJob(serviceId, admin);
+      setMessage(`AI 补充任务 ${job.id} 已进入队列，只处理媒体库现有未匹配内容，不会重新扫描网盘`);
+      await resource.refresh();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "创建 AI 补充任务失败";
+      console.warn("codex-flycloud-helper-ai-clean", {
+        事件: "服务详情创建未识别内容AI补充任务失败",
+        服务ID: serviceId,
+        错误信息: errorMessage,
+      });
+      setMessage(errorMessage);
+    } finally {
+      creatingAiSupplementRef.current = false;
+      setCreatingAiSupplement(false);
     }
   }
 
@@ -886,8 +921,9 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
             <SecondaryButton disabled={updatingStatus || service.status === "scanning" || deletingService} onClick={() => void toggleStatus()}>
               {updatingStatus ? "正在更新…" : service.status === "disabled" ? "启用服务" : "停用服务"}
             </SecondaryButton>
-            <SecondaryButton disabled={fullScanRoots.length === 0 || creatingScanMode !== null || deletingService} title={fullScanRoots.length === 0 ? "请先配置全量扫描路径" : undefined} onClick={() => void trigger("full")}>{creatingScanMode === "full" ? "正在创建…" : "全量扫描"}</SecondaryButton>
-            <PrimaryButton disabled={incrementalScanRoots.length === 0 || creatingScanMode !== null || deletingService} title={incrementalScanRoots.length === 0 ? "请先配置增量扫描路径" : undefined} onClick={() => void trigger("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "正在创建…" : "增量扫描"}</PrimaryButton>
+            <SecondaryButton disabled={fullScanRoots.length === 0 || creatingScanMode !== null || creatingAiSupplement || deletingService} title={fullScanRoots.length === 0 ? "请先配置全量扫描路径" : undefined} onClick={() => void trigger("full")}>{creatingScanMode === "full" ? "正在创建…" : "全量扫描"}</SecondaryButton>
+            <PrimaryButton disabled={incrementalScanRoots.length === 0 || creatingScanMode !== null || creatingAiSupplement || deletingService} title={incrementalScanRoots.length === 0 ? "请先配置增量扫描路径" : undefined} onClick={() => void trigger("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "正在创建…" : "增量扫描"}</PrimaryButton>
+            <SecondaryButton disabled={!metadataSettings.aiCleaning.enabled || creatingScanMode !== null || creatingAiSupplement || deletingService} title={!metadataSettings.aiCleaning.enabled ? "请先启用 AI 目录文件清洗" : undefined} onClick={() => void triggerAiSupplement()}><Sparkles className="size-4" /> {creatingAiSupplement ? "正在创建…" : "AI补充未识别内容"}</SecondaryButton>
           </div>
         )}
       />

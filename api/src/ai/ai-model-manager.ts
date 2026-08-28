@@ -16,9 +16,15 @@ import {
   requestOpenAiCompatibleJson,
   testOpenAiCompatibleModel,
   type OpenAiCompatibleJsonResult,
+  type OpenAiCompatibleJsonRequestOptions,
 } from "./openai-compatible-client.js";
 
-export const AI_VIDEO_NAME_CLEAN_PROMPT_VERSION = "video-name-clean-v1";
+export const AI_VIDEO_NAME_CLEAN_PROMPT_VERSION = "video-name-clean-v3-flymby";
+
+export interface AiStructuredJsonRequestOptions extends OpenAiCompatibleJsonRequestOptions {
+  /** 业务请求允许高于模型配置的最低超时，避免批量输出被短连接测试超时截断。 */
+  minimumTimeoutMs?: number;
+}
 
 export interface AiCleaningSettings {
   enabled: boolean;
@@ -325,6 +331,18 @@ export class AiModelManager {
     };
   }
 
+  /** 为媒体库未匹配内容补充任务冻结模型，并强制重新请求而不复用历史成功缓存。 */
+  public async buildUnmatchedSupplementTaskSnapshot(
+    metadataProfile: Record<string, unknown>,
+  ): Promise<AiModelTaskSnapshot | null> {
+    const snapshot = await this.buildTaskSnapshot(metadataProfile);
+    return snapshot ? {
+      ...snapshot,
+      triggerMode: "weak_or_unmatched",
+      forceRefresh: true,
+    } : null;
+  }
+
   /** 返回用户可选择的启用模型，并按需附带当前服务已选择但后来停用的模型。 */
   public async listAvailableModels(selectedModelId = ""): Promise<Array<{
     id: string;
@@ -350,6 +368,7 @@ export class AiModelManager {
     snapshot: AiModelTaskSnapshot,
     systemPrompt: string,
     input: Record<string, unknown>,
+    options: AiStructuredJsonRequestOptions = {},
     signal?: AbortSignal,
   ): Promise<OpenAiCompatibleJsonResult> {
     const configuration = await this.database.query("ai_model_configurations")
@@ -386,8 +405,8 @@ export class AiModelManager {
         baseUrl: String(configuration.base_url),
         modelName: String(configuration.model_name),
         apiKey: typeof secrets.apiKey === "string" ? secrets.apiKey : null,
-        timeoutMs: Number(configuration.timeout_ms),
-      }, systemPrompt, input, signal);
+        timeoutMs: Math.max(Number(configuration.timeout_ms), Number(options.minimumTimeoutMs ?? 0)),
+      }, systemPrompt, input, options, signal);
       if (result.errorCode !== "ai_model_request_aborted") {
         await this.database.query("ai_model_profiles")
           .where({ id: snapshot.modelId, configuration_revision: snapshot.configurationRevision })

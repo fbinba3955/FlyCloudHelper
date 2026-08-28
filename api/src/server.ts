@@ -37,7 +37,7 @@ import { CredentialVault } from "./secrets.js";
 import { ServiceRepository } from "./service-repository.js";
 import { ServiceMigrationRepository } from "./service-migration-repository.js";
 import { ServiceMigrationWorker } from "./service-migration-worker.js";
-import { loadTmdbKeys } from "./system-settings.js";
+import { loadTmdbBaseUrls, loadTmdbKeys } from "./system-settings.js";
 import { ScanWorker } from "./worker.js";
 import { MediaProbeWorker } from "./media-probe-worker.js";
 
@@ -151,12 +151,20 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   }
   const migrations = new ServiceMigrationRepository(database);
   const tmdbCache = new TmdbMetadataCache(database, logger);
+  const tmdbBaseUrls = await loadTmdbBaseUrls(database); // 关键变量：启动时一次读取当前 TMDB API 与图片地址。
   const tmdb = new TmdbKeyPool(
     config,
     await loadTmdbKeys(database, vault),
     (fields) => server.log.warn(fields),
     tmdbCache,
+    tmdbBaseUrls,
   );
+  logger("info", {
+    日志关键字: "codex-flycloud-helper-tmdb-proxy",
+    事件: "TMDB代理地址启动配置已加载",
+    配置来源: tmdbBaseUrls.source === "database" ? "系统设置" : "默认地址",
+    配置修订: tmdbBaseUrls.configurationRevision,
+  });
   const musicBrainz = new MusicBrainzClient(config);
   const plugins = new MetadataPluginManager(database, config, vault);
   const aiModels = new AiModelManager(database, vault);

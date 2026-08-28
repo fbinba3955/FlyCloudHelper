@@ -133,7 +133,11 @@ export class BaiduPanProvider implements ProviderAdapter {
     options?: ProviderEnumerationOptions,
   ): AsyncGenerator<ProviderEntry> {
     const selectedRoots = roots.length > 0 ? roots : [{ displayPath: "/" }];
-    for (const root of selectedRoots) {
+    for (let rootIndex = 0; rootIndex < selectedRoots.length; rootIndex += 1) {
+      const root = selectedRoots[rootIndex];
+      if (!root) continue;
+      // 根目录只有完整枚举后才允许扫描收尾清理旧文件；中止或异常不会提交完成状态。
+      await options?.onRootStart?.({ rootIndex, root, warningCount: 0 });
       const queue = [root.displayPath || root.resourceId || "/"];
       const visited = new Set<string>();
       const directoryConcurrency = Math.max(1, options?.directoryConcurrency ?? 1);
@@ -176,6 +180,7 @@ export class BaiduPanProvider implements ProviderAdapter {
           }
         }
       }
+      await options?.onRootComplete?.({ rootIndex, root, warningCount: 0 });
     }
   }
 

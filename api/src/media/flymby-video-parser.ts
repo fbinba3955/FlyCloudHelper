@@ -5,7 +5,7 @@ import { FlymbyVideoTitleCleaner } from "./flymby-video-title-cleaner.js";
 export type FlymbyParsedVideoType = "movie" | "tv";
 
 // 关键变量：影响影视查询语义的本地清洗规则发生变化时必须提升，避免复用旧 AI 清洗缓存。
-export const FLYMBY_VIDEO_NAME_CLEANER_VERSION = "webdav-video-name-parser-2026-08-20";
+export const FLYMBY_VIDEO_NAME_CLEANER_VERSION = "webdav-video-name-parser-2026-08-28-ai-flymby-v3";
 
 export interface FlymbyParsedVideoName {
   mediaType: FlymbyParsedVideoType;

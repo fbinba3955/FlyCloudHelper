@@ -1627,6 +1627,13 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       throw new ApiError(409, "job_not_retryable", "只有失败或已取消任务可以重试");
     }
     const service = await runtime.repository.getServiceDetail(sourceJob.serviceId, user.id);
+    const retriesAiSupplement = sourceJob.snapshot.taskPurpose === "ai_supplement_unmatched";
+    const aiModelSnapshot = retriesAiSupplement
+      ? await runtime.aiModels.buildUnmatchedSupplementTaskSnapshot(service.metadataProfile)
+      : await runtime.aiModels.buildTaskSnapshot(service.metadataProfile);
+    if (retriesAiSupplement && !aiModelSnapshot) {
+      throw new ApiError(409, "ai_cleaning_not_enabled", "请先在服务元数据配置中启用 AI 目录文件清洗");
+    }
     const job = await runtime.repository.createScanJob({
       jobId: randomUUID(),
       userId: user.id,
@@ -1637,13 +1644,14 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       scanMode: sourceJob.scanMode,
       runtimeRevision: "scanner-worker-v1",
       tmdbKeyPoolRevision: runtime.tmdb.revision,
-      aiModel: await runtime.aiModels.buildTaskSnapshot(service.metadataProfile),
+      aiModel: aiModelSnapshot,
+      taskPurpose: retriesAiSupplement ? "ai_supplement_unmatched" : "standard",
       retryOfJobId: sourceJob.id,
       pluginVersions: await runtime.plugins.buildTaskSnapshots(service.metadataProfile),
     });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-job-retry",
-      事件: "用户重试扫描任务",
+      事件: retriesAiSupplement ? "用户重试AI补充未匹配任务" : "用户重试扫描任务",
       用户ID: user.id,
       原任务ID: sourceJob.id,
       新任务ID: job.id,
