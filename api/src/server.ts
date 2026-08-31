@@ -35,6 +35,10 @@ import { registerServiceMigrationRoutes } from "./routes/service-migration-route
 import { registerServiceAccessRoutes } from "./routes/service-access-routes.js";
 import { registerJellyfinRoutes } from "./routes/jellyfin-routes.js";
 import { registerEmbyRoutes } from "./routes/emby-routes.js";
+import { registerAggregateServiceRoutes } from "./routes/aggregate-service-routes.js";
+import { AggregateServiceRepository } from "./aggregate-service-repository.js";
+import { AggregateIndexService } from "./aggregate-index-service.js";
+import { AggregateAccessService } from "./aggregate-access-service.js";
 import type { ApiRuntime } from "./runtime.js";
 import { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
 import { ScanFailureReportService } from "./scan-failure-report-service.js";
@@ -149,6 +153,17 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   database.setNotificationDeliveryHandler((notification) => telegramNotifications.enqueue(notification));
   const serviceAccess = new ServiceAccessService(database, vault);
   const embyAccess = new EmbyAccessService(database);
+  const aggregateServices = new AggregateServiceRepository(database);
+  const aggregateIndex = new AggregateIndexService(database, logger);
+  const aggregateAccess = new AggregateAccessService(database);
+  const backfilledAggregateAccounts = await aggregateAccess.ensureExistingServices();
+  if (backfilledAggregateAccounts > 0) {
+    logger("info", {
+      日志关键字: "codex-aggregate-account",
+      事件: "补齐聚合服务初始访问账号",
+      补齐账号数量: backfilledAggregateAccounts,
+    });
+  }
   const repository = new ServiceRepository(database, serviceAccess, logger, {
     scanWorkerConcurrency: config.workerConcurrency,
     mediaProbeConcurrency: config.mediaProbeConcurrency,
@@ -255,9 +270,13 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     publicAccess,
     serviceAccess,
     embyAccess,
+    aggregateServices,
+    aggregateIndex,
+    aggregateAccess,
     telegramNotifications,
     logBusinessEvent: logger,
   };
+  await aggregateIndex.start();
 
   await server.register(cookie);
   await server.register(multipart, {
@@ -439,6 +458,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerServiceRoutes(server, runtime);
   await registerScanScheduleRoutes(server, runtime, scanSchedules);
   await registerServiceAccessRoutes(server, runtime);
+  await registerAggregateServiceRoutes(server, runtime);
   await registerServiceMigrationRoutes(server, runtime);
   await registerScanFailureReportRoutes(server, runtime);
   await registerCatalogRoutes(server, runtime);

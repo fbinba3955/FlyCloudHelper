@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 48;
+export const currentSchemaVersion = 52;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -188,6 +188,9 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.integer("relay_playback_enabled").notNullable().defaultTo(0);
       table.integer("notification_enabled").notNullable().defaultTo(0);
       table.integer("credential_revision").notNullable();
+      table.string("device_id", 255).nullable();
+      table.string("device_name", 255).nullable();
+      table.string("client_name", 255).nullable();
       table.integer("scan_profile_revision").notNullable();
       table.integer("metadata_profile_revision").notNullable();
       table.string("last_scan_at", 40).nullable();
@@ -480,6 +483,170 @@ async function createServiceTables(database: Knex): Promise<void> {
   }
 }
 
+/** 创建单协议聚合服务及其影视成员关系表。 */
+async function createAggregateServiceTables(database: Knex): Promise<void> {
+  if (!(await database.schema.hasTable("aggregate_services"))) {
+    await database.schema.createTable("aggregate_services", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("display_name", 255).notNullable();
+      table.string("protocol", 32).notNullable();
+      table.string("path_suffix", 255).notNullable();
+      table.string("path_suffix_lookup", 255).notNullable();
+      table.string("status", 32).notNullable().defaultTo("draft");
+      table.bigInteger("catalog_version").notNullable().defaultTo(0);
+      table.integer("relay_playback_enabled").notNullable().defaultTo(0);
+      table.integer("download_enabled").notNullable().defaultTo(1);
+      table.integer("region_libraries_enabled").notNullable().defaultTo(0);
+      table.string("last_indexed_at", 40).nullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.string("deleted_at", 40).nullable();
+      table.unique(["protocol", "path_suffix_lookup"], { indexName: "uq_aggregate_services_protocol_path" });
+      table.index(["user_id", "protocol", "status"], "idx_aggregate_services_user_protocol");
+    });
+  }
+  await addColumnIfMissing(database, "aggregate_services", "relay_playback_enabled", (table) => {
+    table.integer("relay_playback_enabled").notNullable().defaultTo(0);
+  });
+  await addColumnIfMissing(database, "aggregate_services", "download_enabled", (table) => {
+    table.integer("download_enabled").notNullable().defaultTo(1);
+  });
+  await addColumnIfMissing(database, "aggregate_services", "region_libraries_enabled", (table) => {
+    table.integer("region_libraries_enabled").notNullable().defaultTo(0);
+  });
+  await addColumnIfMissing(database, "aggregate_services", "last_indexed_at", (table) => {
+    table.string("last_indexed_at", 40).nullable();
+  });
+
+  if (!(await database.schema.hasTable("aggregate_access_accounts"))) {
+    await database.schema.createTable("aggregate_access_accounts", (table) => {
+      table.string("id", 64).primary();
+      table.string("aggregate_service_id", 64).notNullable().references("id").inTable("aggregate_services").onDelete("CASCADE");
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("username", 255).notNullable();
+      table.string("username_lookup", 255).notNullable();
+      table.text("password_hash").notNullable();
+      table.integer("password_required").notNullable().defaultTo(0);
+      table.integer("credential_revision").notNullable().defaultTo(1);
+      table.string("status", 32).notNullable().defaultTo("active");
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["aggregate_service_id", "username_lookup"], { indexName: "uq_aggregate_access_username" });
+      table.index(["aggregate_service_id", "status", "created_at"], "idx_aggregate_access_service_status");
+    });
+  }
+
+  if (!(await database.schema.hasTable("aggregate_protocol_sessions"))) {
+    await database.schema.createTable("aggregate_protocol_sessions", (table) => {
+      table.string("id", 64).primary();
+      table.string("aggregate_service_id", 64).notNullable().references("id").inTable("aggregate_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("aggregate_access_accounts").onDelete("CASCADE");
+      table.string("protocol", 32).notNullable();
+      table.string("token_hash", 64).notNullable().unique();
+      table.integer("credential_revision").notNullable();
+      table.string("device_id", 255).nullable();
+      table.string("device_name", 255).nullable();
+      table.string("client_name", 255).nullable();
+      table.string("expires_at", 40).notNullable();
+      table.string("last_seen_at", 40).notNullable();
+      table.string("revoked_at", 40).nullable();
+      table.string("created_at", 40).notNullable();
+      table.index(["aggregate_service_id", "protocol", "revoked_at"], "idx_aggregate_protocol_sessions_service");
+      table.index(["account_id", "expires_at"], "idx_aggregate_protocol_sessions_account");
+    });
+  }
+  await addColumnIfMissing(database, "aggregate_protocol_sessions", "device_id", (table) => {
+    table.string("device_id", 255).nullable();
+  });
+  await addColumnIfMissing(database, "aggregate_protocol_sessions", "device_name", (table) => {
+    table.string("device_name", 255).nullable();
+  });
+  await addColumnIfMissing(database, "aggregate_protocol_sessions", "client_name", (table) => {
+    table.string("client_name", 255).nullable();
+  });
+
+  if (!(await database.schema.hasTable("aggregate_service_members"))) {
+    await database.schema.createTable("aggregate_service_members", (table) => {
+      table.string("id", 64).primary();
+      table.string("aggregate_service_id", 64).notNullable().references("id").inTable("aggregate_services").onDelete("CASCADE");
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.integer("priority").notNullable();
+      table.integer("enabled").notNullable().defaultTo(1);
+      table.bigInteger("last_catalog_version").notNullable().defaultTo(0);
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["aggregate_service_id", "service_id"], { indexName: "uq_aggregate_members_service" });
+      table.unique(["aggregate_service_id", "library_id"], { indexName: "uq_aggregate_members_library" });
+      table.index(["aggregate_service_id", "priority"], "idx_aggregate_members_priority");
+      table.index(["service_id"], "idx_aggregate_members_source_service");
+    });
+  }
+
+  if (!(await database.schema.hasTable("aggregate_media_items"))) {
+    await database.schema.createTable("aggregate_media_items", (table) => {
+      table.string("id", 64).primary();
+      table.string("aggregate_service_id", 64).notNullable().references("id").inTable("aggregate_services").onDelete("CASCADE");
+      table.string("canonical_key", 255).notNullable();
+      table.string("item_type", 64).notNullable();
+      table.string("parent_aggregate_item_id", 64).nullable().references("id").inTable("aggregate_media_items").onDelete("CASCADE");
+      table.string("primary_member_item_id", 64).nullable().references("id").inTable("media_items").onDelete("SET NULL");
+      table.string("sort_title", 512).notNullable();
+      table.integer("year").nullable();
+      table.string("premiere_date", 40).nullable();
+      table.string("status", 32).notNullable().defaultTo("active");
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.string("deleted_at", 40).nullable();
+      table.unique(["aggregate_service_id", "canonical_key"], { indexName: "uq_aggregate_items_canonical" });
+      table.index(["aggregate_service_id", "item_type", "status"], "idx_aggregate_items_type_status");
+      table.index(["aggregate_service_id", "sort_title"], "idx_aggregate_items_sort_title");
+      table.index(["parent_aggregate_item_id", "item_type"], "idx_aggregate_items_parent");
+    });
+  }
+
+  if (!(await database.schema.hasTable("aggregate_media_item_members"))) {
+    await database.schema.createTable("aggregate_media_item_members", (table) => {
+      table.string("id", 64).primary();
+      table.string("aggregate_service_id", 64).notNullable().references("id").inTable("aggregate_services").onDelete("CASCADE");
+      table.string("aggregate_item_id", 64).notNullable().references("id").inTable("aggregate_media_items").onDelete("CASCADE");
+      table.string("member_id", 64).notNullable().references("id").inTable("aggregate_service_members").onDelete("CASCADE");
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("library_id", 64).notNullable().references("id").inTable("media_libraries").onDelete("CASCADE");
+      table.string("media_item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
+      table.integer("metadata_rank").notNullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["aggregate_service_id", "media_item_id"], { indexName: "uq_aggregate_item_members_source" });
+      table.index(["aggregate_item_id", "service_id"], "idx_aggregate_item_members_item_service");
+      table.index(["member_id", "media_item_id"], "idx_aggregate_item_members_member_source");
+    });
+  }
+
+  if (!(await database.schema.hasTable("aggregate_index_jobs"))) {
+    await database.schema.createTable("aggregate_index_jobs", (table) => {
+      table.string("id", 64).primary();
+      table.string("user_id", 64).notNullable().references("id").inTable("user_accounts").onDelete("CASCADE");
+      table.string("aggregate_service_id", 64).notNullable().references("id").inTable("aggregate_services").onDelete("CASCADE");
+      table.string("job_type", 32).notNullable();
+      table.string("status", 32).notNullable();
+      table.bigInteger("processed_count").notNullable().defaultTo(0);
+      table.bigInteger("total_count").notNullable().defaultTo(0);
+      table.string("current_member_id", 64).nullable();
+      table.string("error_code", 100).nullable();
+      table.text("error_message").nullable();
+      table.string("created_at", 40).notNullable();
+      table.string("started_at", 40).nullable();
+      table.string("finished_at", 40).nullable();
+      table.string("updated_at", 40).notNullable();
+      table.index(["aggregate_service_id", "status", "created_at"], "idx_aggregate_index_jobs_service_status");
+      table.index(["status", "created_at"], "idx_aggregate_index_jobs_queue");
+    });
+  }
+}
+
 /** 在媒体目录表之后创建服务级播放数据表，确保 PostgreSQL 外键目标已经存在。 */
 async function createPlaybackTables(database: Knex): Promise<void> {
   if (!(await database.schema.hasTable("service_playback_progress"))) {
@@ -585,6 +752,76 @@ async function createPlaybackTables(database: Knex): Promise<void> {
       table.integer("sort_order").notNullable();
       table.string("created_at", 40).notNullable();
       table.index(["playlist_id", "sort_order"], "idx_service_music_playlist_items_order");
+    });
+  }
+}
+
+/**
+ * 创建聚合 Jellyfin 独立观看状态表。
+ * 聚合条目可能在来源重建时软删除，因此仅保存稳定聚合条目 ID，不添加会阻断索引重建的外键。
+ */
+async function createAggregateJellyfinPlaybackTables(database: Knex): Promise<void> {
+  if (!(await database.schema.hasTable("aggregate_playback_progress"))) {
+    await database.schema.createTable("aggregate_playback_progress", (table) => {
+      table.string("id", 64).primary();
+      table.string("aggregate_service_id", 64).notNullable().references("id").inTable("aggregate_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("aggregate_access_accounts").onDelete("CASCADE");
+      table.string("aggregate_item_id", 64).notNullable();
+      table.string("media_source_id", 128).nullable();
+      table.bigInteger("position_ticks").notNullable().defaultTo(0);
+      table.integer("played").notNullable().defaultTo(0);
+      table.integer("hidden_from_resume").notNullable().defaultTo(0);
+      table.integer("play_count").notNullable().defaultTo(0);
+      table.string("last_played_at", 40).nullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["aggregate_service_id", "account_id", "aggregate_item_id"], { indexName: "uq_aggregate_playback_progress" });
+      table.index(["aggregate_service_id", "account_id", "updated_at"], "idx_aggregate_progress_resume");
+    });
+  }
+
+  if (!(await database.schema.hasTable("aggregate_playback_sessions"))) {
+    await database.schema.createTable("aggregate_playback_sessions", (table) => {
+      table.string("id", 64).primary();
+      table.string("aggregate_service_id", 64).notNullable().references("id").inTable("aggregate_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("aggregate_access_accounts").onDelete("CASCADE");
+      table.string("aggregate_item_id", 64).notNullable();
+      table.string("media_source_id", 128).nullable();
+      table.string("status", 32).notNullable();
+      table.bigInteger("position_ticks").notNullable().defaultTo(0);
+      table.integer("paused").notNullable().defaultTo(0);
+      table.string("started_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.string("stopped_at", 40).nullable();
+      table.index(["aggregate_service_id", "account_id", "status"], "idx_aggregate_play_sessions_active");
+    });
+  }
+
+  if (!(await database.schema.hasTable("aggregate_playback_history"))) {
+    await database.schema.createTable("aggregate_playback_history", (table) => {
+      table.string("id", 64).primary();
+      table.string("aggregate_service_id", 64).notNullable().references("id").inTable("aggregate_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("aggregate_access_accounts").onDelete("CASCADE");
+      table.string("aggregate_item_id", 64).notNullable();
+      table.string("play_session_id", 64).notNullable().unique();
+      table.bigInteger("position_ticks").notNullable().defaultTo(0);
+      table.integer("completed").notNullable().defaultTo(0);
+      table.string("started_at", 40).notNullable();
+      table.string("stopped_at", 40).notNullable();
+      table.index(["aggregate_service_id", "account_id", "stopped_at"], "idx_aggregate_play_history_recent");
+    });
+  }
+
+  if (!(await database.schema.hasTable("aggregate_item_preferences"))) {
+    await database.schema.createTable("aggregate_item_preferences", (table) => {
+      table.string("id", 64).primary();
+      table.string("aggregate_service_id", 64).notNullable().references("id").inTable("aggregate_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("aggregate_access_accounts").onDelete("CASCADE");
+      table.string("aggregate_item_id", 64).notNullable();
+      table.string("starred_at", 40).nullable();
+      table.integer("rating").notNullable().defaultTo(0);
+      table.string("updated_at", 40).notNullable();
+      table.unique(["aggregate_service_id", "account_id", "aggregate_item_id"], { indexName: "uq_aggregate_item_preferences" });
+      table.index(["aggregate_service_id", "account_id", "starred_at"], "idx_aggregate_item_preferences_starred");
     });
   }
 }
@@ -1577,7 +1814,9 @@ export async function migrateDatabase(database: Knex): Promise<void> {
   await createIdentityTables(database);
   await createServiceTables(database);
   await createCatalogTables(database);
+  await createAggregateServiceTables(database);
   await createPlaybackTables(database);
+  await createAggregateJellyfinPlaybackTables(database);
   await createEmbyProtocolTables(database);
   await createOperationTables(database);
 

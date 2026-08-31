@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { Download, Images, Pause, Play, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
+import { Download, Images, Layers3, Pause, Play, Radio, RefreshCw, RotateCcw, Settings2, Sparkles, Square, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { AdminServiceFilters } from "@/components/AdminServiceFilters";
@@ -14,6 +14,7 @@ import {
   getJobAiSupplements,
   listJobs,
   listAdminUsers,
+  listAggregateServices,
   listMediaProbeJobFailures,
   listProviders,
   listServices,
@@ -771,10 +772,30 @@ function CatalogServiceSelector({ admin }: { admin: boolean }) {
     const [users, providers] = await Promise.all([listAdminUsers(), listProviders()]);
     return { users: users.items, providers };
   }, [admin]);
+  // 关键变量：普通用户媒体库入口直接显示已经创建的聚合服务数量；管理端不发起该用户接口请求。
+  const aggregateServices = useApiResource(
+    () => admin ? Promise.resolve([]) : listAggregateServices(),
+    [admin],
+  );
   const services = resource.data?.items ?? [];
   return (
     <>
-      <PageHeader title={admin ? "媒体库管理" : "我的媒体库"} actions={<SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新</SecondaryButton>} />
+      <PageHeader
+        title={admin ? "媒体库管理" : "我的媒体库"}
+        actions={(
+          <div className="flex flex-wrap gap-2">
+            {!admin && (
+              <Link to="/app/catalog/aggregate">
+                <SecondaryButton>
+                  <Layers3 className="size-4" /> 聚合服务
+                  <StatusPill>{aggregateServices.data?.length ?? 0}</StatusPill>
+                </SecondaryButton>
+              </Link>
+            )}
+            <SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新</SecondaryButton>
+          </div>
+        )}
+      />
       {admin && <AdminServiceFilters value={filters} users={filterOptions.data?.users ?? []} providers={filterOptions.data?.providers ?? []} resultCount={resource.data?.total ?? 0} onChange={setFilters} />}
       {resource.error && <Panel className="mb-4"><p className="text-sm text-destructive">{resource.error}</p></Panel>}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">

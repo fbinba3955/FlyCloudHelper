@@ -51,6 +51,7 @@ import {
 import { AdminAiModelsPage } from "@/pages/AiModelPages";
 import { AdminMusicSourcesPage } from "@/pages/MusicSourcePages";
 import { AdminNotificationSettingsPage } from "@/pages/AdminNotificationSettingsPage";
+import { AggregateServicePage } from "@/pages/AggregateServicePage";
 import {
   AdminServiceScanSchedulePage,
   UserServiceScanSchedulePage,
@@ -381,6 +382,13 @@ const userCatalogRoute = createRoute({
   component: UserCatalogPage,
 });
 
+/** 普通用户查看 Grid 聚合服务列表，并创建单协议聚合服务。 */
+const userAggregateServiceRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "catalog/aggregate",
+  component: AggregateServicePage,
+});
+
 const userLibrarySettingsRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "libraries/$serviceId/settings",
@@ -548,6 +556,7 @@ const appRouteTree = appRoute.addChildren([
   userServiceScanScheduleRoute,
   userJobsRoute,
   userCatalogRoute,
+  userAggregateServiceRoute,
   userLibrarySettingsRoute,
   userLibraryCatalogRoute,
   userLibraryJellyfinSettingsRoute,

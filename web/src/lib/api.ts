@@ -299,6 +299,85 @@ export interface CloudService {
   updatedAt: string;
 }
 
+export type AggregateProtocol = "jellyfin" | "emby";
+export type AggregateServiceStatus = "draft" | "building" | "active" | "failed" | "disabled";
+
+/** 聚合服务中的一个影视来源。 */
+export interface AggregateServiceMember {
+  id: string;
+  serviceId: string;
+  libraryId: string;
+  displayName: string;
+  providerType: string;
+  status: string;
+  priority: number;
+  enabled: boolean;
+  itemCount: number;
+  catalogVersion: number;
+  lastCatalogVersion: number;
+}
+
+/** 一个仅对外提供 Jellyfin 或 Emby 其中一种协议的聚合服务。 */
+export interface AggregateService {
+  id: string;
+  userId: string;
+  displayName: string;
+  protocol: AggregateProtocol;
+  pathSuffix: string;
+  path: string;
+  status: AggregateServiceStatus;
+  catalogVersion: number;
+  itemCount: number;
+  relayPlaybackEnabled: boolean;
+  downloadEnabled: boolean;
+  regionLibrariesEnabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  members: AggregateServiceMember[];
+  latestIndexJob: {
+    id: string;
+    status: string;
+    processedCount: number;
+    totalCount: number;
+    errorCode: string | null;
+    errorMessage: string | null;
+    createdAt: string;
+    startedAt: string | null;
+    finishedAt: string | null;
+  } | null;
+}
+
+export interface CreateAggregateServiceInput {
+  displayName: string;
+  protocol: AggregateProtocol;
+  pathSuffix: string;
+  serviceIds: string[];
+  relayPlaybackEnabled?: boolean;
+  downloadEnabled?: boolean;
+  regionLibrariesEnabled?: boolean;
+}
+
+export interface UpdateAggregateServiceInput {
+  displayName: string;
+  pathSuffix: string;
+  serviceIds: string[];
+  relayPlaybackEnabled: boolean;
+  downloadEnabled: boolean;
+  regionLibrariesEnabled: boolean;
+}
+
+/** 聚合 Jellyfin 或 Emby 地址下的独立访问账号。 */
+export interface AggregateAccessAccount {
+  id: string;
+  aggregateServiceId: string;
+  username: string;
+  hasPassword: boolean;
+  credentialRevision: number;
+  status: "active" | "disabled";
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** 管理端全部服务和全部媒体库共用的服务摘要筛选条件。 */
 export interface ServiceListFilters {
   search?: string;
@@ -731,6 +810,78 @@ export function listServices(
     jellyfinEnabled: filters.jellyfinEnabled === undefined ? undefined : String(filters.jellyfinEnabled),
     limit: 200,
   }));
+}
+
+/** 读取当前账号已创建的全部单协议聚合服务。 */
+export async function listAggregateServices(): Promise<AggregateService[]> {
+  return (await requestJson<{ items: AggregateService[] }>("/api/v1/aggregate-services")).items;
+}
+
+/** 创建一个由多个影视来源组成的 Jellyfin 或 Emby 聚合服务。 */
+export async function createAggregateService(input: CreateAggregateServiceInput): Promise<AggregateService> {
+  const result = await requestJson<{ aggregateService: AggregateService }>("/api/v1/aggregate-services", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return result.aggregateService;
+}
+
+/** 读取一个聚合服务及其来源服务详情。 */
+export async function getAggregateService(aggregateServiceId: string): Promise<AggregateService> {
+  const result = await requestJson<{ aggregateService: AggregateService }>(
+    `/api/v1/aggregate-services/${aggregateServiceId}`,
+  );
+  return result.aggregateService;
+}
+
+/** 修改聚合服务名称、地址、来源成员和协议配置。 */
+export async function updateAggregateService(
+  aggregateServiceId: string,
+  input: UpdateAggregateServiceInput,
+): Promise<AggregateService> {
+  const result = await requestJson<{ aggregateService: AggregateService }>(
+    `/api/v1/aggregate-services/${aggregateServiceId}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+  return result.aggregateService;
+}
+
+/** 读取同一聚合地址下的全部独立账号。 */
+export async function listAggregateAccessAccounts(aggregateServiceId: string): Promise<AggregateAccessAccount[]> {
+  const result = await requestJson<{ accounts: AggregateAccessAccount[] }>(
+    `/api/v1/aggregate-services/${aggregateServiceId}/accounts`,
+  );
+  return result.accounts;
+}
+
+/** 为一个聚合地址创建额外的独立账号。 */
+export async function createAggregateAccessAccount(
+  aggregateServiceId: string,
+  input: { username: string; password: string },
+): Promise<AggregateAccessAccount> {
+  const result = await requestJson<{ account: AggregateAccessAccount }>(
+    `/api/v1/aggregate-services/${aggregateServiceId}/accounts`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return result.account;
+}
+
+/** 修改聚合访问账号的凭据或启用状态。 */
+export async function updateAggregateAccessAccount(
+  aggregateServiceId: string,
+  accountId: string,
+  input: { username?: string; password?: string; status?: "active" | "disabled" },
+): Promise<AggregateAccessAccount> {
+  const result = await requestJson<{ account: AggregateAccessAccount }>(
+    `/api/v1/aggregate-services/${aggregateServiceId}/accounts/${accountId}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+  return result.account;
+}
+
+/** 删除聚合服务的一个额外账号。 */
+export async function deleteAggregateAccessAccount(aggregateServiceId: string, accountId: string): Promise<void> {
+  await requestJson<void>(`/api/v1/aggregate-services/${aggregateServiceId}/accounts/${accountId}`, { method: "DELETE" });
 }
 
 /** 读取用户或管理端服务详情。 */

@@ -4263,6 +4263,32 @@ export class ServiceRepository {
     });
   }
 
+  /**
+   * 批量读取指定媒体条目，供聚合 Jellyfin 在一次列表请求中装配多个来源的主元数据。
+   * 不接受跨用户条目，缺失或已删除的条目不会返回。
+   */
+  public async listCatalogItemsByIds(itemIds: string[], userId: string): Promise<MediaItemRecord[]> {
+    const uniqueItemIds = [...new Set(itemIds.map((itemId) => itemId.trim()).filter(Boolean))];
+    if (uniqueItemIds.length === 0) return [];
+    const rows = await this.database.query("media_items as m")
+      .join("cloud_services as s", "s.id", "m.service_id")
+      .join("user_accounts as u", "u.id", "s.user_id")
+      .select("m.*", "u.username as owner_username", "s.display_name as service_name")
+      .where("m.user_id", userId)
+      .whereIn("m.id", uniqueItemIds)
+      .whereNull("m.deleted_at")
+      .whereNull("s.deleted_at");
+    const [fileCounts, mediaProbeSummaries] = await Promise.all([
+      this.loadCatalogFileCounts(rows),
+      this.loadCatalogMediaProbeSummaries(rows),
+    ]);
+    return rows.map((row) => this.mapMediaItem({
+      ...row,
+      file_count: fileCounts.get(String(row.id)) ?? 0,
+      media_probe_summary: mediaProbeSummaries.get(String(row.id)) ?? null,
+    }));
+  }
+
   /** 批量统计条目自身及其子项关联的源文件数，避免相关子查询反复扫描完整关联表。 */
   private async loadCatalogFileCounts(rows: Record<string, unknown>[]): Promise<Map<string, number>> {
     const fileIdsByItem = new Map<string, Set<string>>();
