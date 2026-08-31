@@ -1024,6 +1024,14 @@ export class FlyCloudHelperDatabase {
       const serviceRows = await transaction("cloud_services").select("id").where({ user_id: userId });
       const serviceIds = serviceRows.map((row) => String(row.id));
       if (serviceIds.length > 0) {
+        // 关键变量：Emby 是独立协议数据，用户彻底删除时必须显式清除，不能依赖 Jellyfin 表的级联关系。
+        await transaction("service_emby_playback_history").whereIn("service_id", serviceIds).delete();
+        await transaction("service_emby_playback_sessions").whereIn("service_id", serviceIds).delete();
+        await transaction("service_emby_playback_progress").whereIn("service_id", serviceIds).delete();
+        await transaction("service_emby_item_preferences").whereIn("service_id", serviceIds).delete();
+        await transaction("service_emby_virtual_preferences").whereIn("service_id", serviceIds).delete();
+        await transaction("service_emby_sessions").whereIn("service_id", serviceIds).delete();
+        await transaction("service_emby_accounts").whereIn("service_id", serviceIds).delete();
         await transaction("service_playback_progress").whereIn("service_id", serviceIds).delete();
         await transaction("service_playback_sessions").whereIn("service_id", serviceIds).delete();
         await transaction("service_playback_history").whereIn("service_id", serviceIds).delete();

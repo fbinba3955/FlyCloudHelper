@@ -2,6 +2,7 @@ import type { ApiConfig } from "./config.js";
 import type { FlyCloudHelperDatabase } from "./database.js";
 import { validationError } from "./errors.js";
 import { buildJellyfinPath } from "./jellyfin-path.js";
+import { buildEmbyPath } from "./emby-path.js";
 import { buildNavidromePath } from "./navidrome-path.js";
 
 const publicBaseUrlSettingKey = "public_base_url";
@@ -55,6 +56,12 @@ export class PublicAccessService {
   public async buildJellyfinUrl(pathSuffix: string): Promise<string | null> {
     const status = await this.getStatus();
     return status.publicBaseUrl ? `${status.publicBaseUrl}${buildJellyfinPath(pathSuffix)}` : null;
+  }
+
+  /** 使用媒体库自定义后缀生成独立 Emby 根地址。 */
+  public async buildEmbyUrl(pathSuffix: string): Promise<string | null> {
+    const status = await this.getStatus();
+    return status.publicBaseUrl ? `${status.publicBaseUrl}${buildEmbyPath(pathSuffix)}` : null;
   }
 
   /** 使用媒体库自定义后缀生成 Navidrome/Subsonic 根地址。 */

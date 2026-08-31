@@ -15,6 +15,7 @@ import type { ServiceMigrationWorker } from "./service-migration-worker.js";
 import type { ScanWorker } from "./worker.js";
 import type { PublicAccessService } from "./public-access.js";
 import type { ServiceAccessService } from "./service-access.js";
+import type { EmbyAccessService } from "./emby-access.js";
 import type { MediaProbeWorker } from "./media-probe-worker.js";
 import type { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
 import type { TelegramNotificationService } from "./telegram-notification-service.js";
@@ -41,6 +42,8 @@ export interface ApiRuntime {
   failureReports: ScanFailureReportService;
   publicAccess: PublicAccessService;
   serviceAccess: ServiceAccessService;
+  /** 独立 Emby 协议账号、令牌和会话服务，不能与 Jellyfin 共用。 */
+  embyAccess: EmbyAccessService;
   telegramNotifications: TelegramNotificationService;
   logBusinessEvent: (
     level: "info" | "warn",

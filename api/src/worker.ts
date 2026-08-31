@@ -1280,6 +1280,7 @@ export class ScanWorker {
           AI子批次: requestBatchLabel,
           本批条目数量: requestBatch.length,
           累计处理数量: processedCount,
+          剩余待补充数量: Math.max(0, unmatchedItems.length - processedCount),
           累计匹配数量: matchedCount,
           累计未匹配数量: unmatchedCount,
           累计错误数量: errorCount,

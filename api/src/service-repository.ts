@@ -45,6 +45,12 @@ interface JellyfinServiceCleanupResult {
   playbackSessionCount: number;
   playbackHistoryCount: number;
   accessAccountCount: number;
+  embySessionCount: number;
+  embyVirtualPreferenceCount: number;
+  embyPlaybackProgressCount: number;
+  embyPlaybackSessionCount: number;
+  embyPlaybackHistoryCount: number;
+  embyAccessAccountCount: number;
 }
 
 // 关键变量：华语、日韩优先于欧美判断，跨地区合拍节目按更具体的亚洲分组归类。
@@ -827,11 +833,17 @@ export class ServiceRepository {
         jellyfin_download_enabled: 1,
         jellyfin_region_libraries_enabled: 0,
         jellyfin_enabled: 0,
+        emby_relay_playback_enabled: 0,
+        emby_download_enabled: 1,
+        emby_region_libraries_enabled: 0,
+        emby_enabled: 0,
         navidrome_enabled: 0,
         navidrome_path_suffix: input.serviceId,
         navidrome_path_suffix_lookup: input.serviceId.toLowerCase(),
         jellyfin_path_suffix: input.serviceId,
         jellyfin_path_suffix_lookup: input.serviceId.toLowerCase(),
+        emby_path_suffix: input.serviceId,
+        emby_path_suffix_lookup: input.serviceId.toLowerCase(),
         status: "active",
         created_at: now,
         updated_at: now,
@@ -2320,7 +2332,7 @@ export class ServiceRepository {
     };
   }
 
-  /** 显式清除服务的 Jellyfin 账号、会话和播放数据，并释放自定义协议地址。 */
+  /** 显式清除服务的 Jellyfin 与 Emby 独立数据，并释放两个协议的自定义地址。 */
   private async deleteJellyfinServiceData(
     transaction: Knex.Transaction,
     serviceId: string,
@@ -2339,6 +2351,19 @@ export class ServiceRepository {
       .where({ service_id: serviceId }).delete());
     const accessAccountCount = Number(await transaction("service_access_accounts")
       .where({ service_id: serviceId }).delete());
+    // 关键变量：Emby 表与 Jellyfin 表完全独立，删除服务时也必须主动清理，不能残留不可访问的协议数据。
+    const embyVirtualPreferenceCount = Number(await transaction("service_emby_virtual_preferences")
+      .where({ service_id: serviceId }).delete());
+    const embyPlaybackHistoryCount = Number(await transaction("service_emby_playback_history")
+      .where({ service_id: serviceId }).delete());
+    const embyPlaybackSessionCount = Number(await transaction("service_emby_playback_sessions")
+      .where({ service_id: serviceId }).delete());
+    const embyPlaybackProgressCount = Number(await transaction("service_emby_playback_progress")
+      .where({ service_id: serviceId }).delete());
+    const embySessionCount = Number(await transaction("service_emby_sessions")
+      .where({ service_id: serviceId }).delete());
+    const embyAccessAccountCount = Number(await transaction("service_emby_accounts")
+      .where({ service_id: serviceId }).delete());
     // 关键变量：删除后的占位后缀按服务 ID 唯一，既满足非空唯一约束，也释放用户原来自定义的 Jellyfin 地址。
     const deletedPathSuffix = `deleted-${serviceId}`;
     await transaction("media_libraries").where({ service_id: serviceId }).update({
@@ -2347,11 +2372,17 @@ export class ServiceRepository {
       jellyfin_download_enabled: 0,
       jellyfin_region_libraries_enabled: 0,
       jellyfin_enabled: 0,
+      emby_relay_playback_enabled: 0,
+      emby_download_enabled: 0,
+      emby_region_libraries_enabled: 0,
+      emby_enabled: 0,
       navidrome_enabled: 0,
       navidrome_path_suffix: deletedPathSuffix,
       navidrome_path_suffix_lookup: deletedPathSuffix.toLowerCase(),
       jellyfin_path_suffix: deletedPathSuffix,
       jellyfin_path_suffix_lookup: deletedPathSuffix.toLowerCase(),
+      emby_path_suffix: deletedPathSuffix,
+      emby_path_suffix_lookup: deletedPathSuffix.toLowerCase(),
       status: "disabled",
       updated_at: now,
     });
@@ -2362,10 +2393,16 @@ export class ServiceRepository {
       playbackSessionCount,
       playbackHistoryCount,
       accessAccountCount,
+      embySessionCount,
+      embyVirtualPreferenceCount,
+      embyPlaybackProgressCount,
+      embyPlaybackSessionCount,
+      embyPlaybackHistoryCount,
+      embyAccessAccountCount,
     };
   }
 
-  /** 软删除服务，并同步清除 Jellyfin 数据、活动媒体统计和扫描来源。 */
+  /** 软删除服务，并同步清除 Jellyfin、Emby 数据、活动媒体统计和扫描来源。 */
   public async deleteService(serviceId: string, userId?: string): Promise<void> {
     let jellyfinCleanupResult: JellyfinServiceCleanupResult | undefined;
     await this.database.query.transaction(async (transaction) => {
@@ -2406,6 +2443,12 @@ export class ServiceRepository {
         删除播放会话数量: jellyfinCleanupResult.playbackSessionCount,
         删除播放历史数量: jellyfinCleanupResult.playbackHistoryCount,
         删除访问账号数量: jellyfinCleanupResult.accessAccountCount,
+        删除Emby会话数量: jellyfinCleanupResult.embySessionCount,
+        删除Emby虚拟条目收藏数量: jellyfinCleanupResult.embyVirtualPreferenceCount,
+        删除Emby播放进度数量: jellyfinCleanupResult.embyPlaybackProgressCount,
+        删除Emby播放会话数量: jellyfinCleanupResult.embyPlaybackSessionCount,
+        删除Emby播放历史数量: jellyfinCleanupResult.embyPlaybackHistoryCount,
+        删除Emby访问账号数量: jellyfinCleanupResult.embyAccessAccountCount,
       });
     }
   }

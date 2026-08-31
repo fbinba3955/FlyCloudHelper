@@ -37,6 +37,10 @@ import {
   UserLibrarySettingsPage,
 } from "@/pages/LibraryPages";
 import {
+  AdminLibraryEmbySettingsPage,
+  UserLibraryEmbySettingsPage,
+} from "@/pages/LibraryEmbySettingsPage";
+import {
   AdminAuditPage,
   AdminConfigurationPage,
   AdminOverviewPage,
@@ -197,6 +201,12 @@ function UserLibrarySettingsRouteComponent() {
   return <UserLibrarySettingsPage serviceId={serviceId} />;
 }
 
+/** 普通用户 Emby 协议配置路由。 */
+function UserLibraryEmbySettingsRouteComponent() {
+  const { serviceId } = userLibraryEmbySettingsRoute.useParams();
+  return <UserLibraryEmbySettingsPage serviceId={serviceId} />;
+}
+
 /** 处理普通用户媒体库海报墙路由参数。 */
 function UserLibraryCatalogRouteComponent() {
   const { serviceId } = userLibraryCatalogRoute.useParams();
@@ -237,6 +247,12 @@ function AdminServiceScanScheduleRouteComponent() {
 function AdminLibrarySettingsRouteComponent() {
   const { serviceId } = adminLibrarySettingsRoute.useParams();
   return <AdminLibrarySettingsPage serviceId={serviceId} />;
+}
+
+/** 管理端 Emby 协议配置路由。 */
+function AdminLibraryEmbySettingsRouteComponent() {
+  const { serviceId } = adminLibraryEmbySettingsRoute.useParams();
+  return <AdminLibraryEmbySettingsPage serviceId={serviceId} />;
 }
 
 /** 处理管理员媒体库海报墙路由参数。 */
@@ -383,6 +399,12 @@ const userLibraryJellyfinSettingsRoute = createRoute({
   component: UserLibraryJellyfinSettingsRouteComponent,
 });
 
+const userLibraryEmbySettingsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "libraries/$serviceId/emby",
+  component: UserLibraryEmbySettingsRouteComponent,
+});
+
 const adminRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "admin",
@@ -467,6 +489,12 @@ const adminLibraryJellyfinSettingsRoute = createRoute({
   component: AdminLibraryJellyfinSettingsRouteComponent,
 });
 
+const adminLibraryEmbySettingsRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "libraries/$serviceId/emby",
+  component: AdminLibraryEmbySettingsRouteComponent,
+});
+
 const adminPluginsRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "plugins",
@@ -523,6 +551,7 @@ const appRouteTree = appRoute.addChildren([
   userLibrarySettingsRoute,
   userLibraryCatalogRoute,
   userLibraryJellyfinSettingsRoute,
+  userLibraryEmbySettingsRoute,
 ]);
 
 /** 组合超级管理员后台子路由。 */
@@ -540,6 +569,7 @@ const adminRouteTree = adminRoute.addChildren([
   adminLibrarySettingsRoute,
   adminLibraryCatalogRoute,
   adminLibraryJellyfinSettingsRoute,
+  adminLibraryEmbySettingsRoute,
   adminPluginsRoute,
   adminAiModelsRoute,
   adminConfigurationRoute,

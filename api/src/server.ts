@@ -28,11 +28,13 @@ import { registerScanScheduleRoutes } from "./routes/scan-schedule-routes.js";
 import { registerPluginRoutes } from "./routes/plugin-routes.js";
 import { PublicAccessService } from "./public-access.js";
 import { ServiceAccessService } from "./service-access.js";
+import { EmbyAccessService } from "./emby-access.js";
 import { registerScanFailureReportRoutes } from "./routes/scan-failure-report-routes.js";
 import { registerServiceRoutes } from "./routes/service-routes.js";
 import { registerServiceMigrationRoutes } from "./routes/service-migration-routes.js";
 import { registerServiceAccessRoutes } from "./routes/service-access-routes.js";
 import { registerJellyfinRoutes } from "./routes/jellyfin-routes.js";
+import { registerEmbyRoutes } from "./routes/emby-routes.js";
 import type { ApiRuntime } from "./runtime.js";
 import { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
 import { ScanFailureReportService } from "./scan-failure-report-service.js";
@@ -146,16 +148,25 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const telegramNotifications = new TelegramNotificationService(database, vault, logger);
   database.setNotificationDeliveryHandler((notification) => telegramNotifications.enqueue(notification));
   const serviceAccess = new ServiceAccessService(database, vault);
+  const embyAccess = new EmbyAccessService(database);
   const repository = new ServiceRepository(database, serviceAccess, logger, {
     scanWorkerConcurrency: config.workerConcurrency,
     mediaProbeConcurrency: config.mediaProbeConcurrency,
   });
   const publicAccess = new PublicAccessService(database, config);
   const backfilledServiceAccessAccounts = await serviceAccess.ensureExistingServices();
+  const backfilledEmbyAccessAccounts = await embyAccess.ensureExistingServices();
   if (backfilledServiceAccessAccounts > 0) {
     logger("info", {
       日志关键字: "codex-jellyfin-compat", 事件: "为历史服务补齐独立访问账号",
       补齐账号数量: backfilledServiceAccessAccounts,
+    });
+  }
+  if (backfilledEmbyAccessAccounts > 0) {
+    logger("info", {
+      日志关键字: "codex-emby-account",
+      事件: "为历史服务补齐独立Emby访问账号",
+      补齐账号数量: backfilledEmbyAccessAccounts,
     });
   }
   const migrations = new ServiceMigrationRepository(database);
@@ -243,6 +254,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     failureReports,
     publicAccess,
     serviceAccess,
+    embyAccess,
     telegramNotifications,
     logBusinessEvent: logger,
   };
@@ -270,6 +282,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     // 关键变量：对外媒体协议同样依赖数据库和凭据主密钥，初始化或主密钥待备份时不能绕过后台保护状态。
     const requiresReadyState = request.url.startsWith("/api/")
       || request.url.startsWith("/j/")
+      || request.url.startsWith("/e/")
       || request.url.startsWith("/n/");
     const systemState = requiresReadyState ? await database.getSystemState() : null;
     if (systemState?.setupRequired && !isSetupPublicPath(request.url)) {
@@ -415,6 +428,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
         catalogExport: true,
         relayPlayback: true,
         jellyfinCompatibility: true,
+        embyCompatibility: true,
         navidromeCompatibility: true,
       },
     };
@@ -431,6 +445,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerMusicArtworkRoutes(server, runtime);
   await registerMediaStreamRoutes(server, runtime);
   await registerJellyfinRoutes(server, runtime);
+  await registerEmbyRoutes(server, runtime);
   await registerNavidromeRoutes(server, runtime);
   await registerNotificationRoutes(server, runtime);
   await registerAdminNotificationSettingsRoutes(server, runtime);
@@ -445,7 +460,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       wildcard: false,
     });
     server.setNotFoundHandler((request, reply) => {
-      if (request.url.startsWith("/api/") || request.url.startsWith("/j/") || request.url.startsWith("/n/")) {
+      if (request.url.startsWith("/api/") || request.url.startsWith("/j/") || request.url.startsWith("/e/") || request.url.startsWith("/n/")) {
         return reply.status(404).send({ error: { code: "not_found", message: "接口不存在" } });
       }
       return reply.sendFile("index.html");

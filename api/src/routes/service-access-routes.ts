@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
 import { requireConfirmation, requireRequestUser, requireSuperAdmin } from "../http.js";
 import { buildJellyfinPath, validateJellyfinPathSuffix } from "../jellyfin-path.js";
+import { buildEmbyPath, validateEmbyPathSuffix } from "../emby-path.js";
 import { buildNavidromePath, validateNavidromePathSuffix } from "../navidrome-path.js";
 import type { ApiRuntime } from "../runtime.js";
 
@@ -33,6 +34,11 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
       "jellyfin_relay_playback_enabled",
       "jellyfin_download_enabled",
       "jellyfin_region_libraries_enabled",
+      "emby_enabled",
+      "emby_path_suffix",
+      "emby_relay_playback_enabled",
+      "emby_download_enabled",
+      "emby_region_libraries_enabled",
       "navidrome_enabled",
       "navidrome_path_suffix",
     )
@@ -43,6 +49,10 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
   const jellyfinPath = buildJellyfinPath(jellyfinPathSuffix);
   const navidromePathSuffix = String(library?.navidrome_path_suffix ?? "").trim() || serviceId;
   const navidromePath = buildNavidromePath(navidromePathSuffix);
+  const embyPathSuffix = String(library?.emby_path_suffix ?? "").trim() || serviceId;
+  const embyPath = buildEmbyPath(embyPathSuffix);
+  // 关键变量：Emby 账号始终从独立服务读取，禁止把 Jellyfin account/accounts 回传给 Emby 客户端。
+  const embyAccounts = await runtime.embyAccess.listByService(serviceId);
   return {
     relayPlaybackSupported: supportsRelayPlayback(runtime, service.providerType),
     appRelayPlaybackEnabled: Number(library?.app_relay_playback_enabled) === 1,
@@ -54,6 +64,14 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
     jellyfinUrl: await runtime.publicAccess.buildJellyfinUrl(jellyfinPathSuffix),
     jellyfinPath,
     jellyfinPathSuffix,
+    embyEnabled: Number(library?.emby_enabled) === 1,
+    embyUrl: await runtime.publicAccess.buildEmbyUrl(embyPathSuffix),
+    embyPath,
+    embyPathSuffix,
+    embyRelayPlaybackEnabled: Number(library?.emby_relay_playback_enabled) === 1,
+    embyDownloadEnabled: library?.emby_download_enabled === undefined || Number(library.emby_download_enabled) === 1,
+    embyRegionLibrariesEnabled: Number(library?.emby_region_libraries_enabled) === 1,
+    embyAccounts,
     navidromeSupported: service.dataType === "music",
     navidromeEnabled: service.dataType === "music" && Number(library?.navidrome_enabled) === 1,
     navidromeUrl: service.dataType === "music" ? await runtime.publicAccess.buildNavidromeUrl(navidromePathSuffix) : null,
@@ -264,6 +282,108 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
     });
 
+    /** 保存独立 Emby 协议开关、地址、下载和地区虚拟媒体库设置。 */
+    server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/emby-settings`, async (request) => {
+      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      const changesEnabled = request.body.embyEnabled !== undefined;
+      const changesPathSuffix = request.body.embyPathSuffix !== undefined;
+      const changesDownload = request.body.embyDownloadEnabled !== undefined;
+      const changesRegions = request.body.embyRegionLibrariesEnabled !== undefined;
+      if (!changesEnabled && !changesPathSuffix && !changesDownload && !changesRegions) {
+        throw new ApiError(422, "emby_settings_empty", "没有需要保存的 Emby 设置");
+      }
+      if (changesEnabled && typeof request.body.embyEnabled !== "boolean") {
+        throw new ApiError(422, "emby_enabled_invalid", "Emby 开关必须是布尔值");
+      }
+      if (changesDownload && typeof request.body.embyDownloadEnabled !== "boolean") {
+        throw new ApiError(422, "emby_download_enabled_invalid", "Emby 允许下载开关必须是布尔值");
+      }
+      if (changesRegions && typeof request.body.embyRegionLibrariesEnabled !== "boolean") {
+        throw new ApiError(422, "emby_region_libraries_invalid", "Emby 节目地区分组开关必须是布尔值");
+      }
+      const pathSuffix = changesPathSuffix ? validateEmbyPathSuffix(request.body.embyPathSuffix) : null;
+      if (pathSuffix) {
+        const duplicate = await runtime.database.query("media_libraries")
+          .select("service_id")
+          .where({ emby_path_suffix_lookup: pathSuffix.lookup })
+          .whereNot({ service_id: request.params.serviceId })
+          .first();
+        if (duplicate) throw new ApiError(409, "emby_path_suffix_conflict", "该 Emby 地址后缀已被使用，请更换后缀");
+      }
+      const values: Record<string, unknown> = { updated_at: new Date().toISOString() };
+      if (changesEnabled) values.emby_enabled = request.body.embyEnabled ? 1 : 0;
+      if (changesDownload) values.emby_download_enabled = request.body.embyDownloadEnabled ? 1 : 0;
+      if (changesRegions) values.emby_region_libraries_enabled = request.body.embyRegionLibrariesEnabled ? 1 : 0;
+      if (pathSuffix) {
+        values.emby_path_suffix = pathSuffix.value;
+        values.emby_path_suffix_lookup = pathSuffix.lookup;
+      }
+      try {
+        const changed = await runtime.database.query("media_libraries").where({ service_id: request.params.serviceId }).update(values);
+        if (changed !== 1) throw new ApiError(404, "library_not_found", "媒体库不存在");
+      } catch (error) {
+        const databaseError = error as Error & { code?: string };
+        if (pathSuffix && (databaseError.code === "23505" || databaseError.code === "ER_DUP_ENTRY" || /unique|duplicate/iu.test(databaseError.message))) {
+          throw new ApiError(409, "emby_path_suffix_conflict", "该 Emby 地址后缀已被使用，请更换后缀");
+        }
+        throw error;
+      }
+      if (changesEnabled && request.body.embyEnabled === true) await runtime.embyAccess.ensureForService(request.params.serviceId);
+      const revokedCount = changesEnabled && request.body.embyEnabled === false
+        ? await runtime.embyAccess.revokeSessions(request.params.serviceId)
+        : 0;
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-emby-settings",
+        事件: changesEnabled ? (request.body.embyEnabled ? "启用媒体库Emby协议" : "停用媒体库Emby协议") : pathSuffix ? "更新媒体库Emby地址" : changesDownload ? "更新Emby下载权限" : "更新Emby节目地区分组",
+        操作用户ID: operator.id,
+        服务ID: request.params.serviceId,
+        Emby地址后缀: pathSuffix?.value ?? null,
+        撤销Emby会话数: revokedCount,
+      });
+      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
+    });
+
+    /** 创建同一 Emby 服务地址下、状态彼此独立的登录账号。 */
+    server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/emby-access-accounts`, async (request) => {
+      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      const account = await runtime.embyAccess.createAccount(request.params.serviceId, {
+        username: request.body.username,
+        password: request.body.password,
+      });
+      runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-account", 事件: "创建Emby账号", 操作用户ID: operator.id, 服务ID: request.params.serviceId, Emby账号ID: account.id });
+      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId), account };
+    });
+
+    /** 修改、启停或删除独立 Emby 账号。 */
+    server.patch<{ Params: { serviceId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/emby-access-accounts/:accountId`, async (request) => {
+      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      const changesCredentials = request.body.username !== undefined || request.body.password !== undefined;
+      const changesStatus = request.body.status !== undefined;
+      if (changesCredentials === changesStatus) throw new ApiError(422, "emby_account_update_invalid", "请单独保存 Emby 账号凭据或启停状态");
+      const account = changesCredentials
+        ? await runtime.embyAccess.updateCredentials(request.params.serviceId, request.params.accountId, {
+          username: request.body.username,
+          password: request.body.password,
+        })
+        : await runtime.embyAccess.updateStatus(request.params.serviceId, request.params.accountId, request.body.status);
+      runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-account", 事件: "修改Emby账号", 操作用户ID: operator.id, 服务ID: request.params.serviceId, Emby账号ID: account.id, 账号状态: account.status });
+      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId), account };
+    });
+
+    server.delete<{ Params: { serviceId: string; accountId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/emby-access-accounts/:accountId`, async (request, reply) => {
+      const { operator } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      requireConfirmation(request.body, request.params.accountId);
+      await runtime.embyAccess.deleteAccount(request.params.serviceId, request.params.accountId);
+      runtime.logBusinessEvent("info", { 日志关键字: "codex-emby-account", 事件: "删除Emby账号及独立观看记录", 操作用户ID: operator.id, 服务ID: request.params.serviceId, Emby账号ID: request.params.accountId });
+      return reply.status(204).send();
+    });
+
+    server.post<{ Params: { serviceId: string; accountId: string } }>(`${prefix}/:serviceId/emby-access-accounts/:accountId/revoke-sessions`, async (request) => {
+      await requireManagedService(runtime, request, request.params.serviceId, admin);
+      await runtime.embyAccess.getById(request.params.serviceId, request.params.accountId);
+      return { revokedCount: await runtime.embyAccess.revokeSessions(request.params.serviceId, request.params.accountId) };
+    });
+
     server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/navidrome-settings`, async (request) => {
       const { operator, service } = await requireManagedService(runtime, request, request.params.serviceId, admin);
       if (service.dataType !== "music") {
@@ -322,7 +442,8 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       const { service } = await requireManagedService(runtime, request, request.params.serviceId, admin);
       const changesAppRelay = request.body.appRelayPlaybackEnabled !== undefined;
       const changesJellyfinRelay = request.body.jellyfinRelayPlaybackEnabled !== undefined;
-      if (!changesAppRelay && !changesJellyfinRelay) {
+      const changesEmbyRelay = request.body.embyRelayPlaybackEnabled !== undefined;
+      if (!changesAppRelay && !changesJellyfinRelay && !changesEmbyRelay) {
         throw new ApiError(422, "library_playback_settings_empty", "没有需要保存的媒体库播放设置");
       }
       if (changesAppRelay && typeof request.body.appRelayPlaybackEnabled !== "boolean") {
@@ -331,14 +452,19 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       if (changesJellyfinRelay && typeof request.body.jellyfinRelayPlaybackEnabled !== "boolean") {
         throw new ApiError(422, "jellyfin_relay_playback_invalid", "Jellyfin 中转开关必须是布尔值");
       }
+      if (changesEmbyRelay && typeof request.body.embyRelayPlaybackEnabled !== "boolean") {
+        throw new ApiError(422, "emby_relay_playback_invalid", "Emby 中转开关必须是布尔值");
+      }
       const enablesRelay = request.body.appRelayPlaybackEnabled === true
-        || request.body.jellyfinRelayPlaybackEnabled === true;
+        || request.body.jellyfinRelayPlaybackEnabled === true
+        || request.body.embyRelayPlaybackEnabled === true;
       if (enablesRelay && !supportsRelayPlayback(runtime, service.providerType)) {
         throw new ApiError(422, "provider_relay_playback_unsupported", "当前网盘类型暂不支持中转播放");
       }
       const updateValues: Record<string, unknown> = { updated_at: new Date().toISOString() };
       if (changesAppRelay) updateValues.app_relay_playback_enabled = request.body.appRelayPlaybackEnabled ? 1 : 0;
       if (changesJellyfinRelay) updateValues.jellyfin_relay_playback_enabled = request.body.jellyfinRelayPlaybackEnabled ? 1 : 0;
+      if (changesEmbyRelay) updateValues.emby_relay_playback_enabled = request.body.embyRelayPlaybackEnabled ? 1 : 0;
       const changed = await runtime.database.query("media_libraries")
         .where({ service_id: request.params.serviceId })
         .update(updateValues);

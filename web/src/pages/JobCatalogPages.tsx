@@ -158,6 +158,17 @@ function getScannedMediaCount(job: {
   return job.matchedCount === null ? job.processedCount + job.errorCount : job.discoveredCount;
 }
 
+/** AI 补充任务的“待补充”表示剩余数量，不能直接显示任务开始时固定的总数。 */
+function getAiSupplementPendingCount(job: {
+  processedCount: number;
+  totalCount: number | null;
+  discoveredCount: number;
+}): number {
+  // 关键变量：新任务使用 totalCount，历史异常数据缺少总数时才回退 discoveredCount。
+  const totalCount = job.totalCount ?? job.discoveredCount;
+  return Math.max(0, totalCount - job.processedCount);
+}
+
 /** 读取任务冻结配置中的已知字段，不向页面输出 JSON 原文。 */
 function getJobSnapshotFields(snapshot: Record<string, unknown>): JobSnapshotField[] {
   const providerType = typeof snapshot.providerType === "string" ? snapshot.providerType : "";
@@ -644,7 +655,7 @@ function JobsView({ admin }: { admin: boolean }) {
                 </div>
               ) : (
                 <div className="mt-3 grid grid-cols-2 gap-3 font-mono text-[11px] text-muted-foreground sm:grid-cols-5">
-                  <span title={activeJobIsAiSupplement ? "任务开始时媒体库中未匹配的电影或节目数量" : "扫描路径中识别出的可处理媒体文件数量"}>{activeJobIsAiSupplement ? "待补充" : getScannedMediaLabel(activeJob.dataType)} {getScannedMediaCount(activeJob).toLocaleString()}</span>
+                  <span title={activeJobIsAiSupplement ? "当前任务尚未完成 AI 补充处理的电影或节目数量" : "扫描路径中识别出的可处理媒体文件数量"}>{activeJobIsAiSupplement ? "待补充" : getScannedMediaLabel(activeJob.dataType)} {(activeJobIsAiSupplement ? getAiSupplementPendingCount(activeJob) : getScannedMediaCount(activeJob)).toLocaleString()}</span>
                   <span title={activeJobIsAiSupplement ? "已经完成 AI 补充处理的电影或节目数量" : getProcessedMediaDescription(activeJob.dataType)}>{activeJobIsAiSupplement ? "已处理" : getProcessedMediaLabel(activeJob.dataType)} {activeJob.processedCount.toLocaleString()}</span>
                   <span title={getMatchedMediaDescription(activeJob.dataType, true)}>已匹配 {formatOptionalCount(activeJob.matchedCount)}</span>
                   <span title={getMatchedMediaDescription(activeJob.dataType, false)}>未匹配 {formatOptionalCount(activeJob.unmatchedCount)}</span>

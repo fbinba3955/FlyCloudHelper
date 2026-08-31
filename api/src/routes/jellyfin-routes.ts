@@ -469,7 +469,7 @@ async function buildJellyfinLocalAddress(runtime: ApiRuntime, request: FastifyRe
   }
 }
 
-/** 注册一个 API 前缀；同时支持标准 Jellyfin 根路径和 Flymby 使用的 /emby 路径。 */
+/** 注册 Jellyfin API 前缀，同时保留 Flymby 仍在使用的 /emby 兼容路径。 */
 function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, prefix: string): void {
   /** 读取路由中的单层自定义后缀。 */
   const readPathSuffix = (request: FastifyRequest): string => String((request.params as { jellyfinPathSuffix: string }).jellyfinPathSuffix);
@@ -606,5 +606,12 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
 export async function registerJellyfinRoutes(server: FastifyInstance, runtime: ApiRuntime): Promise<void> {
   const compatibility = new JellyfinCompatibilityService(runtime);
   registerProtocolPrefix(server, runtime, compatibility, "/j/:jellyfinPathSuffix");
+  // 关键变量：这是 Jellyfin 的历史路径兼容入口，仍使用 Jellyfin 服务、账号和用户状态，绝不会转到独立 Emby 协议。
   registerProtocolPrefix(server, runtime, compatibility, "/j/:jellyfinPathSuffix/emby");
+  runtime.logBusinessEvent("info", {
+    日志关键字: "codex-jellyfin-route",
+    事件: "已注册Jellyfin标准与历史兼容入口",
+    标准入口: "/j/{路径}",
+    历史兼容入口: "/j/{路径}/emby",
+  });
 }

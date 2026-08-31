@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 46;
+export const currentSchemaVersion = 48;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -219,16 +219,23 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.integer("jellyfin_download_enabled").notNullable().defaultTo(1);
       table.integer("jellyfin_region_libraries_enabled").notNullable().defaultTo(0);
       table.integer("jellyfin_enabled").notNullable().defaultTo(0);
+      table.integer("emby_relay_playback_enabled").notNullable().defaultTo(0);
+      table.integer("emby_download_enabled").notNullable().defaultTo(1);
+      table.integer("emby_region_libraries_enabled").notNullable().defaultTo(0);
+      table.integer("emby_enabled").notNullable().defaultTo(0);
       table.integer("navidrome_enabled").notNullable().defaultTo(0);
       table.string("navidrome_path_suffix", 255).notNullable();
       table.string("navidrome_path_suffix_lookup", 255).notNullable();
       table.string("jellyfin_path_suffix", 255).notNullable();
       table.string("jellyfin_path_suffix_lookup", 255).notNullable();
+      table.string("emby_path_suffix", 255).notNullable();
+      table.string("emby_path_suffix_lookup", 255).notNullable();
       table.string("status", 32).notNullable();
       table.string("created_at", 40).notNullable();
       table.string("updated_at", 40).notNullable();
       table.index(["user_id"], "idx_media_libraries_user");
       table.unique(["jellyfin_path_suffix_lookup"], { indexName: "uq_media_libraries_jellyfin_path_suffix" });
+      table.unique(["emby_path_suffix_lookup"], { indexName: "uq_media_libraries_emby_path_suffix" });
       table.unique(["navidrome_path_suffix_lookup"], { indexName: "uq_media_libraries_navidrome_path_suffix" });
     });
   } else {
@@ -247,6 +254,18 @@ async function createServiceTables(database: Knex): Promise<void> {
     await addColumnIfMissing(database, "media_libraries", "jellyfin_enabled", (table) => {
       table.integer("jellyfin_enabled").notNullable().defaultTo(0);
     });
+    await addColumnIfMissing(database, "media_libraries", "emby_relay_playback_enabled", (table) => {
+      table.integer("emby_relay_playback_enabled").notNullable().defaultTo(0);
+    });
+    await addColumnIfMissing(database, "media_libraries", "emby_download_enabled", (table) => {
+      table.integer("emby_download_enabled").notNullable().defaultTo(1);
+    });
+    await addColumnIfMissing(database, "media_libraries", "emby_region_libraries_enabled", (table) => {
+      table.integer("emby_region_libraries_enabled").notNullable().defaultTo(0);
+    });
+    await addColumnIfMissing(database, "media_libraries", "emby_enabled", (table) => {
+      table.integer("emby_enabled").notNullable().defaultTo(0);
+    });
     await addColumnIfMissing(database, "media_libraries", "navidrome_enabled", (table) => {
       table.integer("navidrome_enabled").notNullable().defaultTo(0);
     });
@@ -261,6 +280,12 @@ async function createServiceTables(database: Knex): Promise<void> {
     });
     await addColumnIfMissing(database, "media_libraries", "jellyfin_path_suffix_lookup", (table) => {
       table.string("jellyfin_path_suffix_lookup", 255).nullable();
+    });
+    await addColumnIfMissing(database, "media_libraries", "emby_path_suffix", (table) => {
+      table.string("emby_path_suffix", 255).nullable();
+    });
+    await addColumnIfMissing(database, "media_libraries", "emby_path_suffix_lookup", (table) => {
+      table.string("emby_path_suffix_lookup", 255).nullable();
     });
   }
 
@@ -560,6 +585,128 @@ async function createPlaybackTables(database: Knex): Promise<void> {
       table.integer("sort_order").notNullable();
       table.string("created_at", 40).notNullable();
       table.index(["playlist_id", "sort_order"], "idx_service_music_playlist_items_order");
+    });
+  }
+}
+
+/**
+ * 创建 Emby 独立账号、会话和用户状态表。
+ *
+ * Emby 不能复用 Jellyfin 的账号或观看状态；即使两个协议访问同一媒体库，也必须拥有完全独立的数据边界。
+ */
+async function createEmbyProtocolTables(database: Knex): Promise<void> {
+  if (!(await database.schema.hasTable("service_emby_accounts"))) {
+    await database.schema.createTable("service_emby_accounts", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("username", 255).notNullable();
+      table.string("username_lookup", 255).notNullable();
+      table.text("password_hash").notNullable();
+      table.integer("password_required").notNullable().defaultTo(0);
+      table.integer("credential_revision").notNullable().defaultTo(1);
+      table.string("status", 32).notNullable().defaultTo("active");
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["service_id", "username_lookup"], { indexName: "uq_service_emby_username" });
+      table.index(["service_id", "status"], "idx_service_emby_accounts_service");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_emby_sessions"))) {
+    await database.schema.createTable("service_emby_sessions", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_emby_accounts").onDelete("CASCADE");
+      table.string("token_hash", 64).notNullable().unique();
+      table.integer("credential_revision").notNullable();
+      table.string("device_id", 255).nullable();
+      table.string("device_name", 255).nullable();
+      table.string("client_name", 255).nullable();
+      table.string("expires_at", 40).notNullable();
+      table.string("last_seen_at", 40).notNullable();
+      table.string("revoked_at", 40).nullable();
+      table.string("created_at", 40).notNullable();
+      table.index(["service_id", "revoked_at"], "idx_service_emby_sessions_service");
+      table.index(["account_id", "expires_at"], "idx_service_emby_sessions_account");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_emby_playback_progress"))) {
+    await database.schema.createTable("service_emby_playback_progress", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_emby_accounts").onDelete("CASCADE");
+      table.string("item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
+      table.string("media_source_id", 128).nullable();
+      table.bigInteger("position_ticks").notNullable().defaultTo(0);
+      table.integer("played").notNullable().defaultTo(0);
+      table.integer("hidden_from_resume").notNullable().defaultTo(0);
+      table.integer("play_count").notNullable().defaultTo(0);
+      table.string("last_played_at", 40).nullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["service_id", "account_id", "item_id"], { indexName: "uq_service_emby_playback_progress" });
+      table.index(["service_id", "account_id", "updated_at"], "idx_service_emby_progress_resume");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_emby_playback_sessions"))) {
+    await database.schema.createTable("service_emby_playback_sessions", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_emby_accounts").onDelete("CASCADE");
+      table.string("item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
+      table.string("media_source_id", 128).nullable();
+      table.string("status", 32).notNullable();
+      table.bigInteger("position_ticks").notNullable().defaultTo(0);
+      table.integer("paused").notNullable().defaultTo(0);
+      table.string("started_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.string("stopped_at", 40).nullable();
+      table.index(["service_id", "account_id", "status"], "idx_service_emby_play_sessions_active");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_emby_playback_history"))) {
+    await database.schema.createTable("service_emby_playback_history", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_emby_accounts").onDelete("CASCADE");
+      table.string("item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
+      table.string("play_session_id", 64).notNullable().unique();
+      table.bigInteger("position_ticks").notNullable().defaultTo(0);
+      table.integer("completed").notNullable().defaultTo(0);
+      table.string("started_at", 40).notNullable();
+      table.string("stopped_at", 40).notNullable();
+      table.index(["service_id", "account_id", "stopped_at"], "idx_service_emby_play_history_recent");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_emby_item_preferences"))) {
+    await database.schema.createTable("service_emby_item_preferences", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_emby_accounts").onDelete("CASCADE");
+      table.string("item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
+      table.string("starred_at", 40).nullable();
+      table.integer("rating").notNullable().defaultTo(0);
+      table.string("updated_at", 40).notNullable();
+      table.unique(["service_id", "account_id", "item_id"], { indexName: "uq_service_emby_item_preferences" });
+      table.index(["service_id", "account_id", "starred_at"], "idx_service_emby_item_preferences_starred");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_emby_virtual_preferences"))) {
+    await database.schema.createTable("service_emby_virtual_preferences", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_emby_accounts").onDelete("CASCADE");
+      // 关键变量：演员等虚拟 Emby 条目没有 media_items 主键，只保存协议层稳定 ID。
+      table.string("protocol_item_id", 64).notNullable();
+      table.string("item_type", 32).notNullable();
+      table.string("starred_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["service_id", "account_id", "protocol_item_id"], { indexName: "uq_service_emby_virtual_preference" });
+      table.index(["service_id", "account_id", "starred_at"], "idx_service_emby_virtual_preferences_starred");
     });
   }
 }
@@ -1365,6 +1512,31 @@ async function migrateLibraryNavidromePathSuffix(database: Knex): Promise<void> 
   await addUniqueIfMissing(database, "media_libraries", ["navidrome_path_suffix_lookup"], "uq_media_libraries_navidrome_path_suffix");
 }
 
+/** 为已有媒体库补齐 Emby 独立协议配置和全局唯一地址后缀。 */
+async function migrateLibraryEmbyProtocol(database: Knex): Promise<void> {
+  const libraries = await database("media_libraries")
+    .select("service_id", "emby_path_suffix", "emby_path_suffix_lookup");
+  for (const library of libraries) {
+    // 关键变量：Emby 与 Jellyfin 可使用相同文本后缀，但各自在自己的 URL 前缀下全局唯一。
+    const pathSuffix = String(library.emby_path_suffix ?? "").trim() || String(library.service_id);
+    const pathSuffixLookup = String(library.emby_path_suffix_lookup ?? "").trim() || pathSuffix.toLowerCase();
+    await database("media_libraries").where({ service_id: library.service_id }).update({
+      emby_enabled: 0,
+      emby_relay_playback_enabled: 0,
+      emby_download_enabled: 1,
+      emby_region_libraries_enabled: 0,
+      emby_path_suffix: pathSuffix,
+      emby_path_suffix_lookup: pathSuffixLookup,
+    });
+  }
+  await addUniqueIfMissing(database, "media_libraries", ["emby_path_suffix_lookup"], "uq_media_libraries_emby_path_suffix");
+}
+
+/** 将首版 Emby 媒体库的默认播放路线调整为原始播放，用户可在协议配置中再主动开启中转。 */
+async function migrateEmbyRelayPlaybackDefault(database: Knex): Promise<void> {
+  await database("media_libraries").update({ emby_relay_playback_enabled: 0 });
+}
+
 /** 将旧服务级中转开关迁移为媒体库 APP 中转开关，并保留 Jellyfin 原有中转能力。 */
 async function migrateLibraryRelayPlaybackSettings(database: Knex): Promise<void> {
   const services = await database("cloud_services")
@@ -1406,6 +1578,7 @@ export async function migrateDatabase(database: Knex): Promise<void> {
   await createServiceTables(database);
   await createCatalogTables(database);
   await createPlaybackTables(database);
+  await createEmbyProtocolTables(database);
   await createOperationTables(database);
 
   const now = new Date().toISOString();
@@ -1455,6 +1628,12 @@ export async function migrateDatabase(database: Knex): Promise<void> {
     }
     if (Number(existingState.schema_version ?? 0) < 44) {
       await migrateLibraryNavidromePathSuffix(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 47) {
+      await migrateLibraryEmbyProtocol(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 48) {
+      await migrateEmbyRelayPlaybackDefault(database);
     }
     await database("system_state").where({ singleton_id: 1 }).update({
       service_instance_id: existingState.service_instance_id || randomUUID(),

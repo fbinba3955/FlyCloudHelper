@@ -16,6 +16,7 @@ import {
   type ServiceAccessAccount,
   updateServiceAccessAccount,
   updateServiceJellyfinSettings,
+  updateServiceEmbySettings,
   updateServiceNavidromeSettings,
   updateLibraryPlaybackSettings,
 } from "@/lib/api";
@@ -51,6 +52,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   }, [serviceId, admin]);
   const [message, setMessage] = useState<string | null>(null);
   const [updatingJellyfin, setUpdatingJellyfin] = useState(false);
+  const [updatingEmby, setUpdatingEmby] = useState(false);
   const [updatingNavidrome, setUpdatingNavidrome] = useState(false);
   const [updatingRelayPlayback, setUpdatingRelayPlayback] = useState(false);
   const [clearingCatalog, setClearingCatalog] = useState(false);
@@ -60,6 +62,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   const settings = resource.data?.settings;
   const catalogPath = admin ? "/admin/libraries/$serviceId/catalog" : "/app/libraries/$serviceId/catalog";
   const jellyfinPath = admin ? "/admin/libraries/$serviceId/jellyfin" : "/app/libraries/$serviceId/jellyfin";
+  const embyPath = admin ? "/admin/libraries/$serviceId/emby" : "/app/libraries/$serviceId/emby";
   const librariesPath = admin ? "/admin/catalog" : "/app/catalog";
 
   /** 立即保存当前媒体库的 Jellyfin 协议开关。 */
@@ -74,6 +77,21 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
       setMessage(error instanceof Error ? error.message : "Jellyfin 设置保存失败");
     } finally {
       setUpdatingJellyfin(false);
+    }
+  }
+
+  /** 立即保存当前媒体库的独立 Emby 协议总开关。 */
+  async function toggleEmby(): Promise<void> {
+    if (!settings || updatingEmby) return;
+    setUpdatingEmby(true);
+    try {
+      await updateServiceEmbySettings(serviceId, { embyEnabled: !settings.embyEnabled }, admin);
+      setMessage(settings.embyEnabled ? "Emby 协议已关闭" : "Emby 协议已启用");
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Emby 设置保存失败");
+    } finally {
+      setUpdatingEmby(false);
     }
   }
 
@@ -177,6 +195,25 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
               <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinEnabled ? "translate-x-5" : "translate-x-0"}`} />
             </button>
           </div>
+          <div className="mt-4 border-t border-border pt-4">
+            <Link to={jellyfinPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> Jellyfin 配置</SecondaryButton></Link>
+          </div>
+        </div>
+      </Panel>}
+      {!settings.navidromeSupported && <Panel title="Emby 协议" className="mt-4">
+        <div className="rounded-xl border border-border bg-secondary/35 p-4">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <p className="text-sm font-medium">启用 Emby 协议</p>
+              <p className="mt-1 text-xs text-muted-foreground">使用独立 Emby 账号、会话、收藏和观看记录，不与 Jellyfin 共用。</p>
+            </div>
+            <button type="button" role="switch" aria-checked={settings.embyEnabled} aria-label="启用 Emby 协议" disabled={updatingEmby} onClick={() => void toggleEmby()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.embyEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.embyEnabled ? "translate-x-5" : "translate-x-0"}`} />
+            </button>
+          </div>
+          <div className="mt-4 border-t border-border pt-4">
+            <Link to={embyPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> Emby 配置</SecondaryButton></Link>
+          </div>
         </div>
       </Panel>}
       {settings.navidromeSupported && (
@@ -204,11 +241,6 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
           <div className="mt-3"><Link to={jellyfinPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> 配置地址、用户名和密码</SecondaryButton></Link></div>
         </Panel>
       )}
-      {!settings.navidromeSupported && <Panel title="媒体库工具" className="mt-4">
-        <div className="flex flex-wrap gap-2">
-          <Link to={jellyfinPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> Jellyfin 配置</SecondaryButton></Link>
-        </div>
-      </Panel>}
       <Panel title="危险操作" className="mt-4">
         <button type="button" onClick={() => void clearCatalog()} disabled={service.status === "scanning" || clearingCatalog} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空媒体库"}</button>
       </Panel>

@@ -348,6 +348,15 @@ export interface ServiceAccessSettings {
   jellyfinPath: string;
   /** 固定 /j/ 前缀之后的单层可编辑地址后缀。 */
   jellyfinPathSuffix: string;
+  /** Emby 与 Jellyfin 完全独立的协议开关和访问地址。 */
+  embyEnabled: boolean;
+  embyUrl: string | null;
+  embyPath: string;
+  embyPathSuffix: string;
+  embyRelayPlaybackEnabled: boolean;
+  embyDownloadEnabled: boolean;
+  embyRegionLibrariesEnabled: boolean;
+  embyAccounts: ServiceAccessAccount[];
   /** 仅音乐类型服务支持公开 Navidrome/Subsonic 协议。 */
   navidromeSupported: boolean;
   navidromeEnabled: boolean;
@@ -1249,6 +1258,55 @@ export async function updateServiceJellyfinSettings(
   return result.settings;
 }
 
+/** 修改单个媒体库的独立 Emby 开关、地址、下载权限或节目地区分组。 */
+export async function updateServiceEmbySettings(
+  serviceId: string,
+  input: {
+    embyEnabled?: boolean;
+    embyPathSuffix?: string;
+    embyDownloadEnabled?: boolean;
+    embyRegionLibrariesEnabled?: boolean;
+  },
+  admin = false,
+): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(
+    admin ? `/api/v1/admin/services/${serviceId}/emby-settings` : `/api/v1/services/${serviceId}/emby-settings`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+  return result.settings;
+}
+
+/** 创建独立 Emby 协议账号；不会创建或修改 Jellyfin 账号。 */
+export async function createServiceEmbyAccount(serviceId: string, input: { username: string; password: string }, admin = false): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(
+    admin ? `/api/v1/admin/services/${serviceId}/emby-access-accounts` : `/api/v1/services/${serviceId}/emby-access-accounts`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return result.settings;
+}
+
+/** 修改独立 Emby 账号凭据或状态。 */
+export async function updateServiceEmbyAccount(serviceId: string, accountId: string, input: { username?: string; password?: string; status?: "active" | "disabled" }, admin = false): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(
+    admin ? `/api/v1/admin/services/${serviceId}/emby-access-accounts/${accountId}` : `/api/v1/services/${serviceId}/emby-access-accounts/${accountId}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+  return result.settings;
+}
+
+/** 删除独立 Emby 账号及其 Emby 用户状态。 */
+export function deleteServiceEmbyAccount(serviceId: string, accountId: string, admin = false): Promise<void> {
+  return requestJson(admin ? `/api/v1/admin/services/${serviceId}/emby-access-accounts/${accountId}` : `/api/v1/services/${serviceId}/emby-access-accounts/${accountId}`, { method: "DELETE", body: JSON.stringify({ confirmation: accountId }) });
+}
+
+/** 撤销一个 Emby 账号的全部 Emby 会话，不影响 Jellyfin 登录会话。 */
+export function revokeServiceEmbyAccountSessions(serviceId: string, accountId: string, admin = false): Promise<{ revokedCount: number }> {
+  return requestJson(
+    admin ? `/api/v1/admin/services/${serviceId}/emby-access-accounts/${accountId}/revoke-sessions` : `/api/v1/services/${serviceId}/emby-access-accounts/${accountId}/revoke-sessions`,
+    { method: "POST", body: "{}" },
+  );
+}
+
 /** 开启或关闭音乐媒体库的 Navidrome/Subsonic 公开协议。 */
 export async function updateServiceNavidromeSettings(
   serviceId: string,
@@ -1265,7 +1323,7 @@ export async function updateServiceNavidromeSettings(
 /** 分别修改媒体库的 APP 专用中转与 Jellyfin 中转开关。 */
 export async function updateLibraryPlaybackSettings(
   serviceId: string,
-  input: { appRelayPlaybackEnabled?: boolean; jellyfinRelayPlaybackEnabled?: boolean },
+  input: { appRelayPlaybackEnabled?: boolean; jellyfinRelayPlaybackEnabled?: boolean; embyRelayPlaybackEnabled?: boolean },
   admin = false,
 ): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(
