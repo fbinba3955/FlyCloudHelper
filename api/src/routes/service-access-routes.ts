@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.js";
 import { requireConfirmation, requireRequestUser, requireSuperAdmin } from "../http.js";
 import { buildJellyfinPath, validateJellyfinPathSuffix } from "../jellyfin-path.js";
+import { buildNavidromePath, validateNavidromePathSuffix } from "../navidrome-path.js";
 import type { ApiRuntime } from "../runtime.js";
 
 /** 通过基础服务校验媒体库归属，并返回一对一关联记录。 */
@@ -30,22 +31,34 @@ async function buildServiceAccessSettings(runtime: ApiRuntime, serviceId: string
       "jellyfin_path_suffix",
       "app_relay_playback_enabled",
       "jellyfin_relay_playback_enabled",
+      "jellyfin_download_enabled",
       "jellyfin_region_libraries_enabled",
+      "navidrome_enabled",
+      "navidrome_path_suffix",
     )
     .where({ service_id: serviceId })
     .first();
   // 关键变量：数据库升级尚未完成时临时回退服务 ID，保证设置页仍可读取。
   const jellyfinPathSuffix = String(library?.jellyfin_path_suffix ?? "").trim() || serviceId;
   const jellyfinPath = buildJellyfinPath(jellyfinPathSuffix);
+  const navidromePathSuffix = String(library?.navidrome_path_suffix ?? "").trim() || serviceId;
+  const navidromePath = buildNavidromePath(navidromePathSuffix);
   return {
     relayPlaybackSupported: supportsRelayPlayback(runtime, service.providerType),
     appRelayPlaybackEnabled: Number(library?.app_relay_playback_enabled) === 1,
     jellyfinRelayPlaybackEnabled: Number(library?.jellyfin_relay_playback_enabled) === 1,
+    jellyfinDownloadEnabled: library?.jellyfin_download_enabled === undefined
+      || Number(library.jellyfin_download_enabled) === 1,
     jellyfinRegionLibrariesEnabled: Number(library?.jellyfin_region_libraries_enabled) === 1,
     jellyfinEnabled: service.jellyfinEnabled,
     jellyfinUrl: await runtime.publicAccess.buildJellyfinUrl(jellyfinPathSuffix),
     jellyfinPath,
     jellyfinPathSuffix,
+    navidromeSupported: service.dataType === "music",
+    navidromeEnabled: service.dataType === "music" && Number(library?.navidrome_enabled) === 1,
+    navidromeUrl: service.dataType === "music" ? await runtime.publicAccess.buildNavidromeUrl(navidromePathSuffix) : null,
+    navidromePath,
+    navidromePathSuffix,
     account,
     accounts,
   };
@@ -178,7 +191,8 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       const changesJellyfinEnabled = request.body.jellyfinEnabled !== undefined;
       const changesPathSuffix = request.body.jellyfinPathSuffix !== undefined;
       const changesRegionLibraries = request.body.jellyfinRegionLibrariesEnabled !== undefined;
-      if (!changesJellyfinEnabled && !changesPathSuffix && !changesRegionLibraries) {
+      const changesDownloadEnabled = request.body.jellyfinDownloadEnabled !== undefined;
+      if (!changesJellyfinEnabled && !changesPathSuffix && !changesRegionLibraries && !changesDownloadEnabled) {
         throw new ApiError(422, "jellyfin_settings_empty", "没有需要保存的 Jellyfin 设置");
       }
       if (changesJellyfinEnabled && typeof request.body.jellyfinEnabled !== "boolean") {
@@ -186,6 +200,9 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       }
       if (changesRegionLibraries && typeof request.body.jellyfinRegionLibrariesEnabled !== "boolean") {
         throw new ApiError(422, "jellyfin_region_libraries_invalid", "Jellyfin 节目地区分组开关必须是布尔值");
+      }
+      if (changesDownloadEnabled && typeof request.body.jellyfinDownloadEnabled !== "boolean") {
+        throw new ApiError(422, "jellyfin_download_enabled_invalid", "Jellyfin 允许下载开关必须是布尔值");
       }
       const pathSuffix = changesPathSuffix ? validateJellyfinPathSuffix(request.body.jellyfinPathSuffix) : null;
       const publicAccess = await runtime.publicAccess.getStatus();
@@ -203,6 +220,9 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       if (changesRegionLibraries) {
         updateValues.jellyfin_region_libraries_enabled = request.body.jellyfinRegionLibrariesEnabled ? 1 : 0;
       }
+      if (changesDownloadEnabled) {
+        updateValues.jellyfin_download_enabled = request.body.jellyfinDownloadEnabled ? 1 : 0;
+      }
       if (pathSuffix) {
         updateValues.jellyfin_path_suffix = pathSuffix.value;
         updateValues.jellyfin_path_suffix_lookup = pathSuffix.lookup;
@@ -219,11 +239,81 @@ export async function registerServiceAccessRoutes(server: FastifyInstance, runti
       }
       const disabledJellyfin = changesJellyfinEnabled && request.body.jellyfinEnabled === false;
       const revokedCount = disabledJellyfin ? await runtime.serviceAccess.revokeSessions(request.params.serviceId, "jellyfin") : 0;
+      const jellyfinSettingsEvent = pathSuffix
+        ? "更新媒体库Jellyfin地址"
+        : changesJellyfinEnabled
+          ? request.body.jellyfinEnabled ? "启用媒体库Jellyfin协议" : "停用媒体库Jellyfin协议"
+          : changesRegionLibraries
+            ? "更新Jellyfin节目地区分组"
+            : "更新Jellyfin下载权限";
       runtime.logBusinessEvent("info", {
-        日志关键字: "codex-jellyfin-path", 事件: pathSuffix ? "更新媒体库Jellyfin地址" : (request.body.jellyfinEnabled ? "启用媒体库Jellyfin协议" : "停用媒体库Jellyfin协议"),
+        日志关键字: "codex-jellyfin-path", 事件: jellyfinSettingsEvent,
         操作用户ID: operator.id, 基础服务ID: request.params.serviceId, 撤销会话数: revokedCount,
         Jellyfin地址后缀: pathSuffix?.value ?? null,
         公开地址来源: publicAccess.source, 是否使用云助手请求地址: !publicAccess.publicBaseUrl,
+      });
+      if (changesDownloadEnabled) {
+        runtime.logBusinessEvent("info", {
+          日志关键字: "codex-jellyfin-download",
+          事件: request.body.jellyfinDownloadEnabled ? "开启Jellyfin影片下载" : "关闭Jellyfin影片下载",
+          操作用户ID: operator.id,
+          基础服务ID: request.params.serviceId,
+          是否允许下载: request.body.jellyfinDownloadEnabled === true,
+        });
+      }
+      return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
+    });
+
+    server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>(`${prefix}/:serviceId/navidrome-settings`, async (request) => {
+      const { operator, service } = await requireManagedService(runtime, request, request.params.serviceId, admin);
+      if (service.dataType !== "music") {
+        throw new ApiError(422, "navidrome_music_service_required", "只有音乐类型服务可以启用 Navidrome 协议");
+      }
+      const changesEnabled = request.body.navidromeEnabled !== undefined;
+      const changesPathSuffix = request.body.navidromePathSuffix !== undefined;
+      if (!changesEnabled && !changesPathSuffix) {
+        throw new ApiError(422, "navidrome_settings_empty", "没有需要保存的 Navidrome 设置");
+      }
+      if (changesEnabled && typeof request.body.navidromeEnabled !== "boolean") {
+        throw new ApiError(422, "navidrome_enabled_invalid", "Navidrome 开关必须是布尔值");
+      }
+      const pathSuffix = changesPathSuffix ? validateNavidromePathSuffix(request.body.navidromePathSuffix) : null;
+      if (pathSuffix) {
+        const duplicate = await runtime.database.query("media_libraries")
+          .select("service_id")
+          .where({ navidrome_path_suffix_lookup: pathSuffix.lookup })
+          .whereNot({ service_id: request.params.serviceId })
+          .first();
+        if (duplicate) throw new ApiError(409, "navidrome_path_suffix_conflict", "该 Navidrome 地址后缀已被使用，请更换后缀");
+      }
+      const updateValues: Record<string, unknown> = { updated_at: new Date().toISOString() };
+      if (changesEnabled) updateValues.navidrome_enabled = request.body.navidromeEnabled ? 1 : 0;
+      if (pathSuffix) {
+        updateValues.navidrome_path_suffix = pathSuffix.value;
+        updateValues.navidrome_path_suffix_lookup = pathSuffix.lookup;
+      }
+      let changed = 0;
+      try {
+        changed = await runtime.database.query("media_libraries")
+          .where({ service_id: request.params.serviceId })
+          .update(updateValues);
+      } catch (error) {
+        const databaseError = error as Error & { code?: string };
+        const duplicateSuffix = databaseError.code === "23505"
+          || databaseError.code === "ER_DUP_ENTRY"
+          || /unique|duplicate/iu.test(databaseError.message);
+        if (pathSuffix && duplicateSuffix) throw new ApiError(409, "navidrome_path_suffix_conflict", "该 Navidrome 地址后缀已被使用，请更换后缀");
+        throw error;
+      }
+      if (changed !== 1) throw new ApiError(404, "library_not_found", "媒体库不存在");
+      const publicAccess = await runtime.publicAccess.getStatus();
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-flycloud-helper-navidrome",
+        事件: pathSuffix ? "更新音乐库Navidrome地址" : (request.body.navidromeEnabled ? "启用音乐库Navidrome协议" : "停用音乐库Navidrome协议"),
+        操作用户ID: operator.id,
+        基础服务ID: request.params.serviceId,
+        是否已配置公开地址: Boolean(publicAccess.publicBaseUrl),
+        Navidrome地址后缀: pathSuffix?.value ?? null,
       });
       return { settings: await buildServiceAccessSettings(runtime, request.params.serviceId) };
     });

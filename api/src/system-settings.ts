@@ -1,5 +1,9 @@
 import type { FlyCloudHelperDatabase } from "./database.js";
 import { ApiError, validationError } from "./errors.js";
+import {
+  MUSIC_PLATFORM_SOURCE_ORDER,
+  type BuiltinMusicPlatformSource,
+} from "./metadata/music-platforms.js";
 import type { CredentialVault } from "./secrets.js";
 
 /** 系统级 TMDB Key 配置在数据库中的稳定标识。 */
@@ -7,6 +11,9 @@ export const tmdbKeySettingName = "tmdb_api_keys";
 
 /** TMDB API 与图片代理地址在普通系统配置表中的稳定标识。 */
 export const tmdbBaseUrlSettingName = "tmdb_base_urls";
+
+/** 系统级音乐刮削来源配置在普通系统配置表中的稳定标识。 */
+export const musicSourceSettingName = "music_scrape_sources";
 
 /** 云助手与 Flymby APP 对齐后的 TMDB API 默认地址。 */
 export const tmdbDefaultApiBaseUrl = "https://api.tmdb.org/3";
@@ -23,6 +30,93 @@ export interface TmdbBaseUrlSettings {
   configurationRevision: number;
   /** 是否保存过自定义地址。 */
   source: "default" | "database";
+}
+
+export interface MusicSourceSettings {
+  /** 按内置优先顺序排列的已启用来源。 */
+  enabledSources: BuiltinMusicPlatformSource[];
+  /** 数据库配置修订；0 表示使用全部来源默认值。 */
+  configurationRevision: number;
+  /** 是否保存过自定义来源集合。 */
+  source: "default" | "database";
+}
+
+/** 校验音乐刮削来源数组，并按内置来源顺序返回去重结果。 */
+export function validateMusicSourceList(value: unknown): BuiltinMusicPlatformSource[] {
+  if (!Array.isArray(value)) {
+    throw validationError("enabledSources", "音乐刮削来源必须使用数组提交");
+  }
+  const allowedSources = new Set<string>(MUSIC_PLATFORM_SOURCE_ORDER);
+  value.forEach((item, index) => {
+    if (typeof item !== "string" || !allowedSources.has(item)) {
+      throw validationError(`enabledSources.${index}`, "包含不支持的音乐刮削来源");
+    }
+  });
+  const selectedSources = new Set(value as BuiltinMusicPlatformSource[]);
+  return MUSIC_PLATFORM_SOURCE_ORDER.filter((source) => selectedSources.has(source));
+}
+
+/** 读取系统级音乐刮削来源；没有配置时默认启用全部内置来源。 */
+export async function loadMusicSourceSettings(database: FlyCloudHelperDatabase): Promise<MusicSourceSettings> {
+  const row = await database.query("system_settings").where({ setting_key: musicSourceSettingName }).first();
+  if (!row) {
+    return {
+      enabledSources: [...MUSIC_PLATFORM_SOURCE_ORDER],
+      configurationRevision: 0,
+      source: "default",
+    };
+  }
+  try {
+    const payload = JSON.parse(String(row.setting_value)) as unknown;
+    const object = payload && typeof payload === "object" && !Array.isArray(payload)
+      ? payload as Record<string, unknown>
+      : {};
+    return {
+      enabledSources: validateMusicSourceList(object.enabledSources),
+      configurationRevision: Number(row.revision ?? 0),
+      source: "database",
+    };
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(503, "music_source_configuration_invalid", "音乐刮削来源系统配置无法读取");
+  }
+}
+
+/** 保存系统级音乐刮削来源；选择全部来源时删除覆盖值并恢复默认配置。 */
+export async function saveMusicSourceSettings(
+  database: FlyCloudHelperDatabase,
+  input: { enabledSources: unknown; updatedByUserId: string },
+): Promise<MusicSourceSettings> {
+  const enabledSources = validateMusicSourceList(input.enabledSources);
+  const usesDefaultSources = enabledSources.length === MUSIC_PLATFORM_SOURCE_ORDER.length;
+  await database.query.transaction(async (transaction) => {
+    const existing = await transaction("system_settings").where({ setting_key: musicSourceSettingName }).first();
+    if (usesDefaultSources) {
+      if (existing) await transaction("system_settings").where({ setting_key: musicSourceSettingName }).delete();
+      return;
+    }
+    const settingValue = JSON.stringify({ enabledSources });
+    if (existing && String(existing.setting_value) === settingValue) return;
+    const now = new Date().toISOString();
+    if (existing) {
+      await transaction("system_settings").where({ setting_key: musicSourceSettingName }).update({
+        setting_value: settingValue,
+        revision: Number(existing.revision) + 1,
+        updated_by_user_id: input.updatedByUserId,
+        updated_at: now,
+      });
+      return;
+    }
+    await transaction("system_settings").insert({
+      setting_key: musicSourceSettingName,
+      setting_value: settingValue,
+      revision: 1,
+      updated_by_user_id: input.updatedByUserId,
+      created_at: now,
+      updated_at: now,
+    });
+  });
+  return loadMusicSourceSettings(database);
 }
 
 /** 校验 TMDB 基础地址并移除末尾斜杠，空值恢复默认地址。 */

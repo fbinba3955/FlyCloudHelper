@@ -50,8 +50,10 @@ ENV NODE_ENV=production \
     FLYCLOUDHELPER_PLUGIN_DIR=/data/plugins \
     FLYCLOUDHELPER_EXPORT_DIR=/data/exports \
     FLYCLOUDHELPER_MIGRATION_DIR=/data/migrations \
+    FLYCLOUDHELPER_MUSIC_ARTWORK_DIR=/data/music-artwork \
     FLYCLOUDHELPER_WEB_DIST_DIR=/app/web/dist \
     FLYCLOUDHELPER_FFPROBE_PATH=/usr/bin/ffprobe \
+    FLYCLOUDHELPER_FFMPEG_PATH=/usr/bin/ffmpeg \
     FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY=1
 
 WORKDIR /app
@@ -68,7 +70,7 @@ COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg gosu \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations \
+    && mkdir -p /data/database /data/secrets /data/plugins /data/exports /data/migrations /data/music-artwork \
     && chown -R node:node /data
 
 # 入口脚本需要先修复 NAS 挂载目录，随后立即通过 gosu 降权运行 Node 服务。

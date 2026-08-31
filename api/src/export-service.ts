@@ -358,6 +358,8 @@ export class LibraryExportService {
     // 关键变量：异常发生在媒体库查询前时使用通用名称，避免通知写入依赖已经失败的查询。
     let libraryDisplayName = "当前媒体库";
     let serviceId: string | null = null;
+    // 关键变量：快照属于服务级后台任务，外部投递必须遵循该服务当前保存的通知开关。
+    let notificationEnabled = false;
     // 关键变量：ZIP 压缩阶段可能长时间没有记录计数变化，独立心跳防止其他实例误判任务中断。
     const heartbeatTimer = setInterval((): void => {
       void this.database.query("library_exports")
@@ -377,11 +379,12 @@ export class LibraryExportService {
     try {
       const library = await this.database.query("media_libraries as l")
         .join("cloud_services as s", "s.id", "l.service_id")
-        .select("l.*", "s.display_name", "s.provider_type", "s.data_type")
+        .select("l.*", "s.display_name", "s.provider_type", "s.data_type", "s.notification_enabled")
         .where("l.id", libraryId).where("l.user_id", userId).whereNull("s.deleted_at").first();
       if (!library) throw new ApiError(404, "library_not_found", "媒体库不存在");
       libraryDisplayName = String(library.display_name || "当前媒体库");
       serviceId = String(library.service_id || "") || null;
+      notificationEnabled = Number(library.notification_enabled) === 1 || library.notification_enabled === true;
       const catalogVersion = Number(library.catalog_version ?? 0);
       await this.database.query("library_exports").where({ id: exportId }).update({
         status: "running",
@@ -566,6 +569,7 @@ export class LibraryExportService {
         title: "云端快照已生成",
         message: `服务“${libraryDisplayName}”的目录版本 v${catalogVersion} 快照已经生成完成。`,
         actionPath: serviceId ? `/app/services/${serviceId}/snapshots` : "/app/services",
+        deliverExternally: notificationEnabled,
       });
       this.logger("info", {
         日志关键字: "codex-flycloud-snapshot-task",
@@ -595,6 +599,7 @@ export class LibraryExportService {
         title: "云端快照生成失败",
         message: `服务“${libraryDisplayName}”的云端快照生成失败：${message}`,
         actionPath: serviceId ? `/app/services/${serviceId}/snapshots` : "/app/services",
+        deliverExternally: notificationEnabled,
       });
       this.logger("warn", {
         日志关键字: "codex-flycloud-snapshot-task",

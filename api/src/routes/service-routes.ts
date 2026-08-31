@@ -19,8 +19,8 @@ import {
 } from "../providers/types.js";
 import { streamJobEvents } from "./event-stream.js";
 
-/** 当前版本允许创建的服务数据类型；保留 MediaType 联合类型便于后续扩展。 */
-const supportedServiceDataTypes = new Set<MediaType>(["video"]);
+/** 当前版本允许创建的服务数据类型；有声书仍保留为后续阶段。 */
+const supportedServiceDataTypes = new Set<MediaType>(["video", "music"]);
 
 /** 记录迁回接口的失败阶段，不输出连接配置、Token 或导出文件路径。 */
 function logTransferOutFailure(
@@ -53,10 +53,10 @@ function toTransferOutApiError(stage: string, error: unknown): ApiError {
   );
 }
 
-/** 校验服务级数据类型，本阶段只开放影视。 */
+/** 校验服务级数据类型，当前开放影视和音乐。 */
 export function validateServiceDataType(value: unknown): MediaType {
   if (typeof value !== "string" || !supportedServiceDataTypes.has(value as MediaType)) {
-    throw validationError("dataType", "本阶段服务数据类型仅支持影视");
+    throw validationError("dataType", "当前服务数据类型仅支持影视或音乐");
   }
   return value as MediaType;
 }
@@ -296,7 +296,7 @@ function validateScanRoot(
   const rootMediaTypes = root.mediaTypes;
   if (rootMediaTypes !== undefined && (!Array.isArray(rootMediaTypes)
     || rootMediaTypes.some((item) => typeof item !== "string" || !allowedMediaTypes.has(item as MediaType)))) {
-    throw validationError(`scan.${fieldName}.${index}.mediaTypes`, "扫描根媒体类型必须与服务数据类型一致，本阶段仅支持影视");
+    throw validationError(`scan.${fieldName}.${index}.mediaTypes`, "扫描根媒体类型必须与服务数据类型一致");
   }
   return {
     ...(resourceId ? { resourceId } : {}),
@@ -379,7 +379,7 @@ export function validateScanProfile(
   }
   const mediaTypes = Array.isArray(profile.mediaTypes) ? profile.mediaTypes : [];
   if (mediaTypes.some((value) => value !== serviceDataType)) {
-    throw validationError("scan.mediaTypes", "扫描媒体类型必须与服务数据类型一致，本阶段仅支持影视");
+    throw validationError("scan.mediaTypes", "扫描媒体类型必须与服务数据类型一致");
   }
   const {
     roots: _legacyRoots,
@@ -444,13 +444,29 @@ export function validateMetadataProfile(
   }
   const profiles = profile.profiles as Record<string, unknown>;
   if (Object.keys(profiles).some((mediaType) => mediaType !== serviceDataType)) {
-    throw validationError("metadata.profiles", "元数据配置必须与服务数据类型一致，本阶段仅支持影视");
+    throw validationError("metadata.profiles", "元数据配置必须与服务数据类型一致");
   }
   const selectedProfile = profiles[serviceDataType];
   if (!selectedProfile || typeof selectedProfile !== "object" || Array.isArray(selectedProfile)) {
-    throw validationError(`metadata.profiles.${serviceDataType}`, "影视元数据配置必须是对象");
+    throw validationError(`metadata.profiles.${serviceDataType}`, `${serviceDataType === "music" ? "音乐" : "影视"}元数据配置必须是对象`);
   }
   const metadataSettings = selectedProfile as Record<string, unknown>;
+  if (metadataSettings.providerId !== undefined
+    && (typeof metadataSettings.providerId !== "string" || !metadataSettings.providerId.trim())) {
+    throw validationError(`metadata.profiles.${serviceDataType}.providerId`, "元数据来源必须是非空字符串");
+  }
+  if (serviceDataType === "music") {
+    if (metadataSettings.aggregateMode !== undefined
+      && metadataSettings.aggregateMode !== "fast"
+      && metadataSettings.aggregateMode !== "complete") {
+      throw validationError(`metadata.profiles.${serviceDataType}.aggregateMode`, "音乐元数据聚合模式无效");
+    }
+    if (metadataSettings.requiredFields !== undefined
+      && (!metadataSettings.requiredFields || typeof metadataSettings.requiredFields !== "object" || Array.isArray(metadataSettings.requiredFields))) {
+      throw validationError(`metadata.profiles.${serviceDataType}.requiredFields`, "音乐必需字段配置必须是对象");
+    }
+    return profile;
+  }
   if (metadataSettings.useNfo !== undefined && typeof metadataSettings.useNfo !== "boolean") {
     throw validationError(`metadata.profiles.${serviceDataType}.useNfo`, "本地 NFO 开关必须是布尔值");
   }
@@ -507,6 +523,21 @@ export function readVideoMetadataLogFields(profile: Record<string, unknown>): Re
     AI触发策略: videoProfile.aiCleaning && typeof videoProfile.aiCleaning === "object"
       ? String((videoProfile.aiCleaning as Record<string, unknown>).triggerMode ?? "weak_or_unmatched")
       : "disabled",
+  };
+}
+
+/** 提取不含查询内容的音乐元数据配置，用于统一业务日志。 */
+export function readMusicMetadataLogFields(profile: Record<string, unknown>): Record<string, unknown> {
+  const profiles = profile.profiles && typeof profile.profiles === "object" && !Array.isArray(profile.profiles)
+    ? profile.profiles as Record<string, unknown>
+    : {};
+  const musicProfile = profiles.music && typeof profiles.music === "object" && !Array.isArray(profiles.music)
+    ? profiles.music as Record<string, unknown>
+    : {};
+  return {
+    音乐元数据来源: typeof musicProfile.providerId === "string" ? musicProfile.providerId : "auto",
+    聚合模式: musicProfile.aggregateMode === "fast" ? "fast" : "complete",
+    标签读取方式: "云助手内置",
   };
 }
 
@@ -1300,10 +1331,10 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-metadata-profile",
-      事件: "更新影视元数据配置",
+      事件: service.dataType === "music" ? "更新音乐元数据配置" : "更新影视元数据配置",
       用户ID: user.id,
       服务ID: service.id,
-      ...readVideoMetadataLogFields(profile),
+      ...(service.dataType === "music" ? readMusicMetadataLogFields(profile) : readVideoMetadataLogFields(profile)),
     });
     return { service: updatedService };
   });
@@ -1361,6 +1392,27 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       用户ID: user.id,
       服务ID: service.id,
       是否启用APP专用中转: service.relayPlaybackEnabled,
+    });
+    return { service };
+  });
+
+  /** 保存当前账号所属服务的任务完成通知开关。 */
+  server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/notification-settings", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    if (typeof request.body.notificationEnabled !== "boolean") {
+      throw validationError("notificationEnabled", "任务完成通知开关必须是布尔值");
+    }
+    const service = await runtime.repository.updateServiceNotificationEnabled(
+      request.params.serviceId,
+      user.id,
+      request.body.notificationEnabled,
+    );
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-service-notification",
+      事件: "用户更新服务任务通知开关",
+      用户ID: user.id,
+      服务ID: service.id,
+      是否启用任务通知: service.notificationEnabled,
     });
     return { service };
   });

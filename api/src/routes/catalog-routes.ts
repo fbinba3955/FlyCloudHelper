@@ -17,6 +17,12 @@ import type { ApiRuntime } from "../runtime.js";
 const HOME_VIDEO_CATEGORY_KEYS = ["movie", "tv", "anime", "variety", "documentary"];
 /** 每个首页分类只返回少量预览条目，完整数量由数据库单独统计。 */
 const HOME_VIDEO_CATEGORY_PREVIEW_LIMIT = 18;
+/** 音乐首页三类稳定入口，key 同时供 APP 和网页识别。 */
+const HOME_MUSIC_CATEGORIES = [
+  { key: "song", itemType: "music.track" },
+  { key: "album", itemType: "music.album" },
+  { key: "artist", itemType: "music.artist" },
+];
 
 /** 查询媒体库并强制当前用户归属。 */
 async function requireLibrary(runtime: ApiRuntime, libraryId: string, userId: string) {
@@ -105,6 +111,10 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     const user = await requireRequestUser(request, runtime.database);
     const library = await requireLibrary(runtime, request.params.libraryId, user.id);
     const includeItems = request.query.includeItems !== "false"; // 设置页只读统计时不返回海报条目。
+    const libraryMediaType = String(library.data_type) as MediaType;
+    const countedItemTypes = libraryMediaType === "music"
+      ? HOME_MUSIC_CATEGORIES.map((category) => category.itemType)
+      : ["video.movie", "video.series"];
     // 关键变量：同一次首页请求并行读取海报和库统计，避免设置页再读取 APP 本地快照。
     const [matchedCountRows, libraryCountRows, episodeCountRow, sourceFileCountRow, sections, categorySections] = await Promise.all([
       runtime.database.query("media_items")
@@ -112,25 +122,25 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
         .count<Array<{ item_type: string; count: string | number }>>({ count: "id" })
         .where({ user_id: user.id, library_id: request.params.libraryId, match_state: "matched" })
         .whereNull("deleted_at")
-        .whereIn("item_type", ["video.movie", "video.series"])
+        .whereIn("item_type", countedItemTypes)
         .groupBy("item_type"),
       runtime.database.query("media_items")
         .select("item_type")
         .count<Array<{ item_type: string; count: string | number }>>({ count: "id" })
         .where({ user_id: user.id, library_id: request.params.libraryId })
         .whereNull("deleted_at")
-        .whereIn("item_type", ["video.movie", "video.series"])
+        .whereIn("item_type", countedItemTypes)
         .groupBy("item_type"),
       runtime.database.query("media_items")
         .count<{ count: string | number }[]>({ count: "id" })
-        .where({ user_id: user.id, library_id: request.params.libraryId, item_type: "video.episode" })
+        .where({ user_id: user.id, library_id: request.params.libraryId, item_type: libraryMediaType === "music" ? "music.track" : "video.episode" })
         .whereNull("deleted_at")
         .first(),
       runtime.database.query("source_files")
         .count<{ count: string | number }[]>({ count: "id" })
         .where({ user_id: user.id, library_id: request.params.libraryId, status: "active" })
         .first(),
-      includeItems ? Promise.all((["video"] as MediaType[]).map(async (mediaType) => {
+      includeItems ? Promise.all(([libraryMediaType] as MediaType[]).map(async (mediaType) => {
         const result = await runtime.repository.listCatalogItems({
           userId: user.id,
           libraryId: request.params.libraryId,
@@ -143,22 +153,28 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
         });
         return { mediaType, total: result.total, items: result.items };
       })) : Promise.resolve([]),
-      includeItems ? Promise.all(HOME_VIDEO_CATEGORY_KEYS.map(async (categoryKey) => {
+      includeItems ? Promise.all((libraryMediaType === "music"
+        ? HOME_MUSIC_CATEGORIES
+        : HOME_VIDEO_CATEGORY_KEYS.map((key) => ({ key, itemType: undefined }))).map(async (category) => {
         const result = await runtime.repository.listCatalogItems({
           userId: user.id,
           libraryId: request.params.libraryId,
-          mediaType: "video",
-          categoryKey,
+          mediaType: libraryMediaType,
+          itemType: category.itemType,
+          categoryKey: libraryMediaType === "video" ? category.key : undefined,
           sort: "updated_desc",
           limit: HOME_VIDEO_CATEGORY_PREVIEW_LIMIT,
           offset: 0,
           includeFileCounts: false,
         });
-        return { key: categoryKey, total: result.total, items: result.items };
+        return { key: category.key, total: result.total, items: result.items };
       })) : Promise.resolve([]),
     ]);
     const movieCount = Number(matchedCountRows.find((row) => row.item_type === "video.movie")?.count ?? 0);
     const showCount = Number(matchedCountRows.find((row) => row.item_type === "video.series")?.count ?? 0);
+    const songCount = Number(matchedCountRows.find((row) => row.item_type === "music.track")?.count ?? 0);
+    const albumCount = Number(matchedCountRows.find((row) => row.item_type === "music.album")?.count ?? 0);
+    const artistCount = Number(matchedCountRows.find((row) => row.item_type === "music.artist")?.count ?? 0);
     request.log.info({
       日志关键字: "codex-flycloud-home-category",
       事件: "首页分类统计完成",
@@ -167,12 +183,18 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     });
     return {
       catalogVersion: Number(library.catalog_version),
-      total: movieCount + showCount,
+      total: libraryMediaType === "music" ? songCount : movieCount + showCount,
       movieCount,
       showCount,
+      songCount,
+      albumCount,
+      artistCount,
       libraryMovieCount: Number(libraryCountRows.find((row) => row.item_type === "video.movie")?.count ?? 0),
       libraryShowCount: Number(libraryCountRows.find((row) => row.item_type === "video.series")?.count ?? 0),
-      episodeCount: Number(episodeCountRow?.count ?? 0),
+      librarySongCount: Number(libraryCountRows.find((row) => row.item_type === "music.track")?.count ?? 0),
+      libraryAlbumCount: Number(libraryCountRows.find((row) => row.item_type === "music.album")?.count ?? 0),
+      libraryArtistCount: Number(libraryCountRows.find((row) => row.item_type === "music.artist")?.count ?? 0),
+      episodeCount: libraryMediaType === "music" ? 0 : Number(episodeCountRow?.count ?? 0),
       sourceFileCount: Number(sourceFileCountRow?.count ?? 0),
       sections,
       categorySections,
@@ -190,7 +212,7 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
       .groupBy("media_type", "item_type", "match_state");
     return {
       catalogVersion: Number(library.catalog_version),
-      mediaTypes: ["video"],
+      mediaTypes: [String(library.data_type)],
       sorts: ["created_desc", "year_desc", "premiere_date_desc", "title_asc"],
       combinations: rows.map((row) => ({
         mediaType: row.media_type,
@@ -281,6 +303,22 @@ export async function registerCatalogRoutes(server: FastifyInstance, runtime: Ap
     await requireLibrary(runtime, request.params.libraryId, user.id);
     await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
     return { items: await runtime.repository.listCatalogChildren(request.params.itemId, user.id) };
+  });
+
+  /** 返回音乐专辑或歌曲关联的艺术家。 */
+  server.get<{ Params: { libraryId: string; itemId: string } }>("/api/v1/libraries/:libraryId/items/:itemId/artists", async (request) => {
+    const user = await requireRequestUser(request, runtime.database);
+    await requireLibrary(runtime, request.params.libraryId, user.id);
+    const item = await requireLibraryItem(runtime, user.id, request.params.libraryId, request.params.itemId);
+    const artists = await runtime.repository.listCatalogMusicArtists(item.id, user.id);
+    request.log.info({
+      日志关键字: "codex-flycloud-helper-music-album-detail",
+      事件: "读取音乐条目关联艺术家",
+      媒体条目ID: item.id,
+      媒体条目类型: item.itemType,
+      艺术家数量: artists.length,
+    });
+    return { items: artists };
   });
 
   server.get<{ Params: { libraryId: string; itemId: string } }>("/api/v1/libraries/:libraryId/items/:itemId/paths", async (request) => {

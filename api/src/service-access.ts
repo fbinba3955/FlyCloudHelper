@@ -1,7 +1,8 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type { FlyCloudHelperDatabase } from "./database.js";
 import { createUsernameLookup, hashPassword, verifyPassword } from "./auth.js";
 import { ApiError, validationError } from "./errors.js";
+import type { CredentialVault } from "./secrets.js";
 
 /** 服务访问账号的公开状态；密码哈希永不离开服务端。 */
 export interface ServiceAccessAccountRecord {
@@ -9,6 +10,8 @@ export interface ServiceAccessAccountRecord {
   serviceId: string;
   username: string;
   hasPassword: boolean;
+  /** 是否已经保存 Subsonic token+salt 认证所需的加密协议密码。 */
+  subsonicTokenAuthReady: boolean;
   credentialRevision: number;
   status: "active" | "disabled";
   createdAt: string;
@@ -46,7 +49,10 @@ export function generateServiceAccessPassword(): string {
 
 /** 服务访问账号和协议会话的集中数据服务。 */
 export class ServiceAccessService {
-  public constructor(private readonly database: FlyCloudHelperDatabase) {}
+  public constructor(
+    private readonly database: FlyCloudHelperDatabase,
+    private readonly vault: CredentialVault,
+  ) {}
 
   /** 为升级前已经存在的服务补齐默认免密码账号。 */
   public async ensureExistingServices(): Promise<number> {
@@ -54,6 +60,16 @@ export class ServiceAccessService {
       .leftJoin("service_access_accounts as a", "a.service_id", "s.id")
       .select("s.id").whereNull("s.deleted_at").whereNull("a.id");
     for (const service of services) await this.createForService(String(service.id));
+    // 关键变量：免密码历史账号的真实密码可确定为空，直接补齐摘要认证所需的加密值。
+    const passwordlessAccounts = await this.database.query("service_access_accounts")
+      .select("id")
+      .where({ password_required: 0 })
+      .whereNull("protocol_password_encrypted");
+    for (const account of passwordlessAccounts) {
+      await this.database.query("service_access_accounts").where({ id: account.id }).update({
+        protocol_password_encrypted: this.vault.encrypt({ password: "" }),
+      });
+    }
     return services.length;
   }
 
@@ -69,6 +85,7 @@ export class ServiceAccessService {
       username,
       username_lookup: createUsernameLookup(username),
       password_hash: await hashPassword(password),
+      protocol_password_encrypted: this.vault.encrypt({ password }),
       password_required: 0,
       credential_revision: 1,
       status: "active",
@@ -76,7 +93,7 @@ export class ServiceAccessService {
       updated_at: now,
     });
     return {
-      account: { id: accountId, serviceId, username, hasPassword: false, credentialRevision: 1, status: "active", createdAt: now, updatedAt: now },
+      account: { id: accountId, serviceId, username, hasPassword: false, subsonicTokenAuthReady: true, credentialRevision: 1, status: "active", createdAt: now, updatedAt: now },
       password,
     };
   }
@@ -114,6 +131,7 @@ export class ServiceAccessService {
         username,
         username_lookup: createUsernameLookup(username),
         password_hash: await hashPassword(password),
+        protocol_password_encrypted: this.vault.encrypt({ password }),
         password_required: password.length > 0 ? 1 : 0,
         credential_revision: 1,
         status: "active",
@@ -153,6 +171,44 @@ export class ServiceAccessService {
     return this.mapAccount(row);
   }
 
+  /** 验证 Subsonic/Navidrome 请求中的明文、enc 十六进制或 token+salt 凭据。 */
+  public async authenticateSubsonic(
+    serviceId: string,
+    input: { username: unknown; password: unknown; token: unknown; salt: unknown },
+  ): Promise<ServiceAccessAccountRecord> {
+    let username: string;
+    try {
+      username = validateServiceAccessUsername(input.username);
+    } catch {
+      throw new ApiError(401, "subsonic_login_failed", "用户名或密码错误");
+    }
+    const row = await this.database.query("service_access_accounts")
+      .where({ service_id: serviceId, username_lookup: createUsernameLookup(username), status: "active" })
+      .first();
+    if (!row) throw new ApiError(401, "subsonic_login_failed", "用户名或密码错误");
+
+    let matched = false;
+    if (typeof input.password === "string") {
+      const password = this.decodeSubsonicPassword(input.password);
+      matched = await verifyPassword(String(row.password_hash ?? ""), password);
+    } else if (typeof input.token === "string" && typeof input.salt === "string") {
+      const token = input.token.toLocaleLowerCase("en-US");
+      const salt = input.salt;
+      if (/^[a-f0-9]{32}$/u.test(token) && salt.length > 0 && salt.length <= 255) {
+        const encryptedPassword = row.protocol_password_encrypted ? String(row.protocol_password_encrypted) : "";
+        const password = Number(row.password_required ?? 1) === 0
+          ? ""
+          : encryptedPassword ? String(this.vault.decrypt(encryptedPassword).password ?? "") : null;
+        if (password !== null) {
+          const expected = createHash("md5").update(`${password}${salt}`, "utf8").digest("hex");
+          matched = timingSafeEqual(Buffer.from(token, "ascii"), Buffer.from(expected, "ascii"));
+        }
+      }
+    }
+    if (!matched) throw new ApiError(401, "subsonic_login_failed", "用户名或密码错误");
+    return this.mapAccount(row);
+  }
+
   /** 修改用户名或密码，并让所有协议的旧会话立即失效。 */
   public async updateCredentials(serviceId: string, accountId: string, input: { username?: unknown; password?: unknown }): Promise<ServiceAccessAccountRecord> {
     return this.database.query.transaction(async (transaction) => {
@@ -167,6 +223,7 @@ export class ServiceAccessService {
         const password = validateServiceAccessPassword(input.password);
         patch.password_hash = await hashPassword(password);
         patch.password_required = password.length > 0 ? 1 : 0;
+        patch.protocol_password_encrypted = this.vault.encrypt({ password });
       }
       if (input.username === undefined && input.password === undefined) {
         throw validationError("credentials", "至少需要修改用户名或密码中的一项");
@@ -247,11 +304,22 @@ export class ServiceAccessService {
     throw error;
   }
 
+  /** 解码 Subsonic 兼容的 enc: 十六进制密码，其他字符串按明文处理。 */
+  private decodeSubsonicPassword(value: string): string {
+    if (!value.startsWith("enc:")) return value;
+    const encoded = value.slice(4);
+    if (!encoded || encoded.length % 2 !== 0 || !/^[a-f0-9]+$/iu.test(encoded)) {
+      throw new ApiError(401, "subsonic_login_failed", "用户名或密码错误");
+    }
+    return Buffer.from(encoded, "hex").toString("utf8");
+  }
+
   /** 将数据库行转换为公开账号状态。 */
   private mapAccount(row: Record<string, unknown>): ServiceAccessAccountRecord {
     return {
       id: String(row.id), serviceId: String(row.service_id), username: String(row.username),
       hasPassword: Number(row.password_required ?? 1) !== 0,
+      subsonicTokenAuthReady: Number(row.password_required ?? 1) === 0 || Boolean(row.protocol_password_encrypted),
       credentialRevision: Number(row.credential_revision), status: String(row.status) as "active" | "disabled",
       createdAt: String(row.created_at), updatedAt: String(row.updated_at),
     };

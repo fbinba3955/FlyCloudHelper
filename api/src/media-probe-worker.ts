@@ -174,6 +174,21 @@ export class MediaProbeWorker {
     this.config = input.config;
   }
 
+  /** 尽力读取服务通知开关，查询异常时只关闭本次外部投递。 */
+  private async readServiceNotificationEnabled(serviceId: string): Promise<boolean> {
+    try {
+      return await this.repository.isServiceNotificationEnabled(serviceId);
+    } catch (error) {
+      this.logger.warn({
+        日志关键字: "codex-flycloud-helper-service-notification",
+        事件: "规格任务读取服务通知开关失败",
+        服务ID: serviceId,
+        错误信息: error instanceof Error ? error.message : "未知数据库错误",
+      });
+      return false;
+    }
+  }
+
   /** 启动媒体规格队列。 */
   public start(): void {
     if (!this.config.workerEnabled || this.pollTimer || this.stopping) return;
@@ -428,7 +443,28 @@ export class MediaProbeWorker {
     } finally {
       this.abortControllers.delete(controller);
       try {
-        await this.repository.synchronizeMediaProbeJob(job.batchJobId);
+        const synchronization = await this.repository.synchronizeMediaProbeJob(job.batchJobId);
+        if (synchronization?.completedNow) {
+          const notificationEnabled = await this.readServiceNotificationEnabled(job.serviceId);
+          await this.database.createNotificationSafely({
+            userId: synchronization.job.userId,
+            category: "task",
+            tone: synchronization.job.errorCount > 0 ? "warning" : "success",
+            title: "视频规格扫描已完成",
+            message: `服务“${synchronization.job.serviceName}”的视频规格扫描已完成：${synchronization.completedFileCount} 个文件完成了规格扫描。${synchronization.job.errorCount > 0 ? `另有 ${synchronization.job.errorCount} 个文件失败。` : ""}`,
+            actionPath: "/app/jobs",
+            deliverExternally: notificationEnabled,
+          });
+          this.logger.info({
+            日志关键字: "codex-flycloud-helper-service-notification",
+            事件: "视频规格任务完成通知已生成",
+            服务ID: job.serviceId,
+            后台任务ID: job.batchJobId,
+            完成文件数量: synchronization.completedFileCount,
+            失败文件数量: synchronization.job.errorCount,
+            是否投递外部通知: notificationEnabled,
+          });
+        }
       } catch (error) {
         this.logger.error({
           日志关键字: "codex-media-ffprobe",

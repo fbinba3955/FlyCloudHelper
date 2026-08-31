@@ -286,18 +286,16 @@ async function buildPlaybackInfo(runtime: ApiRuntime, compatibility: JellyfinCom
 
 /** 通过 Jellyfin 图片接口代理媒体库已经保存的公开 HTTP 图片。 */
 async function sendItemImage(compatibility: JellyfinCompatibilityService, context: JellyfinLibraryContext, request: FastifyRequest, reply: FastifyReply, itemId: string, imageType: string) {
-  const item = await compatibility.resolveImageItem(context, itemId, imageType);
-  const rawUrl = imageType.toLowerCase() === "backdrop" ? item.backdropUrl : item.posterUrl;
-  if (!rawUrl) throw new ApiError(404, "jellyfin_image_not_found", "图片不存在");
+  const imageSource = await compatibility.resolveImageSource(context, itemId, imageType);
+  const rawUrl = imageSource.url;
   let imageUrl: URL;
   try { imageUrl = new URL(rawUrl); } catch { throw new ApiError(404, "jellyfin_image_not_found", "图片地址不可用"); }
   if (imageUrl.protocol !== "https:" && imageUrl.protocol !== "http:") {
     throw new ApiError(422, "jellyfin_image_source_unsupported", "当前图片来源暂不支持协议代理");
   }
-  const imageTag = String(Date.parse(item.updatedAt) || 1);
-  const responseEtag = `"${imageTag}"`;
+  const responseEtag = `"${imageSource.imageTag}"`;
   reply.header("ETag", responseEtag);
-  reply.header("Last-Modified", new Date(item.updatedAt).toUTCString());
+  reply.header("Last-Modified", new Date(imageSource.updatedAt).toUTCString());
   if (request.headers["if-none-match"] === responseEtag) return reply.status(304).send();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10_000);
@@ -321,17 +319,38 @@ async function sendItemImage(compatibility: JellyfinCompatibilityService, contex
   } finally { clearTimeout(timer); }
 }
 
-/** 将 Provider 原始媒体流转发给 Jellyfin 客户端。 */
-async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompatibilityService, context: JellyfinContext, request: FastifyRequest, reply: FastifyReply, itemId: string) {
+/** 将 Provider 原始媒体流转发给 Jellyfin 客户端，用途决定播放路线或强制原文件下载。 */
+async function sendMediaStream(
+  runtime: ApiRuntime,
+  compatibility: JellyfinCompatibilityService,
+  context: JellyfinContext,
+  request: FastifyRequest,
+  reply: FastifyReply,
+  itemId: string,
+  responseMode: "playback" | "download" = "playback",
+) {
   const service = await compatibility.requireEnabledService(context.serviceId);
+  if (responseMode === "download" && !context.downloadEnabled) {
+    runtime.logBusinessEvent("warn", {
+      日志关键字: "codex-jellyfin-download",
+      事件: "拦截已关闭的Jellyfin影片下载",
+      服务ID: context.serviceId,
+      协议条目ID: itemId,
+      是否允许下载: false,
+    });
+    throw new ApiError(403, "jellyfin_download_disabled", "当前 Jellyfin 服务未允许下载影片");
+  }
   const requestedRoute = readPlaybackRoute(request);
   // Jellyfin 标准 Videos 接口使用独立媒体库开关；自动模式开启时优先服务器中转，保证第三方客户端无需处理 Provider 请求头。
   const jellyfinRelayPlaybackEnabled = Number(service.jellyfin_relay_playback_enabled) === 1
     || service.jellyfin_relay_playback_enabled === true;
   // 关键变量：媒体库开关决定普通客户端的自动路线；显式 server 表示当前客户端主动要求中转。
-  const effectiveRoute = requestedRoute === "auto"
-    ? jellyfinRelayPlaybackEnabled ? "server" : "origin"
-    : requestedRoute;
+  // 关键变量：下载始终由云助手转发原文件字节，不受播放中转开关影响，也不执行转码。
+  const effectiveRoute = responseMode === "download"
+    ? "server"
+    : requestedRoute === "auto"
+      ? jellyfinRelayPlaybackEnabled ? "server" : "origin"
+      : requestedRoute;
   const internalItemId = compatibility.toInternalItemId(itemId);
   const item = await runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
   if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
@@ -396,14 +415,29 @@ async function sendMediaStream(runtime: ApiRuntime, compatibility: JellyfinCompa
     if (!file || !access) {
       throw new ApiError(404, "jellyfin_provider_file_not_found", "当前播放版本对应的网盘文件已删除");
     }
-    const upstream = await providerStream(access.url, { method: request.method, headers: buildUpstreamHeaders(request, access.headers) }, {
+    const upstreamHeaders = buildUpstreamHeaders(request, access.headers);
+    // 下载客户端可能沿用 JSON API 的 Accept，向 Provider 请求原始文件时必须改为接受任意媒体类型。
+    if (responseMode === "download") upstreamHeaders.Accept = "*/*";
+    const upstream = await providerStream(access.url, { method: request.method, headers: upstreamHeaders }, {
       allowInsecureHttp: runtime.config.allowInsecureProviderHttp,
       logConnectionFailure: (fields) => runtime.logBusinessEvent("warn", fields),
     }, abortController.signal);
     upstreamBody = upstream.body;
     copyMediaResponseHeaders(reply, upstream.headers);
+    if (responseMode === "download") {
+      const downloadFileName = String(file.name ?? item.title).trim() || item.title;
+      reply.header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(downloadFileName)}`);
+    }
     reply.status(upstream.statusCode);
-    runtime.logBusinessEvent("info", {
+    runtime.logBusinessEvent("info", responseMode === "download" ? {
+      日志关键字: "codex-jellyfin-download",
+      事件: "建立Jellyfin影片下载连接",
+      服务ID: context.serviceId,
+      媒体条目ID: internalItemId,
+      源文件ID: String(file.fileId),
+      是否Range请求: Boolean(request.headers.range),
+      上游状态码: upstream.statusCode,
+    } : {
       日志关键字: "codex-jellyfin-compat", 事件: "建立Jellyfin服务器直放连接", 服务ID: context.serviceId,
       媒体条目ID: internalItemId, 源文件ID: String(file.fileId), 是否Range请求: Boolean(request.headers.range), 上游状态码: upstream.statusCode,
     });
@@ -455,7 +489,7 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
   });
   server.post(`${prefix}/Users/AuthenticateByName`, async (request) => compatibility.login(await resolveServiceId(request), request, (request.body ?? {}) as Record<string, unknown>));
   server.post(`${prefix}/Sessions/Logout`, async (request, reply) => { await compatibility.logout(await resolveServiceId(request), request); return reply.status(204).send(); });
-  server.get(`${prefix}/Users/:userId`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.mapUser(context.accountId, context.accountUsername, context.serviceId, context.accountHasPassword); });
+  server.get(`${prefix}/Users/:userId`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.mapUser(context.accountId, context.accountUsername, context.serviceId, context.accountHasPassword, context.downloadEnabled); });
   server.get(`${prefix}/Users/:userId/Views`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.listLibraries(context); });
   server.get(`${prefix}/UserViews`, async (request) => compatibility.listLibraries(await authenticated(request)));
   server.get(`${prefix}/Users/:userId/Items/Resume`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); return compatibility.listResume(context, readQuery(request)); });
@@ -464,6 +498,8 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
     const context = await authenticated(request);
     const params = request.params as { userId: string; itemId: string };
     requireProtocolUser(context, params.userId);
+    const personItem = await compatibility.getPersonItem(context, params.itemId);
+    if (personItem) return personItem;
     const sourceItem = await runtime.repository.getCatalogItem(
       compatibility.toInternalItemId(params.itemId),
       context.ownerUserId,
@@ -478,20 +514,49 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
       parent ? await runtime.repository.getCatalogItem(String(parent.parent_item_id), context.ownerUserId) : undefined,
     );
   });
-  server.get(`${prefix}/Users/:userId/Items`, async (request) => { const context = await authenticated(request); requireProtocolUser(context, String((request.params as { userId: string }).userId)); const query = readQuery(request); return String(query.SortBy ?? "").includes("DatePlayed") || String(query.Filters ?? "").includes("IsPlayed") ? compatibility.listHistory(context, query) : compatibility.listItems(context, query); });
+  server.get(`${prefix}/Users/:userId/Items`, async (request) => {
+    const context = await authenticated(request);
+    requireProtocolUser(context, String((request.params as { userId: string }).userId));
+    const query = readQuery(request);
+    // 关键变量：收藏和已观看必须走用户状态过滤，仅 DatePlayed 排序才走全部播放历史。
+    const hasStateFilter = String(query.Filters ?? query.filters ?? "").split(",").some((value) => ["IsFavorite", "IsPlayed"].includes(value.trim()))
+      || String(query.IsFavorite ?? query.isFavorite ?? "").toLowerCase() === "true"
+      || String(query.IsPlayed ?? query.isPlayed ?? "").toLowerCase() === "true";
+    return !hasStateFilter && String(query.SortBy ?? query.sortBy ?? "").includes("DatePlayed")
+      ? compatibility.listHistory(context, query)
+      : compatibility.listItems(context, query);
+  });
   server.get(`${prefix}/Users/:userId/Items/:itemId/UserData`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); return compatibility.getUserData(context, params.itemId); });
   server.post(`${prefix}/Users/:userId/Items/:itemId/UserData`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); return compatibility.updateUserData(context, params.itemId, (request.body ?? {}) as Record<string, unknown>); });
   server.get(`${prefix}/Items/Counts`, async (request) => compatibility.getItemCounts(await authenticated(request)));
   server.get(`${prefix}/Items/:itemId/Similar`, async (request) => compatibility.listSimilar(await authenticated(request), String((request.params as { itemId: string }).itemId), readQuery(request)));
   server.get(`${prefix}/Items/:itemId`, async (request) => {
     const context = await authenticated(request);
+    const protocolItemId = String((request.params as { itemId: string }).itemId);
+    const personItem = await compatibility.getPersonItem(context, protocolItemId);
+    if (personItem) return personItem;
     const sourceItem = await runtime.repository.getCatalogItem(
-      compatibility.toInternalItemId(String((request.params as { itemId: string }).itemId)),
+      compatibility.toInternalItemId(protocolItemId),
       context.ownerUserId,
     );
-    return compatibility.mapItem(context, await hydrateRealtimeVideoDetails(runtime, sourceItem));
+    const item = await hydrateRealtimeVideoDetails(runtime, sourceItem);
+    const parentRelation = item.itemType === "video.episode"
+      ? await runtime.database.query("media_relations").where({ child_item_id: item.id }).first()
+      : null;
+    const parent = parentRelation
+      ? await runtime.repository.getCatalogItem(String(parentRelation.parent_item_id), context.ownerUserId)
+      : undefined;
+    return compatibility.mapItem(context, item, parent);
   });
   server.get(`${prefix}/Items`, async (request) => compatibility.listItems(await authenticated(request), readQuery(request)));
+  server.get(`${prefix}/Persons`, async (request) => compatibility.listPersons(await authenticated(request), readQuery(request)));
+  server.get(`${prefix}/Persons/:name`, async (request) => {
+    const context = await authenticated(request);
+    const personName = String((request.params as { name: string }).name);
+    const personItem = await compatibility.getPersonByName(context, personName);
+    if (!personItem) throw new ApiError(404, "jellyfin_person_not_found", "演员不存在");
+    return personItem;
+  });
   server.get(`${prefix}/Items/:itemId/Ancestors`, async (request) => {
     const context = await authenticated(request);
     const protocolItemId = String((request.params as { itemId: string }).itemId);
@@ -509,6 +574,8 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
   server.get(`${prefix}/Shows/:seriesId/Episodes`, async (request) => compatibility.listEpisodes(await authenticated(request), String((request.params as { seriesId: string }).seriesId), readQuery(request)));
   server.get(`${prefix}/Shows/NextUp`, async (request) => compatibility.listNextUp(await authenticated(request), readQuery(request)));
   server.route({ method: ["GET", "POST"], url: `${prefix}/Items/:itemId/PlaybackInfo`, handler: async (request) => buildPlaybackInfo(runtime, compatibility, await authenticated(request), request, String((request.params as { itemId: string }).itemId)) });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/Download`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId), "download") });
+  server.route({ method: ["GET", "HEAD"], url: `${prefix}/Items/:itemId/File`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId), "download") });
   // 官方 Jellyfin 使用 /Videos；Fastify 已按 Jellyfin 行为配置为大小写不敏感，Flymby 的 /videos 同样命中。
   server.route({ method: ["GET", "HEAD"], url: `${prefix}/Videos/:itemId/stream.:container`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
   server.route({ method: ["GET", "HEAD"], url: `${prefix}/Videos/:itemId/stream`, handler: async (request, reply) => sendMediaStream(runtime, compatibility, await authenticated(request), request, reply, String((request.params as { itemId: string }).itemId)) });
@@ -519,8 +586,18 @@ function registerProtocolPrefix(server: FastifyInstance, runtime: ApiRuntime, co
   server.post(`${prefix}/Sessions/Playing`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "playing", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
   server.post(`${prefix}/Sessions/Playing/Progress`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "progress", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
   server.post(`${prefix}/Sessions/Playing/Stopped`, async (request, reply) => { await compatibility.reportPlayback(await authenticated(request), "stopped", (request.body ?? {}) as Record<string, unknown>); return reply.status(204).send(); });
-  server.post(`${prefix}/Users/:userId/PlayedItems/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); return { UserData: await compatibility.setPlayed(context, params.itemId, true) }; });
-  server.delete(`${prefix}/Users/:userId/PlayedItems/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); return { UserData: await compatibility.setPlayed(context, params.itemId, false) }; });
+  // Jellyfin 10.8 及旧客户端的用户路径，响应直接返回 UserItemDataDto。
+  server.post(`${prefix}/Users/:userId/PlayedItems/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); return compatibility.setPlayed(context, params.itemId, true); });
+  server.delete(`${prefix}/Users/:userId/PlayedItems/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); return compatibility.setPlayed(context, params.itemId, false); });
+  server.post(`${prefix}/Users/:userId/FavoriteItems/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); return compatibility.setFavorite(context, params.itemId, true); });
+  server.delete(`${prefix}/Users/:userId/FavoriteItems/:itemId`, async (request) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); return compatibility.setFavorite(context, params.itemId, false); });
+  // Jellyfin 10.9+ SDK 使用的当前用户标准路径，用户由访问令牌确定。
+  server.post(`${prefix}/UserPlayedItems/:itemId`, async (request) => compatibility.setPlayed(await authenticated(request), String((request.params as { itemId: string }).itemId), true));
+  server.delete(`${prefix}/UserPlayedItems/:itemId`, async (request) => compatibility.setPlayed(await authenticated(request), String((request.params as { itemId: string }).itemId), false));
+  server.post(`${prefix}/UserFavoriteItems/:itemId`, async (request) => compatibility.setFavorite(await authenticated(request), String((request.params as { itemId: string }).itemId), true));
+  server.delete(`${prefix}/UserFavoriteItems/:itemId`, async (request) => compatibility.setFavorite(await authenticated(request), String((request.params as { itemId: string }).itemId), false));
+  server.get(`${prefix}/UserItems/:itemId/UserData`, async (request) => compatibility.getUserData(await authenticated(request), String((request.params as { itemId: string }).itemId)));
+  server.post(`${prefix}/UserItems/:itemId/UserData`, async (request) => compatibility.updateUserData(await authenticated(request), String((request.params as { itemId: string }).itemId), (request.body ?? {}) as Record<string, unknown>));
   server.post(`${prefix}/Users/:userId/Items/:itemId/HideFromResume`, async (request, reply) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); await compatibility.setHiddenFromResume(context, params.itemId, true); return reply.status(204).send(); });
   server.delete(`${prefix}/Users/:userId/Items/:itemId/HideFromResume`, async (request, reply) => { const context = await authenticated(request); const params = request.params as { userId: string; itemId: string }; requireProtocolUser(context, params.userId); await compatibility.setHiddenFromResume(context, params.itemId, false); return reply.status(204).send(); });
 }

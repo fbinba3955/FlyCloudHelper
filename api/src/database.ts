@@ -36,6 +36,9 @@ type DatabaseBootstrapLogger = (
   fields: Record<string, string | number | boolean | null>,
 ) => void;
 
+/** 接收已经写入站内通知的数据，并交给外部通知渠道异步投递。 */
+type NotificationDeliveryHandler = (notification: NotificationRecord) => void;
+
 interface RemoteDatabaseTarget {
   databaseName: string;
   host: string;
@@ -223,6 +226,8 @@ export class FlyCloudHelperDatabase {
   public readonly databaseType: ApiConfig["databaseType"];
   private readonly config: ApiConfig;
   private readonly bootstrapLogger: DatabaseBootstrapLogger;
+  /** 关键变量：外部投递失败不能影响数据库通知和原业务流程。 */
+  private notificationDeliveryHandler: NotificationDeliveryHandler | null = null;
 
   public constructor(config: ApiConfig, bootstrapLogger: DatabaseBootstrapLogger) {
     this.config = config;
@@ -248,6 +253,11 @@ export class FlyCloudHelperDatabase {
     await this.query.destroy();
   }
 
+  /** 注册统一外部通知投递入口；数据库仍然是站内通知的唯一持久化来源。 */
+  public setNotificationDeliveryHandler(handler: NotificationDeliveryHandler): void {
+    this.notificationDeliveryHandler = handler;
+  }
+
   /** 给指定用户写入一条通知；调用方不得在内容中放入账号密码或 Provider 凭据。 */
   public async createNotification(input: {
     userId: string;
@@ -256,6 +266,8 @@ export class FlyCloudHelperDatabase {
     title: string;
     message: string;
     actionPath?: string | null;
+    /** 是否把该站内通知同步到 Telegram 等外部渠道，默认同步。 */
+    deliverExternally?: boolean;
   }): Promise<NotificationRecord> {
     const row = {
       id: randomUUID(),
@@ -268,7 +280,9 @@ export class FlyCloudHelperDatabase {
       created_at: new Date().toISOString(),
     };
     await this.query("user_notifications").insert(row);
-    return mapNotification(row);
+    const notification = mapNotification(row);
+    if (input.deliverExternally !== false) this.notificationDeliveryHandler?.(notification);
+    return notification;
   }
 
   /** 给全部启用中的超级管理员分别写入通知，确保每个管理员可以独立清除。 */
@@ -288,7 +302,7 @@ export class FlyCloudHelperDatabase {
       .filter((userId) => userId !== input.excludeUserId);
     if (targetUserIds.length === 0) return 0;
     const now = new Date().toISOString();
-    await this.query("user_notifications").insert(targetUserIds.map((userId) => ({
+    const rows = targetUserIds.map((userId) => ({
       id: randomUUID(),
       user_id: userId,
       category: input.category,
@@ -297,7 +311,10 @@ export class FlyCloudHelperDatabase {
       message: input.message.slice(0, 2_000),
       action_path: input.actionPath?.slice(0, 500) ?? null,
       created_at: now,
-    })));
+    }));
+    await this.query("user_notifications").insert(rows);
+    // 管理员广播在 Telegram 目标中只投递一次，避免多个管理员产生重复消息。
+    this.notificationDeliveryHandler?.(mapNotification(rows[0]!));
     return targetUserIds.length;
   }
 
@@ -309,6 +326,8 @@ export class FlyCloudHelperDatabase {
     title: string;
     message: string;
     actionPath?: string | null;
+    /** 是否把该站内通知同步到 Telegram 等外部渠道，默认同步。 */
+    deliverExternally?: boolean;
   }): Promise<void> {
     try {
       await this.createNotification(input);

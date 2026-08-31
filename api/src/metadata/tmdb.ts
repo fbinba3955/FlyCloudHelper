@@ -112,6 +112,8 @@ export interface TmdbVideoMetadata {
   originCountries: string[];
   posterUrl: string | null;
   backdropUrl: string | null;
+  /** 电影或节目标题 Logo；没有合适语言的 Logo 时为空。 */
+  logoUrl: string | null;
   episodeCount: number;
   people: TmdbPersonMetadata[];
   matchedQuery: string;
@@ -809,12 +811,19 @@ export class TmdbKeyPool {
     signal?: AbortSignal,
     fallbackCandidate?: TmdbSearchCandidate,
   ): Promise<TmdbVideoMetadata | null> {
-    const appendToResponse = mediaType === "movie" ? "credits" : "aggregate_credits";
+    const appendToResponse = mediaType === "movie" ? "credits,images" : "aggregate_credits,images";
+    // 关键变量：Logo 优先当前语言，其次英文和无语言版本，避免标题图混入不相关语言。
+    const preferredImageLanguage = (language || "zh-CN").split("-")[0]?.toLowerCase() || "zh";
     let payload: Record<string, unknown> | null = null;
     try {
       payload = await this.requestJson<Record<string, unknown>>(
         `/${mediaType}/${id}`,
-        { language: language || "zh-CN", region, append_to_response: appendToResponse },
+        {
+          language: language || "zh-CN",
+          region,
+          append_to_response: appendToResponse,
+          include_image_language: `${preferredImageLanguage},en,null`,
+        },
         signal,
       );
     } catch (error) {
@@ -855,6 +864,7 @@ export class TmdbKeyPool {
           : fallbackCandidate?.originCountries ?? [],
       posterUrl: buildImageUrl(posterPath, "w500", this.imageBaseUrl),
       backdropUrl: buildImageUrl(backdropPath, "w1280", this.imageBaseUrl),
+      logoUrl: readLogoUrl(details.images, preferredImageLanguage, this.imageBaseUrl),
       episodeCount: isMovie ? 0 : toPositiveNumber(details.number_of_episodes),
       people: readPeople(isMovie ? details.credits : details.aggregate_credits, this.imageBaseUrl),
       matchedQuery,
@@ -883,6 +893,7 @@ export class TmdbKeyPool {
       originCountries: mediaType === "tv" ? candidate.originCountries : [],
       posterUrl: buildImageUrl(candidate.posterPath, "w500", this.imageBaseUrl),
       backdropUrl: buildImageUrl(candidate.backdropPath, "w1280", this.imageBaseUrl),
+      logoUrl: null,
       episodeCount: 0,
       people: [],
       matchedQuery,
@@ -1122,6 +1133,25 @@ function readCountryCodes(value: unknown): string[] {
 /** 将 TMDB 图片路径转换为公开图片地址。 */
 function buildImageUrl(filePath: string, size: string, imageBaseUrl: string): string | null {
   return filePath ? `${imageBaseUrl}/${size}${filePath}` : null;
+}
+
+/** 从 TMDB images.logos 中选择当前语言、英文或无语言的标题 Logo。 */
+function readLogoUrl(value: unknown, preferredLanguage: string, imageBaseUrl: string): string | null {
+  const images = asRecord(value);
+  const logos = Array.isArray(images.logos) ? images.logos.map(asRecord) : [];
+  if (logos.length === 0) return null;
+  // 关键变量：语言优先级比投票数更重要，同一语言内再优先 TMDB 排名靠前的结果。
+  const languagePriority = (logo: Record<string, unknown>): number => {
+    const language = toText(logo.iso_639_1).toLowerCase();
+    if (language === preferredLanguage) return 0;
+    if (language === "en") return 1;
+    if (!language) return 2;
+    return 3;
+  };
+  const selected = logos
+    .map((logo, index) => ({ logo, index, priority: languagePriority(logo) }))
+    .sort((left, right) => left.priority - right.priority || left.index - right.index)[0]?.logo;
+  return buildImageUrl(toText(selected?.file_path), "original", imageBaseUrl);
 }
 
 /** 从 TMDB 日期读取年份。 */

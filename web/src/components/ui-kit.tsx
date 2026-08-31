@@ -175,6 +175,8 @@ export function PosterCard({ item, onClick }: { item: MediaItem; onClick?: () =>
     "video.movie": "电影",
     "video.series": "节目",
     "music.album": "音乐专辑",
+    "music.track": "歌曲",
+    "music.artist": "艺术家",
     "audiobook.book": "有声书",
   };
   const hue = [...item.id].reduce((sum, character) => sum + character.charCodeAt(0), 0) % 360;

@@ -20,6 +20,7 @@ export interface FlymbyNfoMetadata {
   people: FlymbyNfoPerson[];
   posterValue: string;
   backdropValue: string;
+  logoValue: string;
   seasonNumber: number;
   episodeNumber: number;
   airDate: string;
@@ -46,6 +47,7 @@ export function parseFlymbyNfo(text: string): FlymbyNfoMetadata {
     people: readPeople(text),
     posterValue: readPosterValue(text),
     backdropValue: readBackdropValue(text),
+    logoValue: readLogoValue(text),
     seasonNumber: readNumber(text, "season"),
     episodeNumber: readNumber(text, "episode"),
     airDate: readFirstNonEmptyTag(text, ["aired", "premiered"]),
@@ -151,6 +153,12 @@ function readBackdropValue(text: string): string {
   if (thumb) return thumb;
   const typed = /<thumb\b[^>]*\baspect\s*=\s*["']fanart["'][^>]*>([\s\S]*?)<\/thumb>/iu.exec(text);
   return typed?.[1] ? normalizeXmlValue(typed[1]) : "";
+}
+
+/** 读取标题 Logo，兼容 clearlogo 标签和 clearlogo 类型 thumb。 */
+function readLogoValue(text: string): string {
+  const typed = /<thumb\b[^>]*\baspect\s*=\s*["']clearlogo["'][^>]*>([\s\S]*?)<\/thumb>/iu.exec(text);
+  return typed?.[1] ? normalizeXmlValue(typed[1]) : readFirstTag(text, "clearlogo");
 }
 
 /** 只把公开 HTTP 图片值放进 posterUrl/backdropUrl。 */

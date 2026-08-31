@@ -21,7 +21,10 @@ import {
 import { hydrateRealtimeVideoDetails } from "../media/realtime-video-details.js";
 import type { ApiRuntime } from "../runtime.js";
 import {
+  loadMusicSourceSettings,
   loadTmdbBaseUrls,
+  musicSourceSettingName,
+  saveMusicSourceSettings,
   saveTmdbBaseUrls,
   tmdbBaseUrlSettingName,
   tmdbKeySettingName,
@@ -34,6 +37,7 @@ import {
   getScanRootsForMode,
   hasHttpProviderAddress,
   readProviderDirectoryParent,
+  readMusicMetadataLogFields,
   readVideoMetadataLogFields,
   resolveProviderConnection,
   validateConfiguredScanRoots,
@@ -123,19 +127,21 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
 
   server.get("/api/v1/admin/config/status", async (request) => {
     await requireSuperAdmin(request, runtime.database);
-    const [pluginCount, enabledPluginCount, tmdbStatus, publicAccess, aiModels] = await Promise.all([
+    const [pluginCount, enabledPluginCount, tmdbStatus, publicAccess, aiModels, musicSources] = await Promise.all([
       runtime.database.query("metadata_plugin_versions").count<{ count: string | number }[]>({ count: "id" }).first(),
       runtime.database.query("metadata_plugin_versions").where({ status: "enabled" }).count<{ count: string | number }[]>({ count: "id" }).first(),
       getTmdbConfigurationStatus(runtime),
       runtime.publicAccess.getStatus(),
       runtime.aiModels.getSummary(),
+      loadMusicSourceSettings(runtime.database),
     ]);
     return {
       database: { type: runtime.config.databaseType, schemaVersion: (await runtime.database.getSystemState()).schemaVersion },
       tmdb: tmdbStatus,
       publicAccess,
       music: {
-        musicBrainz: { status: "unavailable", reasonCode: "media_type_not_enabled" },
+        sources: musicSources,
+        musicBrainz: { status: "available" },
         acoustId: {
           status: "unavailable",
           configured: Boolean(runtime.config.acoustidApiKey),
@@ -156,6 +162,33 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       aiModels,
       worker: runtime.worker.getStatus(),
     };
+  });
+
+  /** 读取系统级音乐刮削来源集合。 */
+  server.get("/api/v1/admin/config/music-sources", async (request) => {
+    await requireSuperAdmin(request, runtime.database);
+    return { musicSources: await loadMusicSourceSettings(runtime.database) };
+  });
+
+  /** 保存系统级音乐刮削来源集合，之后新启动的扫描会读取新修订。 */
+  server.put<{ Body: Record<string, unknown> }>("/api/v1/admin/config/music-sources", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    const settings = await saveMusicSourceSettings(runtime.database, {
+      enabledSources: request.body.enabledSources,
+      updatedByUserId: operator.id,
+    });
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-music-source-config",
+      事件: settings.source === "default" ? "恢复全部音乐刮削来源" : "更新音乐刮削来源",
+      用户ID: operator.id,
+      启用来源数量: settings.enabledSources.length,
+      配置修订: settings.configurationRevision,
+    });
+    await audit(runtime, operator, "update_music_scrape_sources", "system_configuration", musicSourceSettingName, {
+      启用来源: settings.enabledSources,
+      配置修订: settings.configurationRevision,
+    });
+    return { musicSources: settings };
   });
 
   server.put<{ Body: Record<string, unknown> }>("/api/v1/admin/config/tmdb-keys", async (request) => {
@@ -840,10 +873,12 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
     );
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-metadata-profile",
-      事件: "管理员更新影视元数据配置",
+      事件: service.dataType === "music" ? "管理员更新音乐元数据配置" : "管理员更新影视元数据配置",
       管理员ID: operator.id,
       服务ID: service.id,
-      ...readVideoMetadataLogFields(updated.metadataProfile),
+      ...(service.dataType === "music"
+        ? readMusicMetadataLogFields(updated.metadataProfile)
+        : readVideoMetadataLogFields(updated.metadataProfile)),
     });
     await audit(runtime, operator, "update_service_metadata_profile", "service", service.id);
     return { service: updated };
@@ -913,6 +948,31 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       是否启用APP专用中转: updated.relayPlaybackEnabled,
     });
     return { service: updated };
+  });
+
+  /** 管理员保存任意服务的任务完成通知开关。 */
+  server.patch<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/notification-settings", async (request) => {
+    const operator = await requireSuperAdmin(request, runtime.database);
+    if (typeof request.body.notificationEnabled !== "boolean") {
+      throw validationError("notificationEnabled", "任务完成通知开关必须是布尔值");
+    }
+    const service = await runtime.repository.updateServiceNotificationEnabled(
+      request.params.serviceId,
+      undefined,
+      request.body.notificationEnabled,
+    );
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-flycloud-helper-service-notification",
+      事件: "管理员更新服务任务通知开关",
+      管理员ID: operator.id,
+      目标用户ID: service.userId,
+      服务ID: service.id,
+      是否启用任务通知: service.notificationEnabled,
+    });
+    await audit(runtime, operator, "update_service_notification", "service", service.id, {
+      是否启用任务通知: service.notificationEnabled,
+    });
+    return { service };
   });
 
   server.post<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/scan-jobs", async (request, reply) => {
@@ -1272,6 +1332,21 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.get<{ Params: { itemId: string } }>("/api/v1/admin/catalog/items/:itemId/children", async (request) => {
     await requireSuperAdmin(request, runtime.database);
     return { items: await runtime.repository.listCatalogChildren(request.params.itemId) };
+  });
+
+  /** 管理端返回音乐专辑或歌曲关联的艺术家。 */
+  server.get<{ Params: { itemId: string } }>("/api/v1/admin/catalog/items/:itemId/artists", async (request) => {
+    await requireSuperAdmin(request, runtime.database);
+    const item = await runtime.repository.getCatalogItem(request.params.itemId);
+    const artists = await runtime.repository.listCatalogMusicArtists(item.id);
+    request.log.info({
+      日志关键字: "codex-flycloud-helper-music-album-detail",
+      事件: "管理员读取音乐条目关联艺术家",
+      媒体条目ID: item.id,
+      媒体条目类型: item.itemType,
+      艺术家数量: artists.length,
+    });
+    return { items: artists };
   });
 
   server.get<{ Params: { itemId: string } }>("/api/v1/admin/catalog/items/:itemId/paths", async (request) => {

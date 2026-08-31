@@ -34,6 +34,8 @@ export interface ApiConfig {
   workerPollIntervalMs: number;
   /** ffprobe 可执行文件；Docker 镜像固定为 /usr/bin/ffprobe。 */
   ffprobePath: string;
+  /** ffmpeg 可执行文件，用于从远端音频提取内嵌封面。 */
+  ffmpegPath: string;
   /** 媒体规格独立 Worker 的低并发数量。 */
   mediaProbeConcurrency: number;
   mediaProbePollIntervalMs: number;
@@ -43,6 +45,8 @@ export interface ApiConfig {
   pluginDirectory: string;
   exportDirectory: string;
   migrationDirectory: string;
+  /** 音频内嵌封面的内容寻址缓存目录。 */
+  musicArtworkDirectory: string;
   webDistDirectory: string;
   allowInsecureProviderHttp: boolean;
   pluginMaxBytes: number;
@@ -346,6 +350,7 @@ export function loadApiConfig(): ApiConfig {
     workerConcurrency: readPositiveInteger("FLYCLOUDHELPER_WORKER_CONCURRENCY", 5),
     workerPollIntervalMs: readPositiveInteger("FLYCLOUDHELPER_WORKER_POLL_INTERVAL_MS", 1000),
     ffprobePath: readEnvironmentValue("FLYCLOUDHELPER_FFPROBE_PATH") || "ffprobe",
+    ffmpegPath: readEnvironmentValue("FLYCLOUDHELPER_FFMPEG_PATH") || "ffmpeg",
     mediaProbeConcurrency: readPositiveInteger("FLYCLOUDHELPER_MEDIA_PROBE_CONCURRENCY", 1),
     mediaProbePollIntervalMs: readPositiveInteger("FLYCLOUDHELPER_MEDIA_PROBE_POLL_INTERVAL_MS", 2000),
     ffprobeTimeoutMs: readPositiveInteger("FLYCLOUDHELPER_FFPROBE_TIMEOUT_MS", 60_000),
@@ -356,6 +361,10 @@ export function loadApiConfig(): ApiConfig {
     migrationDirectory: resolveProjectPath(
       readEnvironmentValue("FLYCLOUDHELPER_MIGRATION_DIR"),
       "data/migrations",
+    ),
+    musicArtworkDirectory: resolveProjectPath(
+      readEnvironmentValue("FLYCLOUDHELPER_MUSIC_ARTWORK_DIR"),
+      "data/music-artwork",
     ),
     webDistDirectory: resolveProjectPath(readEnvironmentValue("FLYCLOUDHELPER_WEB_DIST_DIR"), "web/dist"),
     allowInsecureProviderHttp: readBoolean("FLYCLOUDHELPER_ALLOW_INSECURE_HTTP", true),

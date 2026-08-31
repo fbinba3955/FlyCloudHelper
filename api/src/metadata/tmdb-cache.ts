@@ -54,6 +54,8 @@ function readVideoMetadata(payload: unknown): TmdbVideoMetadata | null {
     || typeof metadata.title !== "string") {
     return null;
   }
+  // 旧缓存没有 Logo 字段，失效后重新读取一次详情；null 表示已经确认没有可用 Logo。
+  if (!Object.prototype.hasOwnProperty.call(metadata, "logoUrl")) return null;
   // 关键变量：旧节目缓存没有地区字段，正常重新扫描时让它自然失效并重新读取 TMDB，不建立补全任务。
   if (metadata.mediaType === "tv" && !Array.isArray(metadata.originCountries)) return null;
   return {

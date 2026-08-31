@@ -23,6 +23,7 @@ import {
   reconnectServiceConnection,
   updateServiceConnection,
   updateServiceMetadataProfile,
+  updateServiceNotificationSettings,
   updateServiceScanProfile,
   updateServiceStatus,
   type CloudService,
@@ -82,6 +83,9 @@ const jobStageLabels: Record<string, string> = {
   scraping: "扫描刮削",
   persisting: "写入目录",
   probing: "分析视频规格",
+  reading_tags: "读取音乐标签",
+  grouping_music: "整理歌曲专辑艺术家",
+  scraping_music: "刮削音乐信息",
   completed: "已完成",
 };
 
@@ -112,6 +116,10 @@ interface ScanRootValue {
 
 interface VideoMetadataSettings {
   providerId: string;
+  /** 音乐自动来源采用最快命中或等待完整聚合。 */
+  aggregateMode: "fast" | "complete";
+  /** 音乐刮削是否同时从 LRCLIB 补充歌词。 */
+  syncLyrics: boolean;
   language: string;
   region: string;
   useNfo: boolean;
@@ -168,6 +176,8 @@ function readVideoMetadataSettings(profile: Record<string, unknown>): VideoMetad
     : {};
   return {
     providerId: configuredProvider === "tmdb" || !configuredProvider ? "builtin.tmdb" : configuredProvider,
+    aggregateMode: "complete",
+    syncLyrics: false,
     language: typeof videoProfile.language === "string" ? videoProfile.language : "zh-CN",
     region: typeof videoProfile.region === "string" ? videoProfile.region : "CN",
     useNfo: videoProfile.useNfo !== false,
@@ -214,9 +224,71 @@ function buildVideoMetadataProfile(
   };
 }
 
+/** 读取音乐元数据配置，并复用页面状态结构承载来源选择。 */
+function readMusicMetadataSettings(profile: Record<string, unknown>): VideoMetadataSettings {
+  const profiles = profile.profiles && typeof profile.profiles === "object" && !Array.isArray(profile.profiles)
+    ? profile.profiles as Record<string, unknown>
+    : {};
+  const musicProfile = profiles.music && typeof profiles.music === "object" && !Array.isArray(profiles.music)
+    ? profiles.music as Record<string, unknown>
+    : {};
+  return {
+    providerId: typeof musicProfile.providerId === "string" && musicProfile.providerId !== "builtin.musicbrainz"
+      ? musicProfile.providerId
+      : "auto",
+    aggregateMode: musicProfile.aggregateMode === "fast" ? "fast" : "complete",
+    syncLyrics: Boolean(musicProfile.requiredFields && typeof musicProfile.requiredFields === "object"
+      && !Array.isArray(musicProfile.requiredFields)
+      && (musicProfile.requiredFields as Record<string, unknown>).lyrics === true),
+    language: "",
+    region: "",
+    useNfo: false,
+    syncDetails: true,
+    analyzeMediaSpecs: false,
+    aiCleaning: { enabled: false, modelId: "", triggerMode: "weak_or_unmatched", minConfidence: 0.75 },
+  };
+}
+
+/** 写回音乐元数据来源，同时保留服务内已有的未知扩展字段。 */
+function buildMusicMetadataProfile(profile: Record<string, unknown>, settings: VideoMetadataSettings): Record<string, unknown> {
+  const profiles = profile.profiles && typeof profile.profiles === "object" && !Array.isArray(profile.profiles)
+    ? profile.profiles as Record<string, unknown>
+    : {};
+  const musicProfile = profiles.music && typeof profiles.music === "object" && !Array.isArray(profiles.music)
+    ? profiles.music as Record<string, unknown>
+    : {};
+  return {
+    ...profile,
+    profiles: {
+      ...profiles,
+      music: {
+        ...musicProfile,
+        providerId: settings.providerId,
+        aggregateMode: settings.aggregateMode,
+        requiredFields: {
+          ...(musicProfile.requiredFields && typeof musicProfile.requiredFields === "object"
+            ? musicProfile.requiredFields as Record<string, unknown>
+            : {}),
+          artist: true,
+          album: true,
+          cover: true,
+          lyrics: settings.syncLyrics,
+        },
+      },
+    },
+  };
+}
+
 /** 返回当前元数据来源的中文名称。 */
 function getMetadataProviderLabel(providerId: string): string {
   if (providerId === "builtin.tmdb" || providerId === "tmdb") return "TMDB 在线刮削";
+  if (providerId === "auto" || providerId === "builtin.music-platforms") return "多平台自动补全";
+  if (providerId === "builtin.musicbrainz" || providerId === "musicbrainz") return "MusicBrainz 在线刮削";
+  if (providerId === "netease") return "网易云音乐";
+  if (providerId === "qmusic") return "QQ音乐";
+  if (providerId === "kugou") return "酷狗音乐";
+  if (providerId === "migu") return "咪咕音乐";
+  if (providerId === "kuwo") return "酷我音乐";
   if (providerId === "local") return "仅使用本地 NFO 和文件名";
   if (providerId.startsWith("plugin:")) return `元数据插件（${providerId.slice("plugin:".length)}）`;
   return `现有来源（${providerId}）`;
@@ -406,8 +478,8 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
       setMessage("请选择 Provider 类型");
       return;
     }
-    if (dataType !== "video") {
-      setMessage("本阶段仅支持影视数据类型");
+    if (dataType !== "video" && dataType !== "music") {
+      setMessage("当前仅支持影视或音乐数据类型");
       return;
     }
     const connection: Record<string, string> = {};
@@ -435,7 +507,15 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
         scanDirectoryConcurrency: descriptor.recommendedScanSettings.scanDirectoryConcurrency.default,
         scrapeTaskConcurrency: descriptor.recommendedScanSettings.scrapeTaskConcurrency.default,
       },
-      metadata: {
+      metadata: dataType === "music" ? {
+        profiles: {
+          music: {
+            providerId: "auto",
+            aggregateMode: "complete",
+            requiredFields: { artist: true, album: true, cover: true, lyrics: false },
+          },
+        },
+      } : {
         profiles: {
           video: {
             providerId: "builtin.tmdb",
@@ -470,7 +550,7 @@ export function ServiceCreatePage({ admin = false }: { admin?: boolean }) {
             <span className="text-xs text-muted-foreground">数据类型</span>
             <select name="dataType" required defaultValue="video" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
               <option value="video">影视</option>
-              <option value="music" disabled>音乐（暂未支持）</option>
+              <option value="music">音乐</option>
               <option value="audiobook" disabled>有声书（暂未支持）</option>
             </select>
           </label>
@@ -629,6 +709,8 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   const [message, setMessage] = useState<string | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState(false);
   const updatingStatusRef = useRef(false);
+  const [updatingNotification, setUpdatingNotification] = useState(false);
+  const updatingNotificationRef = useRef(false);
   const [deletingService, setDeletingService] = useState(false);
   // 关键变量：同步占用删除操作，避免 React 按钮状态尚未刷新时重复提交。
   const deletingServiceRef = useRef(false);
@@ -644,6 +726,8 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
   const [incrementalScanRoots, setIncrementalScanRoots] = useState<ProviderDirectory[]>([]);
   const [metadataSettings, setMetadataSettings] = useState<VideoMetadataSettings>({
     providerId: "builtin.tmdb",
+    aggregateMode: "complete",
+    syncLyrics: false,
     language: "zh-CN",
     region: "CN",
     useNfo: true,
@@ -664,7 +748,9 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
 
   useEffect(() => {
     if (!service) return;
-    setMetadataSettings(readVideoMetadataSettings(service.metadataProfile));
+    setMetadataSettings(service.dataType === "music"
+      ? readMusicMetadataSettings(service.metadataProfile)
+      : readVideoMetadataSettings(service.metadataProfile));
   }, [serviceId, service?.id, service?.metadataProfileRevision]);
 
   useEffect(() => {
@@ -777,14 +863,18 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     }
   }
 
-  /** 保存中文表单中选择的影视元数据来源、语言和地区。 */
+  /** 保存当前服务类型对应的元数据来源与刮削配置。 */
   async function saveMetadataProfile(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     setMessage("正在保存元数据配置…");
     try {
-      const profile = buildVideoMetadataProfile(activeService.metadataProfile, metadataSettings);
+      const profile = activeService.dataType === "music"
+        ? buildMusicMetadataProfile(activeService.metadataProfile, metadataSettings)
+        : buildVideoMetadataProfile(activeService.metadataProfile, metadataSettings);
       await updateServiceMetadataProfile(serviceId, profile, admin);
-      setMessage("元数据配置已保存，规格开关只影响之后执行的扫描刮削任务");
+      setMessage(activeService.dataType === "music"
+        ? "音乐元数据配置已保存，之后的扫描会读取内嵌标签并按所选来源补全"
+        : "元数据配置已保存，规格开关只影响之后执行的扫描刮削任务");
       await resource.refresh();
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "元数据配置保存失败";
@@ -847,6 +937,32 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     } finally {
       updatingStatusRef.current = false;
       setUpdatingStatus(false);
+    }
+  }
+
+  /** 立即保存当前服务的任务完成通知开关，并阻止快速重复提交。 */
+  async function toggleNotification(): Promise<void> {
+    if (updatingNotificationRef.current) return;
+    updatingNotificationRef.current = true;
+    setUpdatingNotification(true);
+    const nextEnabled = !activeService.notificationEnabled;
+    setMessage(nextEnabled ? "正在启用任务完成通知…" : "正在关闭任务完成通知…");
+    try {
+      await updateServiceNotificationSettings(serviceId, nextEnabled, admin);
+      setMessage(nextEnabled ? "任务完成通知已启用" : "任务完成通知已关闭");
+      await resource.refresh();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "任务完成通知设置失败";
+      console.warn("codex-flycloud-helper-service-notification", {
+        事件: "服务详情保存任务通知开关失败",
+        服务ID: serviceId,
+        是否启用任务通知: nextEnabled,
+        错误信息: errorMessage,
+      });
+      setMessage(errorMessage);
+    } finally {
+      updatingNotificationRef.current = false;
+      setUpdatingNotification(false);
     }
   }
 
@@ -923,7 +1039,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
             </SecondaryButton>
             <SecondaryButton disabled={fullScanRoots.length === 0 || creatingScanMode !== null || creatingAiSupplement || deletingService} title={fullScanRoots.length === 0 ? "请先配置全量扫描路径" : undefined} onClick={() => void trigger("full")}>{creatingScanMode === "full" ? "正在创建…" : "全量扫描"}</SecondaryButton>
             <PrimaryButton disabled={incrementalScanRoots.length === 0 || creatingScanMode !== null || creatingAiSupplement || deletingService} title={incrementalScanRoots.length === 0 ? "请先配置增量扫描路径" : undefined} onClick={() => void trigger("incremental")}><ScanLine className="size-4" /> {creatingScanMode === "incremental" ? "正在创建…" : "增量扫描"}</PrimaryButton>
-            <SecondaryButton disabled={!metadataSettings.aiCleaning.enabled || creatingScanMode !== null || creatingAiSupplement || deletingService} title={!metadataSettings.aiCleaning.enabled ? "请先启用 AI 目录文件清洗" : undefined} onClick={() => void triggerAiSupplement()}><Sparkles className="size-4" /> {creatingAiSupplement ? "正在创建…" : "AI补充未识别内容"}</SecondaryButton>
+            {service.dataType === "video" && <SecondaryButton disabled={!metadataSettings.aiCleaning.enabled || creatingScanMode !== null || creatingAiSupplement || deletingService} title={!metadataSettings.aiCleaning.enabled ? "请先启用 AI 目录文件清洗" : undefined} onClick={() => void triggerAiSupplement()}><Sparkles className="size-4" /> {creatingAiSupplement ? "正在创建…" : "AI补充未识别内容"}</SecondaryButton>}
           </div>
         )}
       />
@@ -954,6 +1070,36 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
         </div>
       </Panel>
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        <Panel
+          title="任务通知"
+          description="按服务单独控制后台任务完成后是否向系统设置中已启用的 Telegram 渠道推送消息。"
+          className="xl:col-span-2"
+        >
+          <div className="flex items-start justify-between gap-4 rounded-xl border border-border bg-secondary/40 p-4">
+            <div>
+              <p className="text-sm font-medium">启用任务完成通知</p>
+              <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                {service.dataType === "music"
+                  ? "音乐扫描完成后，通知会展示本次新增入库的歌曲、专辑和艺术家数量。"
+                  : service.dataType === "video"
+                    ? "影视扫描完成后展示新增入库内容数量；视频规格扫描和 AI 补充完成后分别展示完成文件数和完成影片数。"
+                    : "扫描任务完成后，会推送当前服务的任务结果。"}
+              </p>
+              <p className="mt-2 text-xs leading-5 text-muted-foreground">Telegram 渠道未在系统设置中启用或目标未配置时，不会发送外部通知。</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={service.notificationEnabled}
+              aria-label="启用任务完成通知"
+              disabled={updatingNotification}
+              onClick={() => void toggleNotification()}
+              className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${service.notificationEnabled ? "border-foreground/30 bg-foreground" : "border-border bg-secondary"}`}
+            >
+              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-background shadow-sm transition-transform ${service.notificationEnabled ? "translate-x-5" : "translate-x-0"}`} />
+            </button>
+          </div>
+        </Panel>
         <Panel title="扫描路径" description="全量和增量任务分别选择网盘目录，不需要手动输入路径。" className="xl:col-span-2">
           <div key={service.scanProfileRevision} className="grid gap-4 lg:grid-cols-2">
             <ServicePathPicker serviceId={serviceId} admin={admin} label="全量扫描目录" value={fullScanRoots} onConfirm={(directories) => saveScanPaths("full", directories)} />
@@ -975,13 +1121,50 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
               <select value={scanConcurrencySettings.scrapeTaskConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, scrapeTaskConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
                 {scrapeConcurrencyOptions.map((value) => <option key={value} value={value}>{value}{value === recommendedScanSettings?.scrapeTaskConcurrency.default ? "（推荐）" : ""}</option>)}
               </select>
-              <p className="mt-2 text-xs text-muted-foreground">实际并发不会超过当前可用 TMDB Key 支持的并发数。</p>
+              <p className="mt-2 text-xs text-muted-foreground">{service.dataType === "music" ? "控制同时执行的音乐元数据补全任务；标签读取使用云助手内置并发。" : "实际并发不会超过当前可用 TMDB Key 支持的并发数。"}</p>
             </label>
             <div className="flex justify-end md:col-span-2"><PrimaryButton type="submit">保存任务并发</PrimaryButton></div>
           </form>
         </Panel>
-        <Panel title="元数据配置" description="配置影视数据的刮削来源；音乐和有声书将在后续版本开放。">
+        <Panel title="元数据配置" description={service.dataType === "music" ? "扫描时先读取音频内嵌标签，再按所选来源补全歌曲、专辑和艺术家信息。" : "配置影视数据的刮削来源。"}>
           <form onSubmit={(event) => void saveMetadataProfile(event)} className="space-y-4">
+            {service.dataType === "music" ? (
+              <>
+                <label className="block">
+                  <span className="text-xs text-muted-foreground">音乐元数据来源</span>
+                  <select value={metadataSettings.providerId} onChange={(event) => setMetadataSettings((current) => ({ ...current, providerId: event.target.value }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
+                    <option value="auto">多平台自动补全</option>
+                    <option value="musicbrainz">MusicBrainz</option>
+                    <option value="netease">网易云音乐</option>
+                    <option value="qmusic">QQ音乐</option>
+                    <option value="kugou">酷狗音乐</option>
+                    <option value="migu">咪咕音乐</option>
+                    <option value="kuwo">酷我音乐</option>
+                    <option value="local">仅使用内嵌标签和文件路径</option>
+                    {!['auto', 'musicbrainz', 'netease', 'qmusic', 'kugou', 'migu', 'kuwo', 'local'].includes(metadataSettings.providerId) && <option value={metadataSettings.providerId}>{getMetadataProviderLabel(metadataSettings.providerId)}</option>}
+                  </select>
+                </label>
+                {metadataSettings.providerId === "auto" && <label className="block">
+                  <span className="text-xs text-muted-foreground">自动聚合方式</span>
+                  <select value={metadataSettings.aggregateMode} onChange={(event) => setMetadataSettings((current) => ({ ...current, aggregateMode: event.target.value === "fast" ? "fast" : "complete" }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
+                    <option value="complete">完整聚合（等待全部平台）</option>
+                    <option value="fast">最快命中（首个完整结果）</option>
+                  </select>
+                  <p className="mt-2 text-xs text-muted-foreground">完整聚合会综合六个平台选择更可信且图片更完整的结果；最快命中扫描更快。</p>
+                </label>}
+                {metadataSettings.providerId !== "local" && <div className="flex items-center justify-between gap-4 rounded-xl border border-border bg-secondary/35 p-4">
+                  <div><p className="text-sm font-medium">同步歌词</p><p className="mt-1 text-xs text-muted-foreground">开启后为每首歌曲从 LRCLIB 补充普通歌词和逐行歌词，扫描时间会增加。</p></div>
+                  <button type="button" role="switch" aria-checked={metadataSettings.syncLyrics} aria-label="同步歌词" onClick={() => setMetadataSettings((current) => ({ ...current, syncLyrics: !current.syncLyrics }))} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${metadataSettings.syncLyrics ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+                    <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${metadataSettings.syncLyrics ? "translate-x-5" : "translate-x-0"}`} />
+                  </button>
+                </div>}
+                <div className="rounded-xl border border-border bg-secondary/35 p-4">
+                  <p className="text-sm font-medium">内嵌标签读取</p>
+                  <p className="mt-2 text-xs leading-6 text-muted-foreground">云助手会优先读取标题、艺术家、专辑、曲号、年份、流派、MusicBrainz 编号和内嵌封面；文件中缺少的信息再由所选平台补全，歌曲继承专辑封面并同步补充艺术家图片。</p>
+                </div>
+              </>
+            ) : (
+              <>
             <label className="block">
               <span className="text-xs text-muted-foreground">元数据来源</span>
               <select value={metadataSettings.providerId} onChange={(event) => setMetadataSettings((current) => ({ ...current, providerId: event.target.value }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
@@ -1051,6 +1234,8 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
               loading: availableAiModels.loading,
               onChange: (aiCleaning) => setMetadataSettings((current) => ({ ...current, aiCleaning })),
             }} />
+              </>
+            )}
             <div className="flex justify-end"><PrimaryButton type="submit">保存元数据配置</PrimaryButton></div>
           </form>
         </Panel>

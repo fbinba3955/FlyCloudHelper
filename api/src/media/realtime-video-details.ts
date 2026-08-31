@@ -110,7 +110,14 @@ export async function hydrateRealtimeVideoDetails(
   if (item.mediaType !== "video" || (item.itemType !== "video.movie" && item.itemType !== "video.series")) {
     return item;
   }
-  if (item.metadata.tmdbDetailsSynchronized !== false) return item;
+  const metadataSource = String(item.metadata.metadataSource ?? "");
+  const storedLogoUrl = String(item.metadata.logoUrl ?? "").trim();
+  const detailsSynchronized = item.metadata.tmdbDetailsSynchronized !== false;
+  const artworkSynchronized = item.metadata.tmdbArtworkSynchronized === true;
+  // 本地 NFO 不依赖 TMDB；旧 TMDB 数据只在首次打开详情时补一次 Logo，结果落库后不再重复查询。
+  if (metadataSource === "local.nfo" || (detailsSynchronized && (artworkSynchronized || Boolean(storedLogoUrl)))) {
+    return item;
+  }
   const tmdbId = Number(item.externalIds.tmdb ?? 0);
   if (!Number.isInteger(tmdbId) || tmdbId <= 0) return item;
 

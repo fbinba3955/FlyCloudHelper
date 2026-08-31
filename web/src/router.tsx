@@ -45,6 +45,8 @@ import {
   AdminUsersPage,
 } from "@/pages/AdminPages";
 import { AdminAiModelsPage } from "@/pages/AiModelPages";
+import { AdminMusicSourcesPage } from "@/pages/MusicSourcePages";
+import { AdminNotificationSettingsPage } from "@/pages/AdminNotificationSettingsPage";
 import {
   AdminServiceScanSchedulePage,
   UserServiceScanSchedulePage,
@@ -489,6 +491,18 @@ const adminConfigurationRoute = createRoute({
   component: AdminConfigurationPage,
 });
 
+const adminMusicSourcesRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "config/music-sources",
+  component: AdminMusicSourcesPage,
+});
+
+const adminNotificationSettingsRoute = createRoute({
+  getParentRoute: () => adminRoute,
+  path: "config/notifications",
+  component: AdminNotificationSettingsPage,
+});
+
 const adminAuditRoute = createRoute({
   getParentRoute: () => adminRoute,
   path: "audit",
@@ -529,6 +543,8 @@ const adminRouteTree = adminRoute.addChildren([
   adminPluginsRoute,
   adminAiModelsRoute,
   adminConfigurationRoute,
+  adminMusicSourcesRoute,
+  adminNotificationSettingsRoute,
   adminSystemRoute,
   adminAuditRoute,
 ]);

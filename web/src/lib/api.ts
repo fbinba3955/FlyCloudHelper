@@ -28,6 +28,23 @@ export interface ConsoleNotification {
   createdAt: string;
 }
 
+export type TelegramNotificationDestinationType = "chat" | "user";
+
+/** 管理端可读取的 Telegram 脱敏配置，永远不包含 Bot Token 原文。 */
+export interface TelegramNotificationSettings {
+  enabled: boolean;
+  botTokenConfigured: boolean;
+  destinationType: TelegramNotificationDestinationType;
+  destinationId: string;
+  chatId: string;
+  telegramUserId: string;
+  configurationRevision: number;
+}
+
+export interface AdminNotificationSettings {
+  telegram: TelegramNotificationSettings;
+}
+
 export interface CredentialKeyBackup {
   masterKey: string;
   fileName: string;
@@ -156,6 +173,14 @@ export interface AdminRuntimeStatus extends OverviewResult {
   database: { type: "sqlite" | "postgres" | "mysql"; connected: boolean };
 }
 
+export type BuiltinMusicSourceId = "musicbrainz" | "netease" | "qmusic" | "kugou" | "migu" | "kuwo";
+
+export interface AdminMusicSourceSettings {
+  enabledSources: BuiltinMusicSourceId[];
+  configurationRevision: number;
+  source: "default" | "database";
+}
+
 export interface AdminConfigStatus {
   database: { type: "sqlite" | "postgres" | "mysql"; schemaVersion: number };
   tmdb: {
@@ -178,6 +203,7 @@ export interface AdminConfigStatus {
     editable: boolean;
   };
   music: {
+    sources: AdminMusicSourceSettings;
     musicBrainz: { status: string };
     acoustId: { status: string; configured: boolean; reasonCode: string };
     fingerprint: { status: string; configured: boolean; reasonCode: string };
@@ -260,6 +286,8 @@ export interface CloudService {
   /** 光鸭服务的登录类型；列表接口不返回任何授权凭据。 */
   connectionAuthMode?: "official_api" | "web_qr" | "web_sms" | null;
   relayPlaybackEnabled: boolean;
+  /** 是否把当前服务的后台任务结果投递到 Telegram 等外部通知渠道。 */
+  notificationEnabled: boolean;
   jellyfinEnabled: boolean;
   credentialRevision: number;
   scanProfileRevision: number;
@@ -299,6 +327,8 @@ export interface ServiceAccessAccount {
   serviceId: string;
   username: string;
   hasPassword: boolean;
+  /** 旧密码账号可能需要重新设置一次密码，才能使用 Subsonic token+salt 登录。 */
+  subsonicTokenAuthReady: boolean;
   credentialRevision: number;
   status: "active" | "disabled";
   createdAt: string;
@@ -309,6 +339,8 @@ export interface ServiceAccessSettings {
   relayPlaybackSupported: boolean;
   appRelayPlaybackEnabled: boolean;
   jellyfinRelayPlaybackEnabled: boolean;
+  /** Jellyfin 客户端是否允许下载原始影片文件。 */
+  jellyfinDownloadEnabled: boolean;
   /** 是否将 Jellyfin 节目媒体库按地区拆分。 */
   jellyfinRegionLibrariesEnabled: boolean;
   jellyfinEnabled: boolean;
@@ -316,6 +348,13 @@ export interface ServiceAccessSettings {
   jellyfinPath: string;
   /** 固定 /j/ 前缀之后的单层可编辑地址后缀。 */
   jellyfinPathSuffix: string;
+  /** 仅音乐类型服务支持公开 Navidrome/Subsonic 协议。 */
+  navidromeSupported: boolean;
+  navidromeEnabled: boolean;
+  navidromeUrl: string | null;
+  navidromePath: string;
+  /** 固定 /n/ 前缀之后的单层可编辑地址后缀。 */
+  navidromePathSuffix: string;
   /** 历史最早账号，保留给旧版客户端读取。 */
   account: ServiceAccessAccount;
   /** 同一个 Jellyfin 地址下按创建时间排列的全部账号。 */
@@ -1100,6 +1139,21 @@ export async function updateServiceStatus(
   return result.service;
 }
 
+/** 开启或关闭单个服务的后台任务完成通知。 */
+export async function updateServiceNotificationSettings(
+  serviceId: string,
+  notificationEnabled: boolean,
+  admin = false,
+): Promise<ServiceDetail> {
+  const result = await requestJson<{ service: ServiceDetail }>(
+    admin
+      ? `/api/v1/admin/services/${serviceId}/notification-settings`
+      : `/api/v1/services/${serviceId}/notification-settings`,
+    { method: "PATCH", body: JSON.stringify({ notificationEnabled }) },
+  );
+  return result.service;
+}
+
 /** 兼容旧版 APP：开启或关闭单个媒体库的 APP 专用中转播放。 */
 export async function updateServiceRelayPlayback(
   serviceId: string,
@@ -1180,13 +1234,31 @@ export function revokeServiceAccessSessions(serviceId: string, admin = false): P
   return requestJson(admin ? `/api/v1/admin/services/${serviceId}/access-account/revoke-sessions` : `/api/v1/services/${serviceId}/access-account/revoke-sessions`, { method: "POST", body: "{}" });
 }
 
-/** 修改单个媒体库的 Jellyfin 开关、自定义地址后缀或节目地区分组。 */
+/** 修改单个媒体库的 Jellyfin 开关、自定义地址后缀、下载权限或节目地区分组。 */
 export async function updateServiceJellyfinSettings(
   serviceId: string,
-  input: { jellyfinEnabled?: boolean; jellyfinPathSuffix?: string; jellyfinRegionLibrariesEnabled?: boolean },
+  input: {
+    jellyfinEnabled?: boolean;
+    jellyfinPathSuffix?: string;
+    jellyfinDownloadEnabled?: boolean;
+    jellyfinRegionLibrariesEnabled?: boolean;
+  },
   admin = false,
 ): Promise<ServiceAccessSettings> {
   const result = await requestJson<{ settings: ServiceAccessSettings }>(admin ? `/api/v1/admin/services/${serviceId}/jellyfin-settings` : `/api/v1/services/${serviceId}/jellyfin-settings`, { method: "PATCH", body: JSON.stringify(input) });
+  return result.settings;
+}
+
+/** 开启或关闭音乐媒体库的 Navidrome/Subsonic 公开协议。 */
+export async function updateServiceNavidromeSettings(
+  serviceId: string,
+  input: { navidromeEnabled?: boolean; navidromePathSuffix?: string },
+  admin = false,
+): Promise<ServiceAccessSettings> {
+  const result = await requestJson<{ settings: ServiceAccessSettings }>(
+    admin ? `/api/v1/admin/services/${serviceId}/navidrome-settings` : `/api/v1/services/${serviceId}/navidrome-settings`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
   return result.settings;
 }
 
@@ -1292,6 +1364,17 @@ export async function listMediaItemChildren(
   const path = admin
     ? `/api/v1/admin/catalog/items/${item.id}/children`
     : `/api/v1/libraries/${item.libraryId}/items/${item.id}/children`;
+  return (await requestJson<{ items: MediaItem[] }>(path)).items;
+}
+
+/** 读取音乐专辑或歌曲关联的艺术家，不返回播放定位。 */
+export async function listMediaItemArtists(
+  item: Pick<MediaItem, "id" | "libraryId">,
+  admin = false,
+): Promise<MediaItem[]> {
+  const path = admin
+    ? `/api/v1/admin/catalog/items/${item.id}/artists`
+    : `/api/v1/libraries/${item.libraryId}/items/${item.id}/artists`;
   return (await requestJson<{ items: MediaItem[] }>(path)).items;
 }
 
@@ -1404,6 +1487,54 @@ export function getAdminStatus(): Promise<AdminRuntimeStatus> {
 /** 读取管理后台脱敏配置状态。 */
 export function getAdminConfigStatus(): Promise<AdminConfigStatus> {
   return requestJson("/api/v1/admin/config/status");
+}
+
+/** 读取系统级外部通知渠道的脱敏设置。 */
+export function getAdminNotificationSettings(): Promise<AdminNotificationSettings> {
+  return requestJson("/api/v1/admin/notification-settings");
+}
+
+/** 保存 Telegram 通知渠道；Bot Token 留空时保留服务端已有值。 */
+export async function updateAdminTelegramNotificationSettings(input: {
+  enabled: boolean;
+  botToken: string;
+  chatId: string;
+  telegramUserId: string;
+}): Promise<TelegramNotificationSettings> {
+  const result = await requestJson<{ telegram: TelegramNotificationSettings }>(
+    "/api/v1/admin/notification-settings/telegram",
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+  return result.telegram;
+}
+
+/** 使用已经保存并启用的 Telegram 配置发送测试通知。 */
+export async function testAdminTelegramNotification(input: {
+  botToken: string;
+  chatId: string;
+  telegramUserId: string;
+}): Promise<void> {
+  await requestJson<{ sent: true }>("/api/v1/admin/notification-settings/telegram/test", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** 读取系统级音乐刮削来源配置。 */
+export async function getAdminMusicSourceSettings(): Promise<AdminMusicSourceSettings> {
+  const result = await requestJson<{ musicSources: AdminMusicSourceSettings }>("/api/v1/admin/config/music-sources");
+  return result.musicSources;
+}
+
+/** 保存系统级音乐刮削来源配置。 */
+export async function updateAdminMusicSourceSettings(
+  enabledSources: BuiltinMusicSourceId[],
+): Promise<AdminMusicSourceSettings> {
+  const result = await requestJson<{ musicSources: AdminMusicSourceSettings }>("/api/v1/admin/config/music-sources", {
+    method: "PUT",
+    body: JSON.stringify({ enabledSources }),
+  });
+  return result.musicSources;
 }
 
 /** 读取全部 AI 模型配置，响应不包含 API Key 原文。 */

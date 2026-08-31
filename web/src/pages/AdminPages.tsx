@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { Plus, Puzzle, RefreshCw, Save, ServerCog, Trash2, Upload } from "lucide-react";
+import { Bell, Music2, Plus, Puzzle, RefreshCw, Save, ServerCog, Trash2, Upload } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatCard, StatusPill } from "@/components/ui-kit";
@@ -91,7 +91,7 @@ function SystemConfigurationSummary({ config }: { config: AdminConfigStatus }) {
     <div className="grid gap-3 sm:grid-cols-2">
       <SystemSummaryItem label="数据库" value={`${databaseTypeLabels[config.database.type]} · 架构 v${config.database.schemaVersion}`} status="正常" tone="success" />
       <SystemSummaryItem label="TMDB" value={`${config.tmdb.healthyCount}/${config.tmdb.configuredCount} 个 Key 可用 · 并发 ${config.tmdb.effectiveConcurrency} · 配置 r${config.tmdb.configurationRevision}`} status={tmdbConfigured ? "已配置" : "未配置"} tone={tmdbConfigured ? "success" : "warning"} />
-      <SystemSummaryItem label="音乐刮削" value="MusicBrainz" status={config.music.musicBrainz.status === "available" ? "可用" : "不可用"} tone={config.music.musicBrainz.status === "available" ? "success" : "warning"} />
+      <SystemSummaryItem label="音乐刮削" value={`已启用 ${config.music.sources.enabledSources.length} / 6 个来源`} status={config.music.sources.enabledSources.length > 0 ? "可用" : "已关闭"} tone={config.music.sources.enabledSources.length > 0 ? "success" : "warning"} />
       <SystemSummaryItem label="凭据主密钥" value={configurationSourceLabels[config.credentials.source]} status={config.credentials.configured ? "已配置" : "未配置"} tone={config.credentials.configured ? "success" : "danger"} />
       <SystemSummaryItem label="元数据插件" value={`已启用 ${config.plugins.enabledCount} / 已安装 ${config.plugins.installedCount}`} status={config.plugins.directoryReady ? "目录正常" : "目录异常"} tone={config.plugins.directoryReady ? "success" : "danger"} />
       <SystemSummaryItem label="AI 模型" value={`已启用 ${config.aiModels.enabledCount} / 已配置 ${config.aiModels.configuredCount}`} status={config.aiModels.availableCount > 0 ? `${config.aiModels.availableCount} 个可用` : "尚无可用模型"} tone={config.aiModels.availableCount > 0 ? "success" : config.aiModels.configuredCount > 0 ? "warning" : "neutral"} />
@@ -401,9 +401,30 @@ export function AdminConfigurationPage() {
 
   return (
     <>
-      <PageHeader title="系统配置" actions={<SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新状态</SecondaryButton>} />
+      <PageHeader title="系统设置" actions={<SecondaryButton onClick={() => void resource.refresh()}><RefreshCw className="size-4" /> 刷新状态</SecondaryButton>} />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
       {resource.data && <Panel title="当前配置摘要" description="只显示数量和状态，不返回任何 Key 原文。"><SystemConfigurationSummary config={resource.data} /></Panel>}
+      <Panel title="通知设置" description="集中管理 Telegram 等系统通知渠道。" className="mt-4">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="grid size-10 shrink-0 place-items-center rounded-xl border border-border bg-secondary/40"><Bell className="size-5" /></div>
+            <div>
+              <p className="text-sm font-medium">通知渠道</p>
+              <p className="mt-1 text-xs text-muted-foreground">配置 Telegram Bot、群聊或个人接收目标，并发送测试消息。</p>
+            </div>
+          </div>
+          <Link to="/admin/config/notifications"><SecondaryButton><Bell className="size-4" /> 进入通知设置</SecondaryButton></Link>
+        </div>
+      </Panel>
+      <Panel title="音乐刮削源" description="管理哪些内置音乐平台可以参与歌曲、专辑、封面和艺术家信息补全。" className="mt-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-sm">当前启用 {resource.data?.music.sources.enabledSources.length ?? 0} / 6 个来源</p>
+            <p className="mt-1 text-xs text-muted-foreground">来源配置对全部用户和音乐服务生效，文件内嵌标签仍然优先。</p>
+          </div>
+          <Link to="/admin/config/music-sources"><SecondaryButton><Music2 className="size-4" /> 管理音乐刮削源</SecondaryButton></Link>
+        </div>
+      </Panel>
       <Panel title="Jellyfin 公开地址（可选）" description="不填写时直接使用云助手 API 地址；填写后使用该地址生成 Jellyfin 对外服务地址。" className="mt-4">
         <form onSubmit={(event) => void savePublicBaseUrl(event)} className="flex flex-col gap-3 md:flex-row md:items-end">
           <label className="min-w-0 flex-1"><span className="text-xs font-medium">对外地址覆盖值（可选）</span><input name="publicBaseUrl" type="url" defaultValue={resource.data?.publicAccess.publicBaseUrl ?? ""} disabled={resource.data?.publicAccess.editable === false} placeholder="选填，例如 https://media.example.com" className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm disabled:opacity-60" /></label>

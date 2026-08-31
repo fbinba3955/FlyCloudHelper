@@ -1,8 +1,9 @@
-import { FolderOpen, RefreshCw, Search, Trash2, WandSparkles, X } from "lucide-react";
+import { FolderOpen, Music2, RefreshCw, Search, Trash2, UserRound, WandSparkles, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import {
   clearMediaItemMatch,
   getMediaItem,
+  listMediaItemArtists,
   listMediaItemChildren,
   listMediaItemPaths,
   type CatalogSort,
@@ -28,6 +29,7 @@ const itemTypeLabels: Record<string, string> = {
   "video.episode": "单集",
   "music.album": "音乐专辑",
   "music.track": "音乐曲目",
+  "music.artist": "音乐艺术家",
   "audiobook.book": "有声书",
   "audiobook.chapter": "有声书章节",
 };
@@ -40,11 +42,28 @@ const catalogSortLabels: Record<CatalogSort, string> = {
 };
 
 const metadataLabels: Record<string, string> = {
+  artist: "艺术家",
+  artists: "艺术家",
+  album: "专辑",
+  albumArtist: "专辑艺术家",
+  trackNumber: "曲号",
+  trackTotal: "总曲数",
+  discNumber: "碟号",
+  genres: "类型 / 流派",
+  composers: "作曲",
+  durationMs: "时长（毫秒）",
+  audioCodec: "音频编码",
+  audioContainer: "音频封装",
+  audioBitRate: "音频码率",
+  audioSampleRate: "采样率",
+  audioChannels: "声道数",
+  audioChannelLayout: "声道布局",
+  audioBitDepth: "位深",
+  tagStatus: "标签状态",
   originalTitle: "原始标题",
   releaseDate: "上映日期",
   airDate: "播出日期",
   rating: "评分",
-  genres: "类型",
   people: "演职人员",
   episodeCount: "总集数",
   seasonNumber: "季号",
@@ -60,12 +79,19 @@ export interface MediaCatalogQuery {
   search: string;
   mediaType: MediaType | "all";
   videoItemType: "all" | "video.movie" | "video.series";
+  musicItemType: "all" | "music.track" | "music.album" | "music.artist";
   matchState: MatchState | "all";
   sort: CatalogSort;
 }
 
 /** 将媒体详情中的常用元数据转换为可读中文文本。 */
 function formatMetadataValue(key: string, value: unknown): string {
+  if (key === "durationMs" && typeof value === "number") return formatMediaDuration(value);
+  if (key === "audioBitRate" && typeof value === "number") return formatMediaBitRate(value);
+  if (key === "audioSampleRate" && typeof value === "number" && value > 0) return `${Math.round(value).toLocaleString("zh-CN")} Hz`;
+  if (key === "tagStatus" && typeof value === "string") {
+    return ({ complete: "已读取", partial: "部分读取", empty: "无内嵌标签", failed: "读取失败" } as Record<string, string>)[value] ?? value;
+  }
   if (key === "people" && Array.isArray(value)) {
     return value.map((raw) => {
       if (!raw || typeof raw !== "object") return "";
@@ -135,6 +161,51 @@ function formatMediaBitRate(bitRate: number): string {
   return bitRate >= 1_000_000 ? `${(bitRate / 1_000_000).toFixed(1)} Mbps` : `${Math.round(bitRate / 1000)} Kbps`;
 }
 
+/** 将歌曲时长转换为分钟和秒，避免专辑曲目列表按整分钟取整。 */
+function formatMusicTrackDuration(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return "";
+  const totalSeconds = Math.round(durationMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+/** 生成专辑歌曲列表中的碟号和曲号。 */
+function getMusicTrackPosition(track: MediaItem): string {
+  const trackNumber = Number(track.metadata.trackNumber ?? 0);
+  const discNumber = Number(track.metadata.discNumber ?? 1);
+  if (!Number.isInteger(trackNumber) || trackNumber <= 0) return "";
+  return discNumber > 1
+    ? `${discNumber}-${String(trackNumber).padStart(2, "0")}`
+    : String(trackNumber).padStart(2, "0");
+}
+
+/** 将标签预读得到的歌曲技术字段组合为简洁规格文本。 */
+function getMusicTrackSpecifications(track: MediaItem): string {
+  const metadata = track.metadata;
+  const sampleRate = Number(metadata.audioSampleRate ?? 0);
+  const bitDepth = Number(metadata.audioBitDepth ?? 0);
+  const channels = Number(metadata.audioChannels ?? 0);
+  const duration = formatMusicTrackDuration(Number(metadata.durationMs ?? 0));
+  const codec = String(metadata.audioCodec ?? "");
+  const container = String(metadata.audioContainer ?? "");
+  const channelLayout = String(metadata.audioChannelLayout ?? "") || (channels > 0 ? `${channels} 声道` : "");
+  const sampleRateText = sampleRate > 0
+    ? sampleRate >= 1000 ? `${Number((sampleRate / 1000).toFixed(1))} kHz` : `${sampleRate} Hz`
+    : "";
+  return [
+    duration,
+    codec ? formatMediaCodec(codec) : "",
+    container && container.toLocaleLowerCase("zh-CN") !== codec.toLocaleLowerCase("zh-CN")
+      ? container.toLocaleUpperCase("zh-CN")
+      : "",
+    sampleRateText,
+    bitDepth > 0 ? `${bitDepth} bit` : "",
+    channelLayout,
+    Number(metadata.audioBitRate ?? 0) > 0 ? formatMediaBitRate(Number(metadata.audioBitRate)) : "",
+  ].filter(Boolean).join(" · ");
+}
+
 /** 把 ffprobe 编码名称转换为用户熟悉的名称。 */
 function formatMediaCodec(codec: string): string {
   const labels: Record<string, string> = { h264: "H.264", hevc: "H.265", h265: "H.265", av1: "AV1", vp9: "VP9", aac: "AAC", ac3: "AC3", eac3: "EAC3", truehd: "TrueHD", dts: "DTS" };
@@ -175,6 +246,7 @@ function getMatchStateLabel(matchState: MatchState | "all"): string {
 function MediaDetailDialog({
   item,
   children,
+  artists,
   paths,
   loading,
   error,
@@ -185,6 +257,7 @@ function MediaDetailDialog({
 }: {
   item: MediaItem;
   children: MediaItem[];
+  artists: MediaItem[];
   paths: MediaPathItem[];
   loading: boolean;
   error: string | null;
@@ -199,6 +272,7 @@ function MediaDetailDialog({
   const canMatchVideo = item.mediaType === "video" && (item.itemType === "video.movie" || item.itemType === "video.series");
   // 关键变量：只有节目详情使用季集位置展示子项，电影及其他媒体保持原展示。
   const isSeries = item.itemType === "video.series";
+  const isMusicAlbum = item.itemType === "music.album";
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center p-3 sm:p-6">
@@ -304,22 +378,53 @@ function MediaDetailDialog({
             </div>
           </div>
 
-          <div>
-            <h3 className="text-sm font-semibold">{isSeries ? "剧集列表" : "子项"}</h3>
-            {loading ? <p className="mt-3 text-sm text-muted-foreground">正在读取详情…</p> : error ? <p className="mt-3 text-sm text-destructive">{error}</p> : children.length > 0 ? (
-              <ul className="mt-3 max-h-96 space-y-2 overflow-y-auto pr-1">
-                {children.map((child) => (
-                  <li key={child.id} className="rounded-lg border border-border bg-secondary/30 p-3">
-                    <p className="text-sm">{isSeries ? getSeriesEpisodeLabel(child) : child.title}</p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {isSeries
-                        ? getSeriesEpisodeDescription(child)
-                        : `${child.subtitle || itemTypeLabels[child.itemType] || "子项"}${child.year ? ` · ${child.year}` : ""}`}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-            ) : <p className="mt-3 text-sm text-muted-foreground">{isSeries ? "当前节目没有剧集" : "当前条目没有子项"}</p>}
+          <div className="space-y-5">
+            {isMusicAlbum && (
+              <div>
+                <h3 className="flex items-center gap-2 text-sm font-semibold"><UserRound className="size-4" /> 艺术家</h3>
+                {loading ? <p className="mt-3 text-sm text-muted-foreground">正在读取艺术家…</p> : error ? <p className="mt-3 text-sm text-destructive">{error}</p> : artists.length > 0 ? (
+                  <ul className="mt-3 space-y-2">
+                    {artists.map((artist) => (
+                      <li key={artist.id} className="flex items-center gap-3 rounded-lg border border-border bg-secondary/30 p-3">
+                        <div className="size-11 shrink-0 overflow-hidden rounded-full border border-border bg-secondary">
+                          {artist.posterUrl ? <img src={artist.posterUrl} alt={artist.title} className="size-full object-cover" /> : <div className="grid size-full place-items-center"><UserRound className="size-4 text-muted-foreground" /></div>}
+                        </div>
+                        <div className="min-w-0"><p className="truncate text-sm">{artist.title}</p><p className="mt-1 text-xs text-muted-foreground">艺术家</p></div>
+                      </li>
+                    ))}
+                  </ul>
+                ) : <p className="mt-3 text-sm text-muted-foreground">当前专辑没有关联艺术家</p>}
+              </div>
+            )}
+            <div>
+              <h3 className="flex items-center gap-2 text-sm font-semibold">{isMusicAlbum && <Music2 className="size-4" />}{isSeries ? "剧集列表" : isMusicAlbum ? "歌曲" : "子项"}</h3>
+              {loading ? <p className="mt-3 text-sm text-muted-foreground">正在读取详情…</p> : error ? <p className="mt-3 text-sm text-destructive">{error}</p> : children.length > 0 ? (
+                <ul className="mt-3 max-h-[32rem] space-y-2 overflow-y-auto pr-1">
+                  {children.map((child) => {
+                    const trackPosition = isMusicAlbum ? getMusicTrackPosition(child) : "";
+                    const trackSpecifications = isMusicAlbum ? getMusicTrackSpecifications(child) : "";
+                    return (
+                      <li key={child.id} className="rounded-lg border border-border bg-secondary/30 p-3">
+                        <div className="flex items-start gap-3">
+                          {isMusicAlbum && <span className="w-7 shrink-0 pt-0.5 text-right font-mono text-xs text-muted-foreground">{trackPosition || "—"}</span>}
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm">{isSeries ? getSeriesEpisodeLabel(child) : child.title}</p>
+                            <p className="mt-1 text-xs text-muted-foreground">
+                              {isSeries
+                                ? getSeriesEpisodeDescription(child)
+                                : isMusicAlbum
+                                  ? String(child.metadata.artist ?? child.subtitle ?? "未知艺术家")
+                                  : `${child.subtitle || itemTypeLabels[child.itemType] || "子项"}${child.year ? ` · ${child.year}` : ""}`}
+                            </p>
+                            {trackSpecifications && <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground">{trackSpecifications}</p>}
+                          </div>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : <p className="mt-3 text-sm text-muted-foreground">{isSeries ? "当前节目没有剧集" : isMusicAlbum ? "当前专辑没有歌曲" : "当前条目没有子项"}</p>}
+            </div>
             <div className="mt-5 rounded-xl border border-border bg-secondary/30 p-4 text-xs leading-6 text-muted-foreground">
               所属用户：{item.ownerUsername}<br />所属服务：{item.serviceName}<br />该页面不提供播放、下载或网盘地址。
             </div>
@@ -368,10 +473,13 @@ export function MediaCatalogView({
   const [mediaType, setMediaType] = useState<MediaType | "all">("all");
   // 关键变量：影视子类型和匹配状态共同决定海报墙可见条目，匹配状态按需求默认已匹配。
   const [videoItemType, setVideoItemType] = useState<"all" | "video.movie" | "video.series">("all");
+  // 关键变量：音乐分类单独保存，切换影视筛选时不丢失用户上一次选择。
+  const [musicItemType, setMusicItemType] = useState<"all" | "music.track" | "music.album" | "music.artist">("all");
   const [matchState, setMatchState] = useState<MatchState | "all">("matched");
   const [sort, setSort] = useState<CatalogSort>("created_desc");
   const [selectedItem, setSelectedItem] = useState<MediaItem | null>(null);
   const [selectedChildren, setSelectedChildren] = useState<MediaItem[]>([]);
+  const [selectedArtists, setSelectedArtists] = useState<MediaItem[]>([]);
   const [selectedPaths, setSelectedPaths] = useState<MediaPathItem[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -383,11 +491,12 @@ export function MediaCatalogView({
   const locallyFilteredItems = useMemo(() => displayItems.filter((item) => {
     const matchesMediaType = mediaType === "all" || item.mediaType === mediaType;
     const matchesVideoItemType = videoItemType === "all" || item.itemType === videoItemType;
+    const matchesMusicItemType = musicItemType === "all" || item.itemType === musicItemType;
     const matchesState = matchState === "all" || item.matchState === matchState;
     const keyword = search.trim().toLocaleLowerCase("zh-CN");
-    return matchesMediaType && matchesVideoItemType && matchesState
+    return matchesMediaType && matchesVideoItemType && matchesMusicItemType && matchesState
       && (!keyword || `${item.title} ${item.subtitle}`.toLocaleLowerCase("zh-CN").includes(keyword));
-  }), [displayItems, matchState, mediaType, search, videoItemType]);
+  }), [displayItems, matchState, mediaType, musicItemType, search, videoItemType]);
   const visibleItems = serverFiltered ? displayItems : locallyFilteredItems;
 
   useEffect(() => {
@@ -398,11 +507,12 @@ export function MediaCatalogView({
       search: search.trim(),
       mediaType,
       videoItemType,
+      musicItemType,
       matchState,
       sort,
     }), delay);
     return () => window.clearTimeout(timer);
-  }, [matchState, mediaType, onQueryChange, search, sort, videoItemType]);
+  }, [matchState, mediaType, musicItemType, onQueryChange, search, sort, videoItemType]);
 
   useEffect(() => {
     if (!selectedItem) return undefined;
@@ -419,17 +529,20 @@ export function MediaCatalogView({
   async function openMediaDetail(item: MediaItem): Promise<void> {
     setSelectedItem(item);
     setSelectedChildren([]);
+    setSelectedArtists([]);
     setSelectedPaths([]);
     setDetailError(null);
     setDetailLoading(true);
     try {
-      const [detail, children, paths] = await Promise.all([
+      const [detail, children, artists, paths] = await Promise.all([
         getMediaItem(item, admin),
         listMediaItemChildren(item, admin),
+        item.itemType === "music.album" ? listMediaItemArtists(item, admin) : Promise.resolve([]),
         listMediaItemPaths(item, admin),
       ]);
       setSelectedItem(detail);
       setSelectedChildren(children);
+      setSelectedArtists(artists);
       setSelectedPaths(paths);
       if (detail.itemType === "video.series") {
         const missingPositionCount = children.filter((child) => {
@@ -444,8 +557,25 @@ export function MediaCatalogView({
           缺少季集位置数量: missingPositionCount,
         });
       }
+      if (detail.itemType === "music.album") {
+        console.info("codex-flycloud-helper-music-album-detail", {
+          事件: "网页加载音乐专辑详情",
+          专辑ID: detail.id,
+          歌曲数量: children.length,
+          艺术家数量: artists.length,
+          包含规格歌曲数量: children.filter((child) => Boolean(child.metadata.audioCodec || child.metadata.audioContainer)).length,
+        });
+      }
     } catch (error) {
-      setDetailError(error instanceof Error ? error.message : "媒体详情读取失败");
+      const errorMessage = error instanceof Error ? error.message : "媒体详情读取失败";
+      if (item.itemType === "music.album") {
+        console.warn("codex-flycloud-helper-music-album-detail", {
+          事件: "网页加载音乐专辑详情失败",
+          专辑ID: item.id,
+          错误信息: errorMessage,
+        });
+      }
+      setDetailError(errorMessage);
     } finally {
       setDetailLoading(false);
     }
@@ -514,17 +644,24 @@ export function MediaCatalogView({
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">媒体类型</span>
-            <FilterChip active={mediaType === "all"} onClick={() => { setMediaType("all"); setVideoItemType("all"); }}>全部</FilterChip>
-            <FilterChip active={mediaType === "video"} onClick={() => setMediaType("video")}>影视</FilterChip>
+            <FilterChip active={mediaType === "all"} onClick={() => { setMediaType("all"); setVideoItemType("all"); setMusicItemType("all"); }}>全部</FilterChip>
+            <FilterChip active={mediaType === "video"} onClick={() => { setMediaType("video"); setMusicItemType("all"); }}>影视</FilterChip>
             <FilterChip active={mediaType === "music"} onClick={() => { setMediaType("music"); setVideoItemType("all"); }}>音乐</FilterChip>
-            <FilterChip active={mediaType === "audiobook"} onClick={() => { setMediaType("audiobook"); setVideoItemType("all"); }}>有声书</FilterChip>
+            <FilterChip active={mediaType === "audiobook"} onClick={() => { setMediaType("audiobook"); setVideoItemType("all"); setMusicItemType("all"); }}>有声书</FilterChip>
           </div>
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <span className="text-xs text-muted-foreground">影视类型</span>
           <FilterChip active={videoItemType === "all"} onClick={() => setVideoItemType("all")}>全部</FilterChip>
-          <FilterChip active={videoItemType === "video.movie"} onClick={() => { setMediaType("video"); setVideoItemType("video.movie"); }}>电影</FilterChip>
-          <FilterChip active={videoItemType === "video.series"} onClick={() => { setMediaType("video"); setVideoItemType("video.series"); }}>节目</FilterChip>
+          <FilterChip active={videoItemType === "video.movie"} onClick={() => { setMediaType("video"); setMusicItemType("all"); setVideoItemType("video.movie"); }}>电影</FilterChip>
+          <FilterChip active={videoItemType === "video.series"} onClick={() => { setMediaType("video"); setMusicItemType("all"); setVideoItemType("video.series"); }}>节目</FilterChip>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-muted-foreground">音乐分类</span>
+          <FilterChip active={musicItemType === "all"} onClick={() => setMusicItemType("all")}>全部</FilterChip>
+          <FilterChip active={musicItemType === "music.track"} onClick={() => { setMediaType("music"); setVideoItemType("all"); setMusicItemType("music.track"); }}>歌曲</FilterChip>
+          <FilterChip active={musicItemType === "music.album"} onClick={() => { setMediaType("music"); setVideoItemType("all"); setMusicItemType("music.album"); }}>专辑</FilterChip>
+          <FilterChip active={musicItemType === "music.artist"} onClick={() => { setMediaType("music"); setVideoItemType("all"); setMusicItemType("music.artist"); }}>艺术家</FilterChip>
         </div>
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <span className="text-xs text-muted-foreground">匹配状态</span>
@@ -581,13 +718,14 @@ export function MediaCatalogView({
         <MediaDetailDialog
           item={selectedItem}
           children={selectedChildren}
+          artists={selectedArtists}
           paths={selectedPaths}
           loading={detailLoading}
           error={detailError}
           clearingMatch={clearingMatch}
           onManualMatch={() => setManualMatchOpen(true)}
           onClearMatch={() => void clearSelectedMatch()}
-          onClose={() => { setManualMatchOpen(false); setSelectedItem(null); }}
+          onClose={() => { setManualMatchOpen(false); setSelectedItem(null); setSelectedChildren([]); setSelectedArtists([]); setSelectedPaths([]); }}
         />
       )}
       {selectedItem && manualMatchOpen && (

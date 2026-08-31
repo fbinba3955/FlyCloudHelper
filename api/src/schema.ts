@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Knex } from "knex";
 import { repairDuplicateCatalogFileLinks } from "./catalog-file-link-repair.js";
 
-export const currentSchemaVersion = 42;
+export const currentSchemaVersion = 46;
 
 /** 仅在目标表缺少字段时追加字段，兼容已完成认证阶段初始化的 SQLite。 */
 async function addColumnIfMissing(
@@ -186,6 +186,7 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("status", 32).notNullable();
       table.string("connection_status", 64).notNullable();
       table.integer("relay_playback_enabled").notNullable().defaultTo(0);
+      table.integer("notification_enabled").notNullable().defaultTo(0);
       table.integer("credential_revision").notNullable();
       table.integer("scan_profile_revision").notNullable();
       table.integer("metadata_profile_revision").notNullable();
@@ -202,6 +203,9 @@ async function createServiceTables(database: Knex): Promise<void> {
     await addColumnIfMissing(database, "cloud_services", "relay_playback_enabled", (table) => {
       table.integer("relay_playback_enabled").notNullable().defaultTo(0);
     });
+    await addColumnIfMissing(database, "cloud_services", "notification_enabled", (table) => {
+      table.integer("notification_enabled").notNullable().defaultTo(0);
+    });
   }
   if (!(await database.schema.hasTable("media_libraries"))) {
     await database.schema.createTable("media_libraries", (table) => {
@@ -212,8 +216,12 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.bigInteger("catalog_version").notNullable().defaultTo(0);
       table.integer("app_relay_playback_enabled").notNullable().defaultTo(0);
       table.integer("jellyfin_relay_playback_enabled").notNullable().defaultTo(1);
+      table.integer("jellyfin_download_enabled").notNullable().defaultTo(1);
       table.integer("jellyfin_region_libraries_enabled").notNullable().defaultTo(0);
       table.integer("jellyfin_enabled").notNullable().defaultTo(0);
+      table.integer("navidrome_enabled").notNullable().defaultTo(0);
+      table.string("navidrome_path_suffix", 255).notNullable();
+      table.string("navidrome_path_suffix_lookup", 255).notNullable();
       table.string("jellyfin_path_suffix", 255).notNullable();
       table.string("jellyfin_path_suffix_lookup", 255).notNullable();
       table.string("status", 32).notNullable();
@@ -221,6 +229,7 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("updated_at", 40).notNullable();
       table.index(["user_id"], "idx_media_libraries_user");
       table.unique(["jellyfin_path_suffix_lookup"], { indexName: "uq_media_libraries_jellyfin_path_suffix" });
+      table.unique(["navidrome_path_suffix_lookup"], { indexName: "uq_media_libraries_navidrome_path_suffix" });
     });
   } else {
     await addColumnIfMissing(database, "media_libraries", "app_relay_playback_enabled", (table) => {
@@ -229,11 +238,23 @@ async function createServiceTables(database: Knex): Promise<void> {
     await addColumnIfMissing(database, "media_libraries", "jellyfin_relay_playback_enabled", (table) => {
       table.integer("jellyfin_relay_playback_enabled").notNullable().defaultTo(1);
     });
+    await addColumnIfMissing(database, "media_libraries", "jellyfin_download_enabled", (table) => {
+      table.integer("jellyfin_download_enabled").notNullable().defaultTo(1);
+    });
     await addColumnIfMissing(database, "media_libraries", "jellyfin_region_libraries_enabled", (table) => {
       table.integer("jellyfin_region_libraries_enabled").notNullable().defaultTo(0);
     });
     await addColumnIfMissing(database, "media_libraries", "jellyfin_enabled", (table) => {
       table.integer("jellyfin_enabled").notNullable().defaultTo(0);
+    });
+    await addColumnIfMissing(database, "media_libraries", "navidrome_enabled", (table) => {
+      table.integer("navidrome_enabled").notNullable().defaultTo(0);
+    });
+    await addColumnIfMissing(database, "media_libraries", "navidrome_path_suffix", (table) => {
+      table.string("navidrome_path_suffix", 255).nullable();
+    });
+    await addColumnIfMissing(database, "media_libraries", "navidrome_path_suffix_lookup", (table) => {
+      table.string("navidrome_path_suffix_lookup", 255).nullable();
     });
     await addColumnIfMissing(database, "media_libraries", "jellyfin_path_suffix", (table) => {
       table.string("jellyfin_path_suffix", 255).nullable();
@@ -396,6 +417,7 @@ async function createServiceTables(database: Knex): Promise<void> {
       table.string("username", 255).notNullable();
       table.string("username_lookup", 255).notNullable();
       table.text("password_hash").notNullable();
+      table.text("protocol_password_encrypted").nullable();
       table.integer("password_required").notNullable().defaultTo(0);
       table.integer("credential_revision").notNullable().defaultTo(1);
       table.string("status", 32).notNullable().defaultTo("active");
@@ -407,6 +429,9 @@ async function createServiceTables(database: Knex): Promise<void> {
   await addColumnIfMissing(database, "service_access_accounts", "password_required", (table) => {
     // 关键变量：缺少密码状态字段的旧结构按新的默认规则补为免密码。
     table.integer("password_required").notNullable().defaultTo(0);
+  });
+  await addColumnIfMissing(database, "service_access_accounts", "protocol_password_encrypted", (table) => {
+    table.text("protocol_password_encrypted").nullable();
   });
 
   if (!(await database.schema.hasTable("service_protocol_sessions"))) {
@@ -482,6 +507,59 @@ async function createPlaybackTables(database: Knex): Promise<void> {
       table.string("started_at", 40).notNullable();
       table.string("stopped_at", 40).notNullable();
       table.index(["service_id", "account_id", "stopped_at"], "idx_service_play_history_recent");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_item_preferences"))) {
+    await database.schema.createTable("service_item_preferences", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_access_accounts").onDelete("CASCADE");
+      table.string("item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
+      table.string("starred_at", 40).nullable();
+      table.integer("rating").notNullable().defaultTo(0);
+      table.string("updated_at", 40).notNullable();
+      table.unique(["service_id", "account_id", "item_id"], { indexName: "uq_service_item_preferences" });
+      table.index(["service_id", "account_id", "starred_at"], "idx_service_item_preferences_starred");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_jellyfin_virtual_preferences"))) {
+    await database.schema.createTable("service_jellyfin_virtual_preferences", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_access_accounts").onDelete("CASCADE");
+      // 关键变量：Person 等虚拟 Jellyfin 条目没有 media_items 外键，直接保存稳定协议 ID。
+      table.string("protocol_item_id", 64).notNullable();
+      table.string("item_type", 32).notNullable();
+      table.string("starred_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.unique(["service_id", "account_id", "protocol_item_id"], { indexName: "uq_jellyfin_virtual_preference" });
+      table.index(["service_id", "account_id", "starred_at"], "idx_jellyfin_virtual_preference_starred");
+    });
+  }
+
+  if (!(await database.schema.hasTable("service_music_playlists"))) {
+    await database.schema.createTable("service_music_playlists", (table) => {
+      table.string("id", 64).primary();
+      table.string("service_id", 64).notNullable().references("id").inTable("cloud_services").onDelete("CASCADE");
+      table.string("account_id", 64).notNullable().references("id").inTable("service_access_accounts").onDelete("CASCADE");
+      table.string("name", 255).notNullable();
+      table.text("comment").nullable();
+      table.integer("is_public").notNullable().defaultTo(0);
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.index(["service_id", "account_id", "updated_at"], "idx_service_music_playlists_account");
+    });
+  }
+  if (!(await database.schema.hasTable("service_music_playlist_items"))) {
+    await database.schema.createTable("service_music_playlist_items", (table) => {
+      table.string("id", 64).primary();
+      table.string("playlist_id", 64).notNullable().references("id").inTable("service_music_playlists").onDelete("CASCADE");
+      table.string("item_id", 64).notNullable().references("id").inTable("media_items").onDelete("CASCADE");
+      table.integer("sort_order").notNullable();
+      table.string("created_at", 40).notNullable();
+      table.index(["playlist_id", "sort_order"], "idx_service_music_playlist_items_order");
     });
   }
 }
@@ -702,6 +780,30 @@ async function createCatalogTables(database: Knex): Promise<void> {
   await addColumnIfMissing(database, "source_files", "recognition_revision", (table) => {
     table.string("recognition_revision", 128).nullable();
   });
+
+  if (!(await database.schema.hasTable("audio_file_tags"))) {
+    await database.schema.createTable("audio_file_tags", (table) => {
+      // 关键变量：一个源文件只保存当前文件指纹对应的一份音频标签，文件变化后原位覆盖。
+      table.string("source_file_id", 64).primary().references("id").inTable("source_files").onDelete("CASCADE");
+      table.string("user_id", 64).notNullable();
+      table.string("service_id", 64).notNullable();
+      table.string("library_id", 64).notNullable();
+      table.string("fingerprint", 64).notNullable();
+      table.string("status", 32).notNullable();
+      table.string("parser_version", 40).notNullable();
+      table.text("tag_json").notNullable();
+      table.text("technical_json").notNullable();
+      table.text("artwork_json").notNullable();
+      table.bigInteger("read_bytes_limit").notNullable().defaultTo(0);
+      table.string("error_code", 100).nullable();
+      table.text("error_message").nullable();
+      table.string("read_at", 40).notNullable();
+      table.string("created_at", 40).notNullable();
+      table.string("updated_at", 40).notNullable();
+      table.index(["library_id", "status"], "idx_audio_file_tags_library_status");
+      table.index(["service_id", "updated_at"], "idx_audio_file_tags_service_updated");
+    });
+  }
 
   if (!(await database.schema.hasTable("nfo_sidecar_cache"))) {
     await database.schema.createTable("nfo_sidecar_cache", (table) => {
@@ -1247,6 +1349,22 @@ async function migrateLibraryJellyfinPathSuffix(database: Knex): Promise<void> {
   await addUniqueIfMissing(database, "media_libraries", ["jellyfin_path_suffix_lookup"], "uq_media_libraries_jellyfin_path_suffix");
 }
 
+/** 为已有媒体库生成默认 Navidrome 地址后缀，并建立全局唯一约束。 */
+async function migrateLibraryNavidromePathSuffix(database: Knex): Promise<void> {
+  const libraries = await database("media_libraries")
+    .select("service_id", "navidrome_path_suffix", "navidrome_path_suffix_lookup");
+  for (const library of libraries) {
+    // 关键变量：升级前的音乐库沿用服务 ID，确保不同服务的 /n/ 地址不会冲突。
+    const pathSuffix = String(library.navidrome_path_suffix ?? "").trim() || String(library.service_id);
+    const pathSuffixLookup = String(library.navidrome_path_suffix_lookup ?? "").trim() || pathSuffix.toLowerCase();
+    await database("media_libraries").where({ service_id: library.service_id }).update({
+      navidrome_path_suffix: pathSuffix,
+      navidrome_path_suffix_lookup: pathSuffixLookup,
+    });
+  }
+  await addUniqueIfMissing(database, "media_libraries", ["navidrome_path_suffix_lookup"], "uq_media_libraries_navidrome_path_suffix");
+}
+
 /** 将旧服务级中转开关迁移为媒体库 APP 中转开关，并保留 Jellyfin 原有中转能力。 */
 async function migrateLibraryRelayPlaybackSettings(database: Knex): Promise<void> {
   const services = await database("cloud_services")
@@ -1334,6 +1452,9 @@ export async function migrateDatabase(database: Knex): Promise<void> {
     }
     if (Number(existingState.schema_version ?? 0) < 39) {
       await dropLegacyServiceAccessAccountUnique(database);
+    }
+    if (Number(existingState.schema_version ?? 0) < 44) {
+      await migrateLibraryNavidromePathSuffix(database);
     }
     await database("system_state").where({ singleton_id: 1 }).update({
       service_instance_id: existingState.service_instance_id || randomUUID(),

@@ -27,6 +27,8 @@ export interface JellyfinContext extends JellyfinLibraryContext {
   accountHasPassword: boolean;
   credentialRevision: number;
   accessToken: string;
+  /** 当前媒体库是否允许 Jellyfin 客户端下载原始影片文件。 */
+  downloadEnabled: boolean;
 }
 
 interface JellyfinFileSummary {
@@ -39,6 +41,8 @@ interface JellyfinFileSummary {
 
 interface JellyfinItemMappingContext {
   progressByItemId: Map<string, Record<string, unknown>>;
+  /** 当前账号已收藏的内部媒体条目 ID。 */
+  favoriteItemIds: Set<string>;
   filesByItemId: Map<string, JellyfinFileSummary[]>;
 }
 
@@ -65,6 +69,30 @@ interface JellyfinSeasonReference {
   seasonNumber: number;
 }
 
+/** Jellyfin 标准图片接口实际需要代理的远端图片。 */
+export interface JellyfinImageSource {
+  url: string;
+  imageTag: string;
+  updatedAt: string;
+  sourceType: "media" | "person";
+}
+
+interface JellyfinPersonSummary {
+  id: string;
+  name: string;
+  sourceId: string;
+  profileUrl: string;
+  imageTag: string;
+  updatedAt: string;
+  /** 当前演员直接关联的顶层电影或节目 ID。 */
+  itemIds: Set<string>;
+}
+
+interface JellyfinPersonCache {
+  catalogVersion: number;
+  peopleById: Map<string, JellyfinPersonSummary>;
+}
+
 const JELLYFIN_ITEM_UUID_PREFIX = "f10c0000";
 const JELLYFIN_SEASON_UUID_PREFIX = "f2";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -83,6 +111,19 @@ function createProtocolUuid(scope: string, value: string): string {
   digest[6] = (digest[6]! & 0x0f) | 0x50;
   digest[8] = (digest[8]! & 0x3f) | 0x80;
   return formatProtocolUuid(digest.toString("hex").slice(0, 32));
+}
+
+/** 根据远端图片地址生成稳定的 Jellyfin ImageTag。 */
+function createJellyfinImageTag(imageUrl: string): string {
+  return createHash("sha256").update(imageUrl, "utf8").digest("hex").slice(0, 32);
+}
+
+/** 按 Jellyfin 图片类型读取媒体条目保存的图片地址。 */
+function readJellyfinImageUrl(item: MediaItemRecord, imageType: string): string {
+  const normalizedType = imageType.trim().toLowerCase();
+  if (normalizedType === "backdrop") return String(item.backdropUrl ?? "").trim();
+  if (normalizedType === "logo") return String(item.metadata.logoUrl ?? "").trim();
+  return String(item.posterUrl ?? "").trim();
 }
 
 /** 将内部 itm_ ID 可逆编码为标准 UUID；已有 UUID 保持不变。 */
@@ -223,6 +264,8 @@ function readAuthorizationAttribute(request: FastifyRequest, key: string): strin
 export class JellyfinCompatibilityService {
   // 关键变量：登录失败按服务和来源地址隔离，避免攻击一个服务影响其他服务。
   private readonly loginFailures = new Map<string, { count: number; firstFailedAt: number; blockedUntil: number }>();
+  // 关键变量：演员 UUID 无法反解详情，按媒体库版本缓存演员实体及其关联作品索引。
+  private readonly personCaches = new Map<string, JellyfinPersonCache>();
 
   public constructor(private readonly runtime: ApiRuntime) {}
 
@@ -261,7 +304,7 @@ export class JellyfinCompatibilityService {
   public async requireEnabledService(serviceId: string) {
     const row = await this.runtime.database.query("cloud_services as s")
       .join("media_libraries as l", "l.id", "s.library_id")
-      .select("s.id", "s.user_id", "s.library_id", "s.display_name", "s.status", "l.jellyfin_enabled", "l.jellyfin_relay_playback_enabled", "l.jellyfin_region_libraries_enabled", "s.provider_type", "s.credential_revision")
+      .select("s.id", "s.user_id", "s.library_id", "s.display_name", "s.status", "l.jellyfin_enabled", "l.jellyfin_relay_playback_enabled", "l.jellyfin_download_enabled", "l.jellyfin_region_libraries_enabled", "s.provider_type", "s.credential_revision")
       .where("s.id", serviceId).whereNull("s.deleted_at").first();
     if (!row) throw new ApiError(404, "jellyfin_service_not_found", "Jellyfin 服务不存在");
     if (Number(row.jellyfin_enabled) !== 1 || row.status === "disabled") throw new ApiError(404, "jellyfin_service_disabled", "Jellyfin 服务未启用");
@@ -313,7 +356,13 @@ export class JellyfinCompatibilityService {
       服务ID: serviceId, 服务访问账号ID: account.id, 客户端名称: readAuthorizationAttribute(request, "Client") ?? "未知",
     });
     return {
-      User: this.mapUser(account.id, account.username, serviceId, account.hasPassword),
+      User: this.mapUser(
+        account.id,
+        account.username,
+        serviceId,
+        account.hasPassword,
+        Number(service.jellyfin_download_enabled) === 1,
+      ),
       SessionInfo: { Id: protocolSessionId, ServerId: serviceId, UserId: account.id, UserName: account.username, Client: readAuthorizationAttribute(request, "Client") ?? "Jellyfin" },
       AccessToken: token,
       ServerId: serviceId,
@@ -331,7 +380,7 @@ export class JellyfinCompatibilityService {
       .select(
         "ps.*", "a.username", "a.password_required", "a.credential_revision as account_revision",
         "a.status as account_status", "s.user_id", "s.library_id", "s.status as service_status",
-        "l.jellyfin_enabled", "l.jellyfin_region_libraries_enabled",
+        "l.jellyfin_enabled", "l.jellyfin_region_libraries_enabled", "l.jellyfin_download_enabled",
       )
       .where("ps.token_hash", hashSessionToken(token)).where("ps.service_id", serviceId).where("ps.protocol", "jellyfin").whereNull("ps.revoked_at").whereNull("s.deleted_at").first();
     if (!row || String(row.expires_at) <= new Date().toISOString() || Number(row.credential_revision) !== Number(row.account_revision)
@@ -348,6 +397,7 @@ export class JellyfinCompatibilityService {
       accountId: String(row.account_id), accountUsername: String(row.username),
       accountHasPassword: Number(row.password_required ?? 1) !== 0,
       credentialRevision: Number(row.account_revision), accessToken: token,
+      downloadEnabled: Number(row.jellyfin_download_enabled) === 1,
     };
   }
 
@@ -361,14 +411,20 @@ export class JellyfinCompatibilityService {
   }
 
   /** 构造 Jellyfin 用户 DTO，服务访问账号没有管理权限。 */
-  public mapUser(accountId: string, username: string, serviceId = "", hasPassword = true) {
+  public mapUser(
+    accountId: string,
+    username: string,
+    serviceId = "",
+    hasPassword = true,
+    downloadEnabled = true,
+  ) {
     return {
       Name: username, ServerId: serviceId, Id: accountId,
       HasPassword: hasPassword, HasConfiguredPassword: hasPassword,
       EnableAutoLogin: false, Configuration: {}, Policy: {
         IsAdministrator: false, IsHidden: false, IsDisabled: false, EnableMediaPlayback: true,
         EnableAudioPlaybackTranscoding: false, EnableVideoPlaybackTranscoding: false,
-        EnableContentDownloading: true, EnableContentDeletion: false,
+        EnableContentDownloading: downloadEnabled, EnableContentDeletion: false,
       },
     };
   }
@@ -433,13 +489,14 @@ export class JellyfinCompatibilityService {
 
   /** 将 Jellyfin SortBy、SortOrder 映射为云助手目录排序字段。 */
   private readCatalogSort(query: Record<string, unknown>): CatalogSort {
-    const requestedFields = String(query.SortBy ?? "").split(",")
+    const requestedFields = String(this.readQueryValue(query, "SortBy") ?? "").split(",")
       .map((field) => field.trim().toLowerCase())
       .filter(Boolean);
     if (requestedFields.length === 0) return "created_desc";
     // Jellyfin 在提供 SortBy 但省略 SortOrder 时默认升序；Flymby 通常会显式传入方向。
-    const ascending = query.SortOrder === undefined
-      || String(query.SortOrder).toLowerCase() === "ascending";
+    const sortOrder = this.readQueryValue(query, "SortOrder");
+    const ascending = sortOrder === undefined
+      || String(sortOrder).toLowerCase() === "ascending";
     for (const field of requestedFields) {
       if (field === "sortname" || field === "name") return ascending ? "title_asc" : "title_desc";
       if (field === "productionyear") return ascending ? "year_asc" : "year_desc";
@@ -544,10 +601,16 @@ export class JellyfinCompatibilityService {
     const episodeNumber = Number(metadata.episodeNumber ?? 0);
     const ownPrimaryTag = item.posterUrl ? String(Date.parse(item.updatedAt) || 1) : "";
     const parentPrimaryTag = parent?.posterUrl ? String(Date.parse(parent.updatedAt) || 1) : "";
+    const ownLogoUrl = String(metadata.logoUrl ?? "").trim();
+    const ownLogoTag = ownLogoUrl ? createJellyfinImageTag(ownLogoUrl) : "";
+    const parentLogoUrl = String(parent?.metadata.logoUrl ?? "").trim();
+    const parentLogoTag = parentLogoUrl ? createJellyfinImageTag(parentLogoUrl) : "";
     // 关键变量：单集没有独立海报时继承节目海报，并明确图片所属条目，避免客户端请求错误的单集图片。
     const primaryImageTag = ownPrimaryTag || (type === "Episode" ? parentPrimaryTag : "");
     const primaryImageItemId = ownPrimaryTag ? item.id : primaryImageTag ? parent?.id : undefined;
-    const imageTags: Record<string, string> = primaryImageTag ? { Primary: primaryImageTag } : {};
+    const imageTags: Record<string, string> = {};
+    if (primaryImageTag) imageTags.Primary = primaryImageTag;
+    if (ownLogoTag) imageTags.Logo = ownLogoTag;
     const people = Array.isArray(metadata.people) ? metadata.people : [];
     const genreNames = Array.isArray(metadata.genres)
       ? [...new Set(metadata.genres.map((genre) => String(genre).trim()).filter(Boolean))]
@@ -585,6 +648,18 @@ export class JellyfinCompatibilityService {
         实际文件数量: itemFiles.length,
         已完成规格文件数量: itemFiles.filter((file) => file.mediaProbe !== null).length,
       });
+      this.runtime.logBusinessEvent("info", {
+        日志关键字: "codex-jellyfin-artwork",
+        事件: "返回Jellyfin详情图片字段",
+        服务ID: context.serviceId,
+        媒体条目ID: item.id,
+        标题Logo标记是否存在: Boolean(ownLogoTag || parentLogoTag),
+        演职人员数量: people.length,
+        包含头像标记人员数量: people.filter((person) => {
+          const profileUrl = String((person as Record<string, unknown>).profileUrl ?? "").trim();
+          return Boolean(profileUrl);
+        }).length,
+      });
     }
     return {
       Name: item.title, OriginalTitle: String(metadata.originalTitle ?? ""), ServerId: context.serviceId,
@@ -592,17 +667,20 @@ export class JellyfinCompatibilityService {
       SortName: item.sortTitle, PremiereDate: toJellyfinDateTime(item.premiereDate), ProductionYear: item.year,
       Overview: item.overview, CommunityRating: Number(metadata.rating ?? 0) || undefined,
       Type: type, MediaType: "Video", IsFolder: type === "Series", LocationType: "FileSystem",
+      CanDownload: context.downloadEnabled && type !== "Series" && itemFiles.length > 0,
       Genres: genreNames,
       GenreItems: genreNames.map((name) => ({ Name: name, Id: this.encodeGenreId(name) })),
       People: people.map((person) => {
         const personRecord = person as Record<string, unknown>;
         const personName = String(personRecord.name ?? "").trim();
         const personSourceId = String(personRecord.id ?? "").trim();
+        const profileUrl = String(personRecord.profileUrl ?? "").trim();
         return {
           Name: personName,
           Id: createProtocolUuid("person", personSourceId ? `source:${personSourceId}` : `name:${personName}`),
           Role: String(personRecord.role ?? ""),
           Type: mapJellyfinPersonKind(personRecord),
+          PrimaryImageTag: profileUrl ? createJellyfinImageTag(profileUrl) : undefined,
         };
       }),
       ProviderIds: mapJellyfinProviderIds(item.externalIds), ImageTags: imageTags,
@@ -626,12 +704,14 @@ export class JellyfinCompatibilityService {
       ParentPrimaryImageItemId: type === "Episode" && parentPrimaryTag ? protocolParentItemId : undefined,
       ParentPrimaryImageTag: type === "Episode" ? parentPrimaryTag || undefined : undefined,
       SeriesPrimaryImageTag: type === "Episode" ? parentPrimaryTag || undefined : undefined,
+      ParentLogoItemId: type === "Episode" && parentLogoTag ? protocolParentItemId : undefined,
+      ParentLogoImageTag: type === "Episode" ? parentLogoTag || undefined : undefined,
       ParentBackdropItemId: type === "Episode" && parent?.backdropUrl ? protocolParentItemId : undefined,
       ParentBackdropImageTags: type === "Episode" && parent?.backdropUrl
         ? [String(Date.parse(parent.updatedAt) || 1)]
         : [],
       DatePlayed: progress?.last_played_at ?? undefined,
-      UserData: this.mapUserData(progress, runTimeTicks),
+      UserData: this.mapUserData(progress, runTimeTicks, mapping?.favoriteItemIds.has(item.id) ?? await this.isMediaItemFavorite(context, item.id), protocolItemId),
     };
   }
 
@@ -677,6 +757,12 @@ export class JellyfinCompatibilityService {
 
   /** 查询顶层目录，支持 Jellyfin 常用过滤、搜索和分页参数。 */
   public async listItems(context: JellyfinContext, query: Record<string, unknown>) {
+    if (this.queryIncludesFilter(query, "IsFavorite", "IsFavorite")) {
+      return this.listFavoriteItems(context, query);
+    }
+    if (this.queryIncludesFilter(query, "IsPlayed", "IsPlayed")) {
+      return this.listPlayedItems(context, query);
+    }
     const include = String(query.IncludeItemTypes ?? "").split(",").filter(Boolean);
     const parentId = String(query.ParentId ?? "");
     const virtualLibrary = this.findLibraryDefinition(context, parentId);
@@ -708,6 +794,22 @@ export class JellyfinCompatibilityService {
     const sort = this.readCatalogSort(query);
     const search = typeof query.SearchTerm === "string" ? query.SearchTerm : undefined;
     const genres = await this.readGenreNames(context, query);
+    const personIds = String(query.PersonIds ?? "").split(",")
+      .map((personId) => personId.trim().toLowerCase())
+      .filter(Boolean);
+    if (personIds.length > 0) {
+      return this.listItemsByPersonIds(
+        context,
+        personIds,
+        effectiveTypes,
+        virtualLibrary,
+        genres,
+        search,
+        sort,
+        limit,
+        offset,
+      );
+    }
     let records: MediaItemRecord[];
     let total: number;
     if (effectiveTypes.length > 1) {
@@ -745,6 +847,151 @@ export class JellyfinCompatibilityService {
       首条协议ID: String(items[0]?.Id ?? "无"),
     });
     return { Items: items, TotalRecordCount: total, StartIndex: offset };
+  }
+
+  /** 按当前 Jellyfin 账号返回已收藏的媒体和 Person 条目。 */
+  public async listFavoriteItems(context: JellyfinContext, query: Record<string, unknown>) {
+    const include = String(this.readQueryValue(query, "IncludeItemTypes") ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+    const requestedMediaTypes: string[] = include.map((type) => type === "Movie" ? "video.movie" : type === "Series" ? "video.series" : type === "Episode" ? "video.episode" : "")
+      .filter(Boolean);
+    const includePeople = include.length === 0 || include.includes("Person");
+    const includeMedia = include.length === 0 || requestedMediaTypes.length > 0;
+    const mediaPreferenceRows = includeMedia
+      ? await this.runtime.database.query("service_item_preferences as pref")
+        .join("media_items as m", "m.id", "pref.item_id")
+        .select("pref.item_id", "pref.starred_at")
+        .where({ "pref.service_id": context.serviceId, "pref.account_id": context.accountId })
+        .whereNotNull("pref.starred_at")
+        .whereNull("m.deleted_at")
+        .orderBy("pref.starred_at", "desc")
+        .limit(500)
+      : [];
+    const records: Array<{ item: MediaItemRecord; parent?: MediaItemRecord }> = [];
+    for (const row of mediaPreferenceRows) {
+      const item = await this.runtime.repository.getCatalogItem(String(row.item_id), context.ownerUserId);
+      if (item.serviceId !== context.serviceId) continue;
+      if (requestedMediaTypes.length > 0 && !requestedMediaTypes.includes(item.itemType)) continue;
+      const parent = item.itemType === "video.episode" ? await this.findParent(item.id, context.ownerUserId) : undefined;
+      if (!this.matchesParentScope(context, item, parent, query)) continue;
+      const searchTerm = String(this.readQueryValue(query, "SearchTerm") ?? "").trim().toLocaleLowerCase("zh-CN");
+      if (searchTerm && !item.title.toLocaleLowerCase("zh-CN").includes(searchTerm)) continue;
+      records.push({ item, parent });
+    }
+    const sort = this.readCatalogSort(query);
+    records.sort((left, right) => this.compareCatalogItems(left.item, right.item, sort));
+    const mapping = await this.loadItemMappingContext(context, records.map((record) => record.item.id));
+    const mediaItems = await Promise.all(records.map((record) => this.mapItem(context, record.item, record.parent, mapping)));
+
+    let personItems: Array<Record<string, unknown>> = [];
+    if (includePeople) {
+      const virtualRows = await this.runtime.database.query("service_jellyfin_virtual_preferences")
+        .select("protocol_item_id")
+        .where({ service_id: context.serviceId, account_id: context.accountId, item_type: "Person" })
+        .orderBy("starred_at", "desc")
+        .limit(500);
+      const people = await Promise.all(virtualRows.map((row) => this.getPersonItem(context, String(row.protocol_item_id))));
+      personItems = people.filter(Boolean).map((item) => item as unknown as Record<string, unknown>);
+      personItems.sort((left, right) => String(left.SortName ?? left.Name ?? "").localeCompare(String(right.SortName ?? right.Name ?? ""), "zh-CN"));
+    }
+    const items = [...mediaItems, ...personItems];
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-user-state",
+      事件: "返回Jellyfin收藏列表",
+      服务ID: context.serviceId,
+      账号ID: context.accountId,
+      媒体数量: mediaItems.length,
+      人物数量: personItems.length,
+    });
+    return this.paginate(items, query);
+  }
+
+  /** 只返回明确标记为已观看的条目，不将普通播放历史混入。 */
+  public async listPlayedItems(context: JellyfinContext, query: Record<string, unknown>) {
+    const include = String(this.readQueryValue(query, "IncludeItemTypes") ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+    const requestedTypes: string[] = include.map((type) => type === "Movie" ? "video.movie" : type === "Series" ? "video.series" : type === "Episode" ? "video.episode" : "")
+      .filter(Boolean);
+    if (include.length > 0 && requestedTypes.length === 0) return { Items: [], TotalRecordCount: 0, StartIndex: 0 };
+    const rows = await this.runtime.database.query("service_playback_progress as p")
+      .join("media_items as m", "m.id", "p.item_id")
+      .select("m.id")
+      .where({ "p.service_id": context.serviceId, "p.account_id": context.accountId, "p.played": 1 })
+      .whereNull("m.deleted_at")
+      .orderBy("p.last_played_at", "desc")
+      .limit(500);
+    const records: Array<{ item: MediaItemRecord; parent?: MediaItemRecord }> = [];
+    for (const row of rows) {
+      const item = await this.runtime.repository.getCatalogItem(String(row.id), context.ownerUserId);
+      if (requestedTypes.length > 0 && !requestedTypes.includes(item.itemType)) continue;
+      const parent = item.itemType === "video.episode" ? await this.findParent(item.id, context.ownerUserId) : undefined;
+      if (!this.matchesParentScope(context, item, parent, query)) continue;
+      records.push({ item, parent });
+    }
+    const mapping = await this.loadItemMappingContext(context, records.map((record) => record.item.id));
+    const items = await Promise.all(records.map((record) => this.mapItem(context, record.item, record.parent, mapping)));
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-user-state",
+      事件: "返回Jellyfin已观看列表",
+      服务ID: context.serviceId,
+      账号ID: context.accountId,
+      已观看数量: items.length,
+    });
+    return this.paginate(items, query);
+  }
+
+  /** 按 Jellyfin PersonIds 返回演员直接关联的电影或节目。 */
+  private async listItemsByPersonIds(
+    context: JellyfinContext,
+    personIds: string[],
+    effectiveTypes: string[],
+    virtualLibrary: JellyfinLibraryDefinition | undefined,
+    genres: string[],
+    search: string | undefined,
+    sort: CatalogSort,
+    limit: number,
+    offset: number,
+  ) {
+    const personCache = await this.loadPersonCache(context);
+    // 关键变量：多个 PersonIds 按 Jellyfin 的任一人员命中处理，作品 ID 使用集合去重。
+    const associatedItemIds = new Set<string>();
+    personIds.forEach((personId) => {
+      personCache.peopleById.get(personId)?.itemIds.forEach((itemId) => associatedItemIds.add(itemId));
+    });
+    const itemIds = [...associatedItemIds];
+    if (itemIds.length === 0) {
+      return { Items: [], TotalRecordCount: 0, StartIndex: offset };
+    }
+    const requestedTypes = effectiveTypes.length > 0
+      ? effectiveTypes
+      : ["video.movie", "video.series"];
+    const results = await Promise.all(requestedTypes.map((requestedType) => this.runtime.repository.listCatalogItems({
+      userId: context.ownerUserId,
+      serviceId: context.serviceId,
+      mediaType: "video",
+      itemType: requestedType,
+      itemIds,
+      regionGroup: virtualLibrary?.regionGroup,
+      genres,
+      search,
+      sort,
+      limit: 500,
+      offset: 0,
+      includeFileCounts: false,
+    })));
+    const combined = results.flatMap((result) => result.items);
+    combined.sort((left, right) => this.compareCatalogItems(left, right, sort));
+    const records = combined.slice(offset, offset + limit);
+    const mapping = await this.loadItemMappingContext(context, records.map((item) => item.id));
+    const items = await Promise.all(records.map((item) => this.mapItem(context, item, undefined, mapping)));
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-artwork",
+      事件: "返回Jellyfin演员关联作品",
+      服务ID: context.serviceId,
+      演员协议ID: personIds.join(","),
+      查询媒体类型: requestedTypes.join(","),
+      关联作品总数: combined.length,
+      返回作品数量: items.length,
+    });
+    return { Items: items, TotalRecordCount: combined.length, StartIndex: offset };
   }
 
   /** 聚合当前电影或节目媒体库的 Jellyfin 分类列表。 */
@@ -891,8 +1138,7 @@ export class JellyfinCompatibilityService {
         regionGroup: library.regionGroup,
         sort: "updated_desc", limit: 60, offset: 0, includeFileCounts: false,
       });
-      const prefersBackdrop = imageType.toLowerCase() === "backdrop";
-      const coverItem = result.items.find((item) => prefersBackdrop ? Boolean(item.backdropUrl) : Boolean(item.posterUrl))
+      const coverItem = result.items.find((item) => Boolean(readJellyfinImageUrl(item, imageType)))
         ?? result.items.find((item) => Boolean(item.posterUrl || item.backdropUrl));
       if (!coverItem) throw new ApiError(404, "jellyfin_image_not_found", "媒体库没有可用封面");
       this.runtime.logBusinessEvent("info", {
@@ -911,16 +1157,207 @@ export class JellyfinCompatibilityService {
         请求条目ID: itemId, 实际条目ID: resolvedItemId, 图片类型: imageType,
       });
     }
-    const requestedImageUrl = imageType.toLowerCase() === "backdrop" ? item.backdropUrl : item.posterUrl;
+    const requestedImageUrl = readJellyfinImageUrl(item, imageType);
     if (requestedImageUrl || item.itemType !== "video.episode") return item;
     // 单集 DTO 可以继承节目海报和背景图；图片请求使用单集 ID 时同样要回退到所属节目。
     const relation = await this.runtime.database.query("media_relations")
       .where({ library_id: context.libraryId, child_item_id: item.id }).first();
     if (!relation) return item;
     const parent = await this.runtime.repository.getCatalogItem(String(relation.parent_item_id), context.ownerUserId);
-    const parentImageUrl = imageType.toLowerCase() === "backdrop" ? parent.backdropUrl : parent.posterUrl;
+    const parentImageUrl = readJellyfinImageUrl(parent, imageType);
     if (parent.serviceId !== context.serviceId || !parentImageUrl) return item;
     return parent;
+  }
+
+  /** 解析标准图片接口的媒体图片或演员头像来源。 */
+  public async resolveImageSource(
+    context: JellyfinLibraryContext,
+    itemId: string,
+    imageType: string,
+  ): Promise<JellyfinImageSource> {
+    const normalizedType = imageType.trim().toLowerCase();
+    if (normalizedType === "primary" && this.isPotentialPersonId(context, itemId)) {
+      const personImage = await this.resolvePersonImageSource(context, itemId);
+      if (personImage) {
+        this.logArtworkResolution(context, itemId, imageType, "演员头像");
+        return personImage;
+      }
+    }
+    const item = await this.resolveImageItem(context, itemId, imageType);
+    const imageUrl = readJellyfinImageUrl(item, imageType);
+    if (!imageUrl) throw new ApiError(404, "jellyfin_image_not_found", "图片不存在");
+    const imageTag = normalizedType === "logo"
+      ? createJellyfinImageTag(imageUrl)
+      : String(Date.parse(item.updatedAt) || 1);
+    this.logArtworkResolution(context, itemId, imageType, normalizedType === "logo" ? "标题Logo" : "媒体图片");
+    return { url: imageUrl, imageTag, updatedAt: item.updatedAt, sourceType: "media" };
+  }
+
+  /** 判断协议 ID 是否可能指向不可逆编码的演员实体。 */
+  private isPotentialPersonId(context: JellyfinLibraryContext, itemId: string): boolean {
+    const compactItemId = itemId.trim().toLowerCase().replace(/-/gu, "");
+    return !INTERNAL_ITEM_ID_PATTERN.test(itemId)
+      && !compactItemId.startsWith(JELLYFIN_ITEM_UUID_PREFIX)
+      && !this.parseSeasonReference(itemId)
+      && !this.findLibraryDefinition(context, itemId);
+  }
+
+  /** 按媒体库版本建立演员实体、头像和关联作品索引。 */
+  private async loadPersonCache(context: JellyfinLibraryContext): Promise<JellyfinPersonCache> {
+    const library = await this.runtime.database.query("media_libraries")
+      .select("catalog_version")
+      .where({ id: context.libraryId, service_id: context.serviceId })
+      .first();
+    const catalogVersion = Number(library?.catalog_version ?? 0);
+    const cacheKey = `${context.ownerUserId}:${context.libraryId}`;
+    let cache = this.personCaches.get(cacheKey);
+    if (cache && cache.catalogVersion === catalogVersion) return cache;
+    // 关键变量：只读取顶层影视条目，单集会重复节目演职人员且不应扩大索引扫描量。
+    const rows = await this.runtime.database.query("media_items")
+      .select("id", "metadata_json", "updated_at")
+      .where({
+        user_id: context.ownerUserId,
+        service_id: context.serviceId,
+        library_id: context.libraryId,
+        media_type: "video",
+      })
+      .whereIn("item_type", ["video.movie", "video.series"])
+      .whereNull("deleted_at")
+      .orderBy("updated_at", "desc");
+    const peopleById = new Map<string, JellyfinPersonSummary>();
+    for (const row of rows) {
+      const metadata = parseJsonObject(row.metadata_json);
+      const people = Array.isArray(metadata.people) ? metadata.people : [];
+      for (const person of people) {
+        const personRecord = person as Record<string, unknown>;
+        const personName = String(personRecord.name ?? "").trim();
+        const personSourceId = String(personRecord.id ?? "").trim();
+        const profileUrl = String(personRecord.profileUrl ?? "").trim();
+        if (!personName) continue;
+        const protocolPersonId = createProtocolUuid(
+          "person",
+          personSourceId ? `source:${personSourceId}` : `name:${personName}`,
+        );
+        const existing = peopleById.get(protocolPersonId);
+        if (existing) {
+          existing.itemIds.add(String(row.id));
+          if (!existing.profileUrl && /^https?:\/\//iu.test(profileUrl)) {
+            existing.profileUrl = profileUrl;
+            existing.imageTag = createJellyfinImageTag(profileUrl);
+            existing.updatedAt = String(row.updated_at);
+          }
+          continue;
+        }
+        const validProfileUrl = /^https?:\/\//iu.test(profileUrl) ? profileUrl : "";
+        peopleById.set(protocolPersonId, {
+          id: protocolPersonId,
+          name: personName,
+          sourceId: personSourceId,
+          profileUrl: validProfileUrl,
+          imageTag: validProfileUrl ? createJellyfinImageTag(validProfileUrl) : "",
+          updatedAt: String(row.updated_at),
+          itemIds: new Set([String(row.id)]),
+        });
+      }
+    }
+    cache = { catalogVersion, peopleById };
+    this.personCaches.set(cacheKey, cache);
+    return cache;
+  }
+
+  /** 返回标准 Jellyfin Person DTO；非演员协议 ID 返回空。 */
+  public async getPersonItem(context: JellyfinContext, personId: string) {
+    if (!this.isPotentialPersonId(context, personId)) return null;
+    const cache = await this.loadPersonCache(context);
+    const person = cache.peopleById.get(personId.trim().toLowerCase());
+    if (!person) return null;
+    const favorite = await this.isVirtualItemFavorite(context, person.id);
+    const item = {
+      Name: person.name,
+      ServerId: context.serviceId,
+      Id: person.id,
+      Etag: person.imageTag || String(Date.parse(person.updatedAt) || 1),
+      DateCreated: toJellyfinDateTime(person.updatedAt),
+      SortName: person.name,
+      Type: "Person",
+      IsFolder: false,
+      LocationType: "FileSystem",
+      Overview: "",
+      ProductionLocations: [],
+      ProviderIds: person.sourceId ? { Tmdb: person.sourceId } : {},
+      ImageTags: person.imageTag ? { Primary: person.imageTag } : {},
+      PrimaryImageTag: person.imageTag || undefined,
+      PrimaryImageAspectRatio: person.profileUrl ? 2 / 3 : undefined,
+      UserData: this.mapUserData(null, 0, favorite, person.id),
+    };
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-artwork",
+      事件: "返回Jellyfin演员详情",
+      服务ID: context.serviceId,
+      演员协议ID: person.id,
+      演员名称: person.name,
+      是否包含头像: Boolean(person.profileUrl),
+      关联作品数量: person.itemIds.size,
+    });
+    return item;
+  }
+
+  /** 返回 Jellyfin 标准演员列表。 */
+  public async listPersons(context: JellyfinContext, query: Record<string, unknown>) {
+    const cache = await this.loadPersonCache(context);
+    const searchTerm = String(query.SearchTerm ?? "").trim().toLocaleLowerCase("zh-CN");
+    const descending = String(query.SortOrder ?? "Ascending").toLowerCase() === "descending";
+    const people = [...cache.peopleById.values()]
+      .filter((person) => !searchTerm || person.name.toLocaleLowerCase("zh-CN").includes(searchTerm))
+      .sort((left, right) => left.name.localeCompare(right.name, "zh-CN") * (descending ? -1 : 1));
+    const offset = Math.max(0, Number(query.StartIndex ?? 0));
+    const limit = Math.min(500, Math.max(1, Number(query.Limit ?? 100)));
+    const selectedPeople = people.slice(offset, offset + limit);
+    const items = await Promise.all(selectedPeople.map((person) => this.getPersonItem(context, person.id)));
+    return { Items: items.filter(Boolean), TotalRecordCount: people.length, StartIndex: offset };
+  }
+
+  /** 按演员名称读取标准 Jellyfin Person DTO。 */
+  public async getPersonByName(context: JellyfinContext, personName: string) {
+    const cache = await this.loadPersonCache(context);
+    const requestedName = personName.trim().toLocaleLowerCase("zh-CN");
+    const person = [...cache.peopleById.values()].find(
+      (candidate) => candidate.name.toLocaleLowerCase("zh-CN") === requestedName,
+    );
+    return person ? this.getPersonItem(context, person.id) : null;
+  }
+
+  /** 从演员实体索引读取头像地址。 */
+  private async resolvePersonImageSource(
+    context: JellyfinLibraryContext,
+    personId: string,
+  ): Promise<JellyfinImageSource | null> {
+    const cache = await this.loadPersonCache(context);
+    const person = cache.peopleById.get(personId.trim().toLowerCase());
+    if (!person?.profileUrl) return null;
+    return {
+      url: person.profileUrl,
+      imageTag: person.imageTag,
+      updatedAt: person.updatedAt,
+      sourceType: "person",
+    };
+  }
+
+  /** 记录 Jellyfin 图片协议解析结果，便于区分 DTO 缺字段和图片代理失败。 */
+  private logArtworkResolution(
+    context: JellyfinLibraryContext,
+    itemId: string,
+    imageType: string,
+    sourceName: string,
+  ): void {
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-artwork",
+      事件: "解析Jellyfin图片来源",
+      服务ID: context.serviceId,
+      请求条目ID: itemId,
+      图片类型: imageType,
+      图片来源: sourceName,
+    });
   }
 
   /** 查询继续观看条目。 */
@@ -932,11 +1369,21 @@ export class JellyfinCompatibilityService {
       .distinct("m.id", "p.updated_at").where({ "p.service_id": context.serviceId, "p.account_id": context.accountId, "p.played": 0, "p.hidden_from_resume": 0, "f.status": "active" })
       // 关键变量：低于 60 秒的试播不进入继续观看，避免首页堆积误触记录。
       .where("p.position_ticks", ">=", 600_000_000).whereNull("m.deleted_at").orderBy("p.updated_at", "desc").limit(500);
-    const records = await Promise.all(rows.map(async (row) => {
+    const rawRecords = await Promise.all(rows.map(async (row) => {
       const item = await this.runtime.repository.getCatalogItem(String(row.id), context.ownerUserId);
       const parent = item.itemType === "video.episode" ? await this.findParent(item.id, context.ownerUserId) : undefined;
       return { item, parent };
     }));
+    const seenResumeGroups = new Set<string>();
+    // 关键变量：单集按父节目聚合，排序后只保留最近播放的一集作为续播入口。
+    const records = rawRecords.filter((record) => {
+      const groupId = record.item.itemType === "video.episode" && record.parent
+        ? `series:${record.parent.id}`
+        : `item:${record.item.id}`;
+      if (seenResumeGroups.has(groupId)) return false;
+      seenResumeGroups.add(groupId);
+      return true;
+    });
     const mapping = await this.loadItemMappingContext(context, records.map((record) => record.item.id));
     const items = await Promise.all(records.map((record) => this.mapItem(context, record.item, record.parent, mapping)));
     const progressItems = items.filter((item) => Number(item.UserData?.PlaybackPositionTicks ?? 0) > 0);
@@ -946,6 +1393,7 @@ export class JellyfinCompatibilityService {
       事件: "返回Jellyfin继续观看进度",
       服务ID: context.serviceId,
       账号ID: context.accountId,
+      聚合前记录数量: rawRecords.length,
       继续观看数量: items.length,
       包含已观看时间数量: progressItems.length,
       包含进度百分比数量: percentageItems.length,
@@ -971,36 +1419,46 @@ export class JellyfinCompatibilityService {
 
   /** 获取单条用户进度 DTO。 */
   public async getUserData(context: JellyfinContext, itemId: string) {
+    if (this.isPotentialPersonId(context, itemId)) {
+      const personCache = await this.loadPersonCache(context);
+      const protocolPersonId = itemId.trim().toLowerCase();
+      if (personCache.peopleById.has(protocolPersonId)) {
+        return this.mapUserData(null, 0, await this.isVirtualItemFavorite(context, protocolPersonId), protocolPersonId);
+      }
+    }
     const internalItemId = decodeProtocolItemId(itemId);
     const item = await this.runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
     if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
     const progress = await this.readProgress(context, internalItemId);
     const runTimeTicks = await this.readItemRunTimeTicks(item);
-    return this.mapUserData(progress, runTimeTicks);
+    return this.mapUserData(progress, runTimeTicks, await this.isMediaItemFavorite(context, internalItemId), encodeProtocolItemId(internalItemId));
   }
 
-  /** 接收 Jellyfin 用户数据更新；第一期只允许修改续播位置。 */
+  /** 接收 Jellyfin 用户数据更新，同步处理续播、已观看和收藏状态。 */
   public async updateUserData(context: JellyfinContext, itemId: string, body: Record<string, unknown>) {
     const internalItemId = decodeProtocolItemId(itemId);
     const item = await this.runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
     if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
-    const positionTicks = Math.max(0, Math.floor(Number(body.PlaybackPositionTicks ?? 0)));
-    const now = new Date().toISOString();
-    const existing = await this.runtime.database.query("service_playback_progress")
-      .where({ service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId }).first();
-    const metadataDurationTicks = await this.readItemRunTimeTicks(item);
-    const patch = {
-      position_ticks: positionTicks,
-      played: 0,
-      hidden_from_resume: 0,
-      updated_at: now,
-    };
-    if (existing) await this.runtime.database.query("service_playback_progress").where({ id: existing.id }).update(patch);
-    else await this.runtime.database.query("service_playback_progress").insert({
-      id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId,
-      media_source_id: null, play_count: 0, last_played_at: null, ...patch,
-    });
-    return this.mapUserData({ ...existing, ...patch, item_id: internalItemId }, metadataDurationTicks);
+    if (Object.prototype.hasOwnProperty.call(body, "PlaybackPositionTicks")) {
+      const positionTicks = Math.max(0, Math.floor(Number(body.PlaybackPositionTicks ?? 0)));
+      const now = new Date().toISOString();
+      const existing = await this.runtime.database.query("service_playback_progress")
+        .where({ service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId }).first();
+      const patch = {
+        position_ticks: positionTicks,
+        played: 0,
+        hidden_from_resume: 0,
+        updated_at: now,
+      };
+      if (existing) await this.runtime.database.query("service_playback_progress").where({ id: existing.id }).update(patch);
+      else await this.runtime.database.query("service_playback_progress").insert({
+        id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId,
+        media_source_id: null, play_count: 0, last_played_at: null, ...patch,
+      });
+    }
+    if (typeof body.Played === "boolean") await this.setPlayed(context, itemId, body.Played);
+    if (typeof body.IsFavorite === "boolean") await this.setFavorite(context, itemId, body.IsFavorite);
+    return this.getUserData(context, itemId);
   }
 
   /** 查询指定节目的下一集。 */
@@ -1039,8 +1497,13 @@ export class JellyfinCompatibilityService {
       item,
       mediaSourceId,
     );
-    const completed = kind === "stopped" && durationTicks > 0 && positionTicks >= durationTicks * 0.9;
+    const progressPercentage = durationTicks > 0
+      ? Math.min(100, positionTicks * 100 / durationTicks)
+      : 0;
+    // 关键变量：任意播放进度上报达到 90% 即完成，不等待 Stopped 事件。
+    const completed = durationTicks > 0 && progressPercentage >= 90;
     const now = new Date().toISOString();
+    let automaticallyMarkedPlayed = false;
     await this.runtime.database.query.transaction(async (transaction) => {
       const existing = await transaction("service_playback_sessions").where({ id: playSessionId, service_id: context.serviceId, account_id: context.accountId }).first();
       const existingHistory = kind === "stopped"
@@ -1049,7 +1512,7 @@ export class JellyfinCompatibilityService {
       const sessionPatch = { item_id: itemId, media_source_id: mediaSourceId ?? null, status: kind === "stopped" ? "stopped" : "playing", position_ticks: positionTicks, paused: body.IsPaused ? 1 : 0, updated_at: now, stopped_at: kind === "stopped" ? now : null };
       if (existing) await transaction("service_playback_sessions").where({ id: playSessionId }).update(sessionPatch);
       else await transaction("service_playback_sessions").insert({ id: playSessionId, service_id: context.serviceId, account_id: context.accountId, ...sessionPatch, started_at: now });
-      await this.upsertProgress(
+      automaticallyMarkedPlayed = await this.upsertProgress(
         transaction,
         context,
         itemId,
@@ -1063,6 +1526,19 @@ export class JellyfinCompatibilityService {
         if (!existingHistory) await transaction("service_playback_history").insert({ id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: itemId, play_session_id: playSessionId, position_ticks: positionTicks, completed: completed ? 1 : 0, started_at: existing?.started_at ?? now, stopped_at: now });
       }
     });
+    if (automaticallyMarkedPlayed) {
+      this.runtime.logBusinessEvent("info", {
+        日志关键字: "codex-jellyfin-user-state",
+        事件: "Jellyfin播放进度达到90%自动标记已观看",
+        服务ID: context.serviceId,
+        账号ID: context.accountId,
+        媒体条目ID: itemId,
+        上报类型: kind,
+        已观看Ticks: positionTicks,
+        总时长Ticks: durationTicks,
+        进度百分比: progressPercentage,
+      });
+    }
     this.runtime.logBusinessEvent("info", {
       日志关键字: "codex-jellyfin-playback-progress",
       事件: "保存Jellyfin播放进度",
@@ -1072,7 +1548,7 @@ export class JellyfinCompatibilityService {
       上报类型: kind,
       已观看Ticks: positionTicks,
       总时长Ticks: durationTicks,
-      进度百分比: durationTicks > 0 ? Math.min(100, positionTicks * 100 / durationTicks) : 0,
+      进度百分比: progressPercentage,
     });
   }
 
@@ -1083,10 +1559,97 @@ export class JellyfinCompatibilityService {
     if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
     const now = new Date().toISOString();
     const existing = await this.runtime.database.query("service_playback_progress").where({ service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId }).first();
-    const patch = { played: played ? 1 : 0, position_ticks: played ? Number(existing?.position_ticks ?? 0) : 0, hidden_from_resume: played ? 1 : 0, updated_at: now, last_played_at: played ? now : existing?.last_played_at ?? null };
+    const patch = {
+      played: played ? 1 : 0,
+      position_ticks: 0,
+      hidden_from_resume: played ? 1 : 0,
+      play_count: played ? Math.max(1, Number(existing?.play_count ?? 0)) : 0,
+      updated_at: now,
+      last_played_at: played ? now : existing?.last_played_at ?? null,
+    };
     if (existing) await this.runtime.database.query("service_playback_progress").where({ id: existing.id }).update(patch);
-    else await this.runtime.database.query("service_playback_progress").insert({ id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId, play_count: played ? 1 : 0, ...patch });
-    return this.mapUserData({ ...existing, ...patch, item_id: internalItemId }, 0);
+    else await this.runtime.database.query("service_playback_progress").insert({ id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId, ...patch });
+    const runTimeTicks = await this.readItemRunTimeTicks(item);
+    const userData = this.mapUserData(
+      { ...existing, ...patch, item_id: internalItemId },
+      runTimeTicks,
+      await this.isMediaItemFavorite(context, internalItemId),
+      encodeProtocolItemId(internalItemId),
+    );
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-user-state",
+      事件: "更新Jellyfin已观看状态",
+      服务ID: context.serviceId,
+      账号ID: context.accountId,
+      媒体条目ID: internalItemId,
+      是否已观看: played,
+    });
+    return userData;
+  }
+
+  /** 设置媒体或虚拟 Person 条目的 Jellyfin 收藏状态。 */
+  public async setFavorite(context: JellyfinContext, itemId: string, favorite: boolean) {
+    const protocolItemId = itemId.trim().toLowerCase();
+    const now = new Date().toISOString();
+    if (this.isPotentialPersonId(context, protocolItemId)) {
+      const personCache = await this.loadPersonCache(context);
+      if (personCache.peopleById.has(protocolItemId)) {
+        const existing = await this.runtime.database.query("service_jellyfin_virtual_preferences")
+          .where({ service_id: context.serviceId, account_id: context.accountId, protocol_item_id: protocolItemId }).first();
+        if (favorite && existing) {
+          await this.runtime.database.query("service_jellyfin_virtual_preferences").where({ id: existing.id }).update({ starred_at: now, updated_at: now });
+        } else if (favorite) {
+          await this.runtime.database.query("service_jellyfin_virtual_preferences").insert({
+            id: randomUUID(), service_id: context.serviceId, account_id: context.accountId,
+            protocol_item_id: protocolItemId, item_type: "Person", starred_at: now, updated_at: now,
+          });
+        } else if (existing) {
+          await this.runtime.database.query("service_jellyfin_virtual_preferences").where({ id: existing.id }).delete();
+        }
+        this.logUserFavoriteChange(context, protocolItemId, "Person", favorite);
+        return this.mapUserData(null, 0, favorite, protocolItemId);
+      }
+    }
+
+    const internalItemId = decodeProtocolItemId(itemId);
+    const item = await this.runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
+    if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
+    const existing = await this.runtime.database.query("service_item_preferences")
+      .where({ service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId }).first();
+    if (favorite && existing) {
+      await this.runtime.database.query("service_item_preferences").where({ id: existing.id }).update({ starred_at: now, updated_at: now });
+    } else if (favorite) {
+      await this.runtime.database.query("service_item_preferences").insert({
+        id: randomUUID(), service_id: context.serviceId, account_id: context.accountId,
+        item_id: internalItemId, starred_at: now, rating: 0, updated_at: now,
+      });
+    } else if (existing && Number(existing.rating ?? 0) === 0) {
+      await this.runtime.database.query("service_item_preferences").where({ id: existing.id }).delete();
+    } else if (existing) {
+      await this.runtime.database.query("service_item_preferences").where({ id: existing.id }).update({ starred_at: null, updated_at: now });
+    }
+    const progress = await this.readProgress(context, internalItemId);
+    const runTimeTicks = await this.readItemRunTimeTicks(item);
+    this.logUserFavoriteChange(context, internalItemId, item.itemType, favorite);
+    return this.mapUserData(progress, runTimeTicks, favorite, encodeProtocolItemId(internalItemId));
+  }
+
+  /** 记录 Jellyfin 收藏状态写入结果。 */
+  private logUserFavoriteChange(
+    context: JellyfinContext,
+    itemId: string,
+    itemType: string,
+    favorite: boolean,
+  ): void {
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-user-state",
+      事件: "更新Jellyfin收藏状态",
+      服务ID: context.serviceId,
+      账号ID: context.accountId,
+      条目ID: itemId,
+      条目类型: itemType,
+      是否收藏: favorite,
+    });
   }
 
   /** 从继续观看隐藏或恢复条目。 */
@@ -1138,10 +1701,15 @@ export class JellyfinCompatibilityService {
   /** 批量加载列表 DTO 所需的用户进度和文件摘要，避免对每个条目重复查询。 */
   private async loadItemMappingContext(context: JellyfinContext, itemIds: string[]): Promise<JellyfinItemMappingContext> {
     const uniqueItemIds = [...new Set(itemIds)];
-    if (uniqueItemIds.length === 0) return { progressByItemId: new Map(), filesByItemId: new Map() };
-    const [progressRows, fileRows] = await Promise.all([
+    if (uniqueItemIds.length === 0) return { progressByItemId: new Map(), favoriteItemIds: new Set(), filesByItemId: new Map() };
+    const [progressRows, preferenceRows, fileRows] = await Promise.all([
       this.runtime.database.query("service_playback_progress")
         .where({ service_id: context.serviceId, account_id: context.accountId }).whereIn("item_id", uniqueItemIds),
+      this.runtime.database.query("service_item_preferences")
+        .select("item_id")
+        .where({ service_id: context.serviceId, account_id: context.accountId })
+        .whereIn("item_id", uniqueItemIds)
+        .whereNotNull("starred_at"),
       this.runtime.database.query("file_links as fl")
         .join("source_files as f", "f.id", "fl.source_file_id")
         .leftJoin("media_file_probes as p", "p.source_file_id", "f.id")
@@ -1152,6 +1720,7 @@ export class JellyfinCompatibilityService {
         .orderBy("f.path", "asc"),
     ]);
     const progressByItemId = new Map(progressRows.map((row) => [String(row.item_id), row as Record<string, unknown>]));
+    const favoriteItemIds = new Set(preferenceRows.map((row) => String(row.item_id)));
     const filesByItemId = new Map<string, JellyfinFileSummary[]>();
     for (const row of fileRows) {
       const itemId = String(row.item_id);
@@ -1164,27 +1733,89 @@ export class JellyfinCompatibilityService {
       });
       filesByItemId.set(itemId, files);
     }
-    return { progressByItemId, filesByItemId };
+    return { progressByItemId, favoriteItemIds, filesByItemId };
   }
 
   /** 映射 Jellyfin UserItemDataDto。 */
-  private mapUserData(progress: Record<string, unknown> | null | undefined, runTimeTicks: number) {
+  private mapUserData(
+    progress: Record<string, unknown> | null | undefined,
+    runTimeTicks: number,
+    favorite = false,
+    protocolItemId?: string,
+  ) {
     const positionTicks = Number(progress?.position_ticks ?? 0);
     const played = Number(progress?.played ?? 0) === 1;
     const itemId = String(progress?.item_id ?? "");
     const mediaSourceId = String(progress?.media_source_id ?? "");
+    // 关键变量：Jellyfin 完播后清零播放位置；播放百分比只根据仍然存在的播放位置派生。
+    const playbackPositionTicks = played ? 0 : positionTicks;
     return {
-      PlaybackPositionTicks: played ? 0 : positionTicks, PlayCount: Number(progress?.play_count ?? 0), IsFavorite: false,
+      PlaybackPositionTicks: playbackPositionTicks, PlayCount: Number(progress?.play_count ?? 0), IsFavorite: favorite,
       Played: played, LastPlayedDate: progress?.last_played_at ?? undefined,
-      PlayedPercentage: runTimeTicks > 0
-        ? (played ? 100 : Math.min(100, positionTicks / runTimeTicks * 100))
+      PlayedPercentage: runTimeTicks > 0 && playbackPositionTicks > 0
+        ? playbackPositionTicks / runTimeTicks * 100
         : undefined,
       Key: "",
-      ItemId: itemId ? encodeProtocolItemId(itemId) : undefined,
+      ItemId: protocolItemId ?? (itemId ? encodeProtocolItemId(itemId) : undefined),
       MediaSourceId: mediaSourceId
         ? INTERNAL_ITEM_ID_PATTERN.test(mediaSourceId) ? encodeProtocolItemId(mediaSourceId) : mediaSourceId
         : undefined,
     };
+  }
+
+  /** 读取当前账号的媒体条目收藏状态。 */
+  private async isMediaItemFavorite(context: JellyfinContext, itemId: string): Promise<boolean> {
+    const preference = await this.runtime.database.query("service_item_preferences")
+      .select("id")
+      .where({ service_id: context.serviceId, account_id: context.accountId, item_id: itemId })
+      .whereNotNull("starred_at")
+      .first();
+    return Boolean(preference);
+  }
+
+  /** 读取 Person 等虚拟 Jellyfin 条目的收藏状态。 */
+  private async isVirtualItemFavorite(context: JellyfinContext, protocolItemId: string): Promise<boolean> {
+    const preference = await this.runtime.database.query("service_jellyfin_virtual_preferences")
+      .select("id")
+      .where({ service_id: context.serviceId, account_id: context.accountId, protocol_item_id: protocolItemId.toLowerCase() })
+      .first();
+    return Boolean(preference);
+  }
+
+  /** 判断 Items 查询是否要求某个用户状态过滤。 */
+  private queryIncludesFilter(query: Record<string, unknown>, filterName: string, booleanKey: string): boolean {
+    const filters = String(this.readQueryValue(query, "Filters") ?? "").split(",").map((value) => value.trim());
+    if (filters.includes(filterName)) return true;
+    return String(this.readQueryValue(query, booleanKey) ?? "").toLowerCase() === "true";
+  }
+
+  /** 读取 Jellyfin 旧客户端 PascalCase 或新 SDK camelCase 查询参数。 */
+  private readQueryValue(query: Record<string, unknown>, key: string): unknown {
+    const camelCaseKey = `${key.charAt(0).toLowerCase()}${key.slice(1)}`;
+    return query[key] ?? query[camelCaseKey];
+  }
+
+  /** 判断用户状态列表中的条目是否属于请求的媒体库、节目或季。 */
+  private matchesParentScope(
+    context: JellyfinContext,
+    item: MediaItemRecord,
+    parent: MediaItemRecord | undefined,
+    query: Record<string, unknown>,
+  ): boolean {
+    const parentId = String(this.readQueryValue(query, "ParentId") ?? "");
+    if (!parentId || parentId === context.libraryId) return true;
+    const virtualLibrary = this.findLibraryDefinition(context, parentId);
+    if (virtualLibrary) return this.getItemLibraryDefinition(context, item).id === virtualLibrary.id;
+    const virtualSeason = this.parseSeasonReference(parentId);
+    if (virtualSeason) {
+      return parent?.id === virtualSeason.seriesId
+        && Number(item.metadata.seasonNumber ?? 0) === virtualSeason.seasonNumber;
+    }
+    try {
+      return parent?.id === decodeProtocolItemId(parentId);
+    } catch {
+      return false;
+    }
   }
 
   /** 跨数据库执行播放进度新增或更新。 */
@@ -1197,18 +1828,28 @@ export class JellyfinCompatibilityService {
     stopped: boolean,
     completed: boolean,
     now: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const existing = await transaction("service_playback_progress").where({ service_id: context.serviceId, account_id: context.accountId, item_id: itemId }).first();
+    // 关键变量：只有从未观看切换为已观看时才记录自动标记日志。
+    const alreadyPlayed = Number(existing?.played ?? 0) === 1;
+    const newlyCompleted = completed && !alreadyPlayed;
     const patch = {
       media_source_id: mediaSourceId ?? existing?.media_source_id ?? null,
       position_ticks: completed ? 0 : positionTicks,
-      played: completed ? 1 : 0,
-      hidden_from_resume: completed ? 1 : 0,
+      // 已观看状态只由显式“标记未观看”撤销，后续播放上报不能反向清除。
+      played: completed || alreadyPlayed ? 1 : 0,
+      hidden_from_resume: completed || alreadyPlayed ? 1 : 0,
       last_played_at: now,
       updated_at: now,
     };
-    if (existing) await transaction("service_playback_progress").where({ id: existing.id }).update({ ...patch, play_count: Number(existing.play_count ?? 0) + (stopped ? 1 : 0) });
-    else await transaction("service_playback_progress").insert({ id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: itemId, ...patch, play_count: stopped ? 1 : 0 });
+    const existingPlayCount = Number(existing?.play_count ?? 0);
+    // 进度首次达标时立即保证 PlayCount 至少为 1，Stopped 事件不再对同一次完播重复计数。
+    const playCount = newlyCompleted
+      ? Math.max(1, existingPlayCount)
+      : existingPlayCount + (stopped && !completed ? 1 : 0);
+    if (existing) await transaction("service_playback_progress").where({ id: existing.id }).update({ ...patch, play_count: playCount });
+    else await transaction("service_playback_progress").insert({ id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: itemId, ...patch, play_count: playCount });
+    return newlyCompleted;
   }
 
   /** 查找单集父节目。 */
@@ -1219,8 +1860,8 @@ export class JellyfinCompatibilityService {
 
   /** 对已经映射的 DTO 执行 Jellyfin 风格分页。 */
   private paginate<T>(items: T[], query: Record<string, unknown>) {
-    const start = Math.max(0, Number(query.StartIndex ?? 0));
-    const limit = Math.min(500, Math.max(1, Number(query.Limit ?? (items.length || 100))));
+    const start = Math.max(0, Number(this.readQueryValue(query, "StartIndex") ?? 0));
+    const limit = Math.min(500, Math.max(1, Number(this.readQueryValue(query, "Limit") ?? (items.length || 100))));
     return { Items: items.slice(start, start + limit), TotalRecordCount: items.length, StartIndex: start };
   }
 

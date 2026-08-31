@@ -77,6 +77,8 @@ export interface CloudServiceRecord {
   connectionStatus: string;
   /** 当前媒体库是否允许 APP 通过 FlyCloudHelper 专用接口中转媒体文件。 */
   relayPlaybackEnabled: boolean;
+  /** 当前服务的后台任务结果是否允许投递到外部通知渠道。 */
+  notificationEnabled: boolean;
   /** 当前服务是否对外提供 Jellyfin 兼容接口。 */
   jellyfinEnabled: boolean;
   credentialRevision: number;

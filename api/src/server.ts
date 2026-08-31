@@ -15,11 +15,14 @@ import { TmdbKeyPool } from "./metadata/tmdb.js";
 import { MetadataPluginManager } from "./plugin-manager.js";
 import { ProviderRegistry } from "./providers/registry.js";
 import { registerAdminRoutes } from "./routes/admin-routes.js";
+import { registerAdminNotificationSettingsRoutes } from "./routes/admin-notification-settings-routes.js";
 import { registerAiModelRoutes } from "./routes/ai-model-routes.js";
 import { registerAuthRoutes } from "./routes/auth-routes.js";
 import { registerCatalogRoutes } from "./routes/catalog-routes.js";
 import { registerGuangyaAuthRoutes } from "./routes/guangya-auth-routes.js";
 import { registerMediaStreamRoutes } from "./routes/media-stream-routes.js";
+import { registerMusicArtworkRoutes } from "./routes/music-artwork-routes.js";
+import { registerNavidromeRoutes } from "./routes/navidrome-routes.js";
 import { registerNotificationRoutes } from "./routes/notification-routes.js";
 import { registerScanScheduleRoutes } from "./routes/scan-schedule-routes.js";
 import { registerPluginRoutes } from "./routes/plugin-routes.js";
@@ -40,6 +43,7 @@ import { ServiceMigrationWorker } from "./service-migration-worker.js";
 import { loadTmdbBaseUrls, loadTmdbKeys } from "./system-settings.js";
 import { ScanWorker } from "./worker.js";
 import { MediaProbeWorker } from "./media-probe-worker.js";
+import { TelegramNotificationService } from "./telegram-notification-service.js";
 
 /** 判断当前 API 是否允许在首次初始化未完成时访问。 */
 function isSetupPublicPath(url: string): boolean {
@@ -114,6 +118,9 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
           "apiKey",
           "body.apiKey",
           "req.body.apiKey",
+          "botToken",
+          "body.botToken",
+          "req.body.botToken",
         ],
         censor: "[已脱敏]",
       },
@@ -136,12 +143,14 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   const logger = createBusinessLogger(server);
   const providers = new ProviderRegistry(config, (fields) => logger("warn", fields));
   const vault = new CredentialVault(config.credentialMasterKey);
-  const repository = new ServiceRepository(database, logger, {
+  const telegramNotifications = new TelegramNotificationService(database, vault, logger);
+  database.setNotificationDeliveryHandler((notification) => telegramNotifications.enqueue(notification));
+  const serviceAccess = new ServiceAccessService(database, vault);
+  const repository = new ServiceRepository(database, serviceAccess, logger, {
     scanWorkerConcurrency: config.workerConcurrency,
     mediaProbeConcurrency: config.mediaProbeConcurrency,
   });
   const publicAccess = new PublicAccessService(database, config);
-  const serviceAccess = new ServiceAccessService(database);
   const backfilledServiceAccessAccounts = await serviceAccess.ensureExistingServices();
   if (backfilledServiceAccessAccounts > 0) {
     logger("info", {
@@ -234,6 +243,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     failureReports,
     publicAccess,
     serviceAccess,
+    telegramNotifications,
     logBusinessEvent: logger,
   };
 
@@ -247,6 +257,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     },
   });
   server.addHook("onClose", async () => {
+    await telegramNotifications.close();
     await scanScheduleWorker.stop();
     await migrationWorker.stop();
     await worker.stop();
@@ -256,8 +267,10 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   });
 
   server.addHook("preHandler", async (request) => {
-    // 关键变量：Jellyfin 同样依赖数据库和凭据主密钥，初始化或主密钥待备份时不能绕过后台保护状态。
-    const requiresReadyState = request.url.startsWith("/api/") || request.url.startsWith("/j/");
+    // 关键变量：对外媒体协议同样依赖数据库和凭据主密钥，初始化或主密钥待备份时不能绕过后台保护状态。
+    const requiresReadyState = request.url.startsWith("/api/")
+      || request.url.startsWith("/j/")
+      || request.url.startsWith("/n/");
     const systemState = requiresReadyState ? await database.getSystemState() : null;
     if (systemState?.setupRequired && !isSetupPublicPath(request.url)) {
       throw new ApiError(503, "setup_required", "实例尚未完成首次初始化");
@@ -358,7 +371,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
           ? "credential_key_backup_required"
           : credentialReady ? "ready" : "configuration_required",
       setupRequired: state.setupRequired,
-      supportedMediaTypes: ["video"],
+      supportedMediaTypes: ["video", "music"],
       providers: providers.listDescriptors(),
       metadataProviders: [
         {
@@ -366,7 +379,14 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
           status: tmdbStatus.healthyCount > 0 ? "available" : tmdbStatus.configuredCount > 0 ? "degraded" : "unavailable",
           supportedMediaTypes: ["video"],
         },
-        { id: "builtin.musicbrainz", status: "unavailable", reasonCode: "media_type_not_enabled", supportedMediaTypes: ["music"] },
+        { id: "builtin.music-platforms", status: "available", supportedMediaTypes: ["music"] },
+        { id: "builtin.musicbrainz", status: "available", supportedMediaTypes: ["music"], legacyAliasOf: "builtin.music-platforms" },
+        { id: "musicbrainz", status: "available", supportedMediaTypes: ["music"] },
+        { id: "netease", status: "available", supportedMediaTypes: ["music"] },
+        { id: "qmusic", status: "available", supportedMediaTypes: ["music"] },
+        { id: "kugou", status: "available", supportedMediaTypes: ["music"] },
+        { id: "migu", status: "available", supportedMediaTypes: ["music"] },
+        { id: "kuwo", status: "available", supportedMediaTypes: ["music"] },
         {
           id: "builtin.acoustid",
           status: "unavailable",
@@ -395,6 +415,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
         catalogExport: true,
         relayPlayback: true,
         jellyfinCompatibility: true,
+        navidromeCompatibility: true,
       },
     };
   });
@@ -407,9 +428,12 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
   await registerServiceMigrationRoutes(server, runtime);
   await registerScanFailureReportRoutes(server, runtime);
   await registerCatalogRoutes(server, runtime);
+  await registerMusicArtworkRoutes(server, runtime);
   await registerMediaStreamRoutes(server, runtime);
   await registerJellyfinRoutes(server, runtime);
+  await registerNavidromeRoutes(server, runtime);
   await registerNotificationRoutes(server, runtime);
+  await registerAdminNotificationSettingsRoutes(server, runtime);
   await registerAdminRoutes(server, runtime);
   await registerAiModelRoutes(server, runtime);
   await registerPluginRoutes(server, runtime);
@@ -421,7 +445,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
       wildcard: false,
     });
     server.setNotFoundHandler((request, reply) => {
-      if (request.url.startsWith("/api/") || request.url.startsWith("/j/")) {
+      if (request.url.startsWith("/api/") || request.url.startsWith("/j/") || request.url.startsWith("/n/")) {
         return reply.status(404).send({ error: { code: "not_found", message: "接口不存在" } });
       }
       return reply.sendFile("index.html");

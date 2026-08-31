@@ -16,6 +16,7 @@ import {
   type ServiceAccessAccount,
   updateServiceAccessAccount,
   updateServiceJellyfinSettings,
+  updateServiceNavidromeSettings,
   updateLibraryPlaybackSettings,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
@@ -50,6 +51,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
   }, [serviceId, admin]);
   const [message, setMessage] = useState<string | null>(null);
   const [updatingJellyfin, setUpdatingJellyfin] = useState(false);
+  const [updatingNavidrome, setUpdatingNavidrome] = useState(false);
   const [updatingRelayPlayback, setUpdatingRelayPlayback] = useState(false);
   const [clearingCatalog, setClearingCatalog] = useState(false);
   // 关键变量：同步占用清空操作，避免按钮状态刷新前重复提交。
@@ -72,6 +74,22 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
       setMessage(error instanceof Error ? error.message : "Jellyfin 设置保存失败");
     } finally {
       setUpdatingJellyfin(false);
+    }
+  }
+
+  /** 立即保存音乐媒体库的 Navidrome/Subsonic 协议开关。 */
+  async function toggleNavidrome(): Promise<void> {
+    if (!settings || updatingNavidrome || !settings.navidromeSupported) return;
+    const nextEnabled = !settings.navidromeEnabled;
+    setUpdatingNavidrome(true);
+    try {
+      await updateServiceNavidromeSettings(serviceId, { navidromeEnabled: nextEnabled }, admin);
+      setMessage(`Navidrome 协议已${nextEnabled ? "启用" : "关闭"}`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Navidrome 设置保存失败");
+    } finally {
+      setUpdatingNavidrome(false);
     }
   }
 
@@ -130,7 +148,9 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
       <div className="grid gap-4 sm:grid-cols-3">
         <StatCard label="媒体条目" value={service.itemCount.toLocaleString()} hint="当前已入库" />
         <StatCard label="目录版本" value={`v${service.catalogVersion}`} tone="info" />
-        <StatCard label="Jellyfin" value={settings.jellyfinEnabled ? "已启用" : "未启用"} tone="muted" />
+        {settings.navidromeSupported
+          ? <StatCard label="Navidrome" value={settings.navidromeEnabled ? "已启用" : "未启用"} tone="muted" />
+          : <StatCard label="Jellyfin" value={settings.jellyfinEnabled ? "已启用" : "未启用"} tone="muted" />}
       </div>
       <Panel title="APP 专用播放" description="仅控制 Flymby 通过云助手媒体库播放时是否使用中转。" className="mt-4">
         <div className="rounded-xl border border-border bg-secondary/35 p-4">
@@ -146,7 +166,7 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
         </div>
         {!settings.relayPlaybackSupported && <p className="mt-3 text-xs text-muted-foreground">当前网盘类型暂不支持中转播放。</p>}
       </Panel>
-      <Panel title="Jellyfin 协议" className="mt-4">
+      {!settings.navidromeSupported && <Panel title="Jellyfin 协议" className="mt-4">
         <div className="rounded-xl border border-border bg-secondary/35 p-4">
           <div className="flex items-center justify-between gap-4">
             <div>
@@ -158,12 +178,37 @@ export function LibrarySettingsPage({ serviceId, admin = false }: { serviceId: s
             </button>
           </div>
         </div>
-      </Panel>
-      <Panel title="媒体库工具" className="mt-4">
+      </Panel>}
+      {settings.navidromeSupported && (
+        <Panel title="Navidrome 协议" description="对外提供兼容 Subsonic 1.16.1 的音乐浏览、搜索、封面和原音频播放接口。" className="mt-4">
+          <div className="rounded-xl border border-border bg-secondary/35 p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-medium">启用 Navidrome 协议</p>
+                <p className="mt-1 text-xs text-muted-foreground">关闭后客户端不能继续访问，已扫描的音乐和协议账号仍会保留。</p>
+              </div>
+              <button type="button" role="switch" aria-checked={settings.navidromeEnabled} aria-label="启用 Navidrome 协议" disabled={updatingNavidrome} onClick={() => void toggleNavidrome()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.navidromeEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+                <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.navidromeEnabled ? "translate-x-5" : "translate-x-0"}`} />
+              </button>
+            </div>
+            <div className="mt-4 flex items-start justify-between gap-3 border-t border-border pt-4">
+              <div className="min-w-0">
+                <p className="text-xs text-muted-foreground">客户端服务器地址</p>
+                <p className="mt-1 break-all font-mono text-xs">{settings.navidromeUrl ?? `云助手 API 地址${settings.navidromePath}`}</p>
+                <p className="mt-2 text-xs text-muted-foreground">默认访问账号：<span className="font-mono text-foreground">{settings.account.username}</span>（密码在协议访问账号中设置）</p>
+              </div>
+              <SecondaryButton type="button" onClick={() => void copyLibraryText(settings.navidromeUrl ?? settings.navidromePath).then(() => setMessage(settings.navidromeUrl ? "Navidrome 服务地址已复制" : "Navidrome 服务路径已复制"))}><Copy className="size-4" /> 复制</SecondaryButton>
+            </div>
+          </div>
+          <p className="mt-3 text-xs text-muted-foreground">登录使用本媒体库的协议访问账号。建议公开地址使用 HTTPS；当前播放透传网盘或 WebDAV 原音频，不进行转码。</p>
+          <div className="mt-3"><Link to={jellyfinPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> 配置地址、用户名和密码</SecondaryButton></Link></div>
+        </Panel>
+      )}
+      {!settings.navidromeSupported && <Panel title="媒体库工具" className="mt-4">
         <div className="flex flex-wrap gap-2">
           <Link to={jellyfinPath} params={{ serviceId }}><SecondaryButton><Settings2 className="size-4" /> Jellyfin 配置</SecondaryButton></Link>
         </div>
-      </Panel>
+      </Panel>}
       <Panel title="危险操作" className="mt-4">
         <button type="button" onClick={() => void clearCatalog()} disabled={service.status === "scanning" || clearingCatalog} className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive/15 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-4" /> {clearingCatalog ? "正在清空…" : "清空媒体库"}</button>
       </Panel>
@@ -185,9 +230,12 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
   }, [serviceId, admin]);
   const [message, setMessage] = useState<string | null>(null);
   const [updatingPlayback, setUpdatingPlayback] = useState(false);
+  const [updatingDownload, setUpdatingDownload] = useState(false);
   const [updatingRegionLibraries, setUpdatingRegionLibraries] = useState(false);
   const [savingJellyfinPath, setSavingJellyfinPath] = useState(false);
   const [jellyfinPathSuffix, setJellyfinPathSuffix] = useState("");
+  const [savingNavidromePath, setSavingNavidromePath] = useState(false);
+  const [navidromePathSuffix, setNavidromePathSuffix] = useState("");
   const [showCreateAccount, setShowCreateAccount] = useState(false);
   const [newAccountUsername, setNewAccountUsername] = useState("");
   const [newAccountPassword, setNewAccountPassword] = useState("");
@@ -205,6 +253,10 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     if (settings?.jellyfinPathSuffix) setJellyfinPathSuffix(settings.jellyfinPathSuffix);
   }, [settings?.jellyfinPathSuffix]);
 
+  useEffect(() => {
+    if (settings?.navidromePathSuffix) setNavidromePathSuffix(settings.navidromePathSuffix);
+  }, [settings?.navidromePathSuffix]);
+
   /** 保存 Jellyfin 专用中转播放开关。 */
   async function toggleJellyfinRelayPlayback(): Promise<void> {
     if (!settings || updatingPlayback) return;
@@ -218,6 +270,22 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
       setMessage(error instanceof Error ? error.message : "Jellyfin 中转播放设置保存失败");
     } finally {
       setUpdatingPlayback(false);
+    }
+  }
+
+  /** 保存 Jellyfin 客户端影片下载权限。 */
+  async function toggleJellyfinDownload(): Promise<void> {
+    if (!settings || updatingDownload) return;
+    const nextEnabled = !settings.jellyfinDownloadEnabled;
+    setUpdatingDownload(true);
+    try {
+      await updateServiceJellyfinSettings(serviceId, { jellyfinDownloadEnabled: nextEnabled }, admin);
+      setMessage(`Jellyfin 影片下载已${nextEnabled ? "允许" : "禁止"}`);
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Jellyfin 下载权限保存失败");
+    } finally {
+      setUpdatingDownload(false);
     }
   }
 
@@ -267,6 +335,36 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     }
   }
 
+  /** 校验并保存固定 /n/ 前缀后的单层 Navidrome 地址后缀。 */
+  async function saveNavidromePath(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (!settings || savingNavidromePath) return;
+    const pathSuffix = navidromePathSuffix.trim();
+    if (pathSuffix.length === 0 || Array.from(pathSuffix).length > 64) {
+      setMessage("Navidrome 地址后缀长度必须为 1 至 64 个字符");
+      return;
+    }
+    if (!/^[\p{L}\p{N}_-]+$/u.test(pathSuffix)) {
+      setMessage("Navidrome 地址后缀只能包含文字、数字、短横线或下划线，且只能有一级");
+      return;
+    }
+    if (pathSuffix === settings.navidromePathSuffix) {
+      setMessage("Navidrome 服务地址没有修改");
+      return;
+    }
+    setSavingNavidromePath(true);
+    try {
+      const nextSettings = await updateServiceNavidromeSettings(serviceId, { navidromePathSuffix: pathSuffix }, admin);
+      setNavidromePathSuffix(nextSettings.navidromePathSuffix);
+      setMessage("Navidrome 服务地址已保存");
+      await resource.refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Navidrome 服务地址保存失败");
+    } finally {
+      setSavingNavidromePath(false);
+    }
+  }
+
   /** 占用全页账号操作槽，避免多个账号操作和刷新互相覆盖。 */
   function beginAccountAction(action: string): boolean {
     if (pendingAccountActionRef.current) return false;
@@ -281,7 +379,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     setPendingAccountAction(null);
   }
 
-  /** 创建共享当前 Jellyfin 地址的新登录账号。 */
+  /** 创建共享当前协议地址、但用户数据彼此隔离的新登录账号。 */
   async function createAccessAccount(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     if (!settings || !beginAccountAction("create")) return;
@@ -293,10 +391,10 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
       setNewAccountUsername("");
       setNewAccountPassword("");
       setShowCreateAccount(false);
-      setMessage("Jellyfin 账号已创建，可使用同一个服务地址登录");
+      setMessage("协议访问账号已创建，可使用同一个服务地址登录");
       await resource.refresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "创建 Jellyfin 账号失败");
+      setMessage(error instanceof Error ? error.message : "创建协议访问账号失败");
     } finally {
       finishAccountAction();
     }
@@ -309,7 +407,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
     setEditingAccountPassword("");
   }
 
-  /** 保存指定 Jellyfin 账号的用户名和可选新密码。 */
+  /** 保存指定协议账号的用户名和可选新密码。 */
   async function saveAccessAccount(event: FormEvent<HTMLFormElement>, account: ServiceAccessAccount): Promise<void> {
     event.preventDefault();
     if (!settings || !beginAccountAction(`save:${account.id}`)) return;
@@ -329,7 +427,7 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
       setMessage(`账号“${editingAccountUsername}”已保存，原登录会话已撤销`);
       await resource.refresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Jellyfin 访问凭据保存失败");
+      setMessage(error instanceof Error ? error.message : "协议访问凭据保存失败");
     } finally {
       finishAccountAction();
     }
@@ -353,28 +451,28 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
   /** 启用或停用指定账号，停用前需要二次确认。 */
   async function toggleAccessAccountStatus(account: ServiceAccessAccount): Promise<void> {
     const nextStatus = account.status === "active" ? "disabled" : "active";
-    if (nextStatus === "disabled" && !window.confirm(`确定停用账号“${account.username}”吗？该账号现有 Jellyfin 会话会被撤销。`)) return;
+    if (nextStatus === "disabled" && !window.confirm(`确定停用账号“${account.username}”吗？该账号现有协议会话会被撤销。`)) return;
     if (!beginAccountAction(`status:${account.id}`)) return;
     try {
       await updateServiceAccessAccount(serviceId, account.id, { status: nextStatus }, admin);
       setMessage(`账号“${account.username}”已${nextStatus === "active" ? "启用" : "停用"}`);
       await resource.refresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "修改 Jellyfin 账号状态失败");
+      setMessage(error instanceof Error ? error.message : "修改协议账号状态失败");
     } finally {
       finishAccountAction();
     }
   }
 
-  /** 二次确认后只撤销指定账号的 Jellyfin 会话。 */
+  /** 二次确认后只撤销指定账号的协议会话。 */
   async function revokeAccessAccountSessions(account: ServiceAccessAccount): Promise<void> {
-    if (!window.confirm(`确定撤销账号“${account.username}”的全部 Jellyfin 会话吗？观看记录不会删除。`)) return;
+    if (!window.confirm(`确定撤销账号“${account.username}”的全部协议会话吗？观看记录不会删除。`)) return;
     if (!beginAccountAction(`sessions:${account.id}`)) return;
     try {
       const result = await revokeServiceAccessAccountSessions(serviceId, account.id, admin);
       setMessage(`账号“${account.username}”已撤销 ${result.revokedCount} 个会话`);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Jellyfin 会话撤销失败");
+      setMessage(error instanceof Error ? error.message : "协议会话撤销失败");
     } finally {
       finishAccountAction();
     }
@@ -390,14 +488,14 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
       setMessage(`账号“${account.username}”及其独立观看记录已删除`);
       await resource.refresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "删除 Jellyfin 账号失败");
+      setMessage(error instanceof Error ? error.message : "删除协议账号失败");
     } finally {
       finishAccountAction();
     }
   }
 
   if (!service || !settings) {
-    return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取 Jellyfin 配置…"}</div></Panel>;
+    return <Panel><div className="py-16 text-center text-sm text-muted-foreground">{resource.error ?? "正在读取协议访问配置…"}</div></Panel>;
   }
   const jellyfinAddress = settings.jellyfinUrl ?? `云助手 API 地址${settings.jellyfinPath}`;
   // 关键变量：旧服务响应没有 accounts 时仍把历史单账号作为列表中的第一个账号显示。
@@ -405,9 +503,9 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
   const activeAccountCount = accessAccounts.filter((account) => account.status === "active").length;
   return (
     <>
-      <PageHeader title={`${service.displayName} · Jellyfin 配置`} actions={<Link to={settingsPath} params={{ serviceId }}><SecondaryButton>返回媒体库设置</SecondaryButton></Link>} />
+      <PageHeader title={`${service.displayName} · ${settings.navidromeSupported ? "协议访问账号" : "Jellyfin 配置"}`} actions={<Link to={settingsPath} params={{ serviceId }}><SecondaryButton>返回媒体库设置</SecondaryButton></Link>} />
       {message && <Panel className="mb-4"><p className="text-sm text-muted-foreground">{message}</p></Panel>}
-      <Panel title="播放设置" description="仅影响通过 Jellyfin 协议播放，和 APP 专用播放设置互不影响。">
+      {!settings.navidromeSupported && <><Panel title="播放设置" description="仅影响通过 Jellyfin 协议播放，和 APP 专用播放设置互不影响。">
         <div className="rounded-xl border border-border bg-secondary/35 p-4">
           <div className="flex items-center justify-between gap-4">
             <div>
@@ -420,6 +518,19 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
           </div>
         </div>
         {!settings.relayPlaybackSupported && <p className="mt-3 text-xs text-muted-foreground">当前网盘类型暂不支持中转播放。</p>}
+      </Panel>
+      <Panel title="下载设置" description="控制 Jellyfin 客户端是否可以下载媒体库中的原始影片文件。" className="mt-4">
+        <div className="rounded-xl border border-border bg-secondary/35 p-4">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <p className="text-sm font-medium">允许下载影片</p>
+              <p className="mt-1 text-xs text-muted-foreground">默认开启；下载由云助手传输原始文件，不转码，也不受 Jellyfin 播放中转开关影响。</p>
+            </div>
+            <button type="button" role="switch" aria-checked={settings.jellyfinDownloadEnabled} aria-label="允许 Jellyfin 下载影片" disabled={updatingDownload} onClick={() => void toggleJellyfinDownload()} className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${settings.jellyfinDownloadEnabled ? "border-primary bg-primary" : "border-border bg-secondary"}`}>
+              <span className={`absolute top-0.5 left-0.5 size-5 rounded-full bg-white shadow-sm transition-transform ${settings.jellyfinDownloadEnabled ? "translate-x-5" : "translate-x-0"}`} />
+            </button>
+          </div>
+        </div>
       </Panel>
       <Panel title="媒体库分类" className="mt-4">
         <div className="rounded-xl border border-border bg-secondary/35 p-4">
@@ -453,10 +564,31 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
             <SecondaryButton type="button" onClick={() => void copyLibraryText(settings.jellyfinUrl ?? settings.jellyfinPath).then(() => setMessage(settings.jellyfinUrl ? "Jellyfin 服务地址已复制" : "Jellyfin 服务路径已复制"))}><Copy className="size-4" /> 复制</SecondaryButton>
           </div>
         </div>
-      </Panel>
+      </Panel></>}
+      {settings.navidromeSupported && (
+        <Panel title="服务地址" description="客户端填写完整地址，固定 /n/ 前缀不可修改。">
+          <div className="rounded-xl border border-border bg-secondary/35 p-4">
+            <form onSubmit={(event) => void saveNavidromePath(event)}>
+              <p className="text-xs text-muted-foreground">Navidrome API 地址</p>
+              <div className="mt-2 flex flex-col gap-2 md:flex-row">
+                <div className="flex min-w-0 flex-1 overflow-hidden rounded-lg border border-input bg-background/50">
+                  <span className="flex shrink-0 items-center border-r border-border bg-secondary/60 px-3 font-mono text-sm text-muted-foreground">/n/</span>
+                  <input value={navidromePathSuffix} maxLength={64} onChange={(event) => setNavidromePathSuffix(event.target.value)} aria-label="Navidrome 地址后缀" className="min-w-0 flex-1 bg-transparent px-3 py-2.5 font-mono text-sm outline-none" />
+                </div>
+                <PrimaryButton type="submit" disabled={savingNavidromePath}><Settings2 className="size-4" /> {savingNavidromePath ? "正在保存…" : "保存地址"}</PrimaryButton>
+              </div>
+              <p className="mt-2 text-[11px] text-muted-foreground">后缀在全部媒体库中不能重复，只支持文字、数字、短横线或下划线，不能包含多级路径。</p>
+            </form>
+            <div className="mt-3 flex items-start justify-between gap-3 border-t border-border pt-3">
+              <p className="min-w-0 break-all font-mono text-xs">{settings.navidromeUrl ?? `云助手 API 地址${settings.navidromePath}`}</p>
+              <SecondaryButton type="button" onClick={() => void copyLibraryText(settings.navidromeUrl ?? settings.navidromePath).then(() => setMessage(settings.navidromeUrl ? "Navidrome 服务地址已复制" : "Navidrome 服务路径已复制"))}><Copy className="size-4" /> 复制</SecondaryButton>
+            </div>
+          </div>
+        </Panel>
+      )}
       <Panel
-        title="Jellyfin 账号"
-        description={`共 ${accessAccounts.length} 个账号，共享同一个服务地址，观看记录按账号独立保存。`}
+        title={settings.navidromeSupported ? "Navidrome 访问账号" : "Jellyfin 账号"}
+        description={`共 ${accessAccounts.length} 个账号，共享同一个服务地址；每个账号的播放记录、收藏和其他个人数据独立保存。`}
         className="mt-4"
         action={<SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => setShowCreateAccount((value) => !value)}><Plus className="size-4" /> 添加账号</SecondaryButton>}
       >
@@ -483,6 +615,9 @@ export function LibraryJellyfinSettingsPage({ serviceId, admin = false }: { serv
                       <StatusPill tone={account.status === "active" ? "success" : "neutral"}>{account.status === "active" ? "已启用" : "已停用"}</StatusPill>
                     </div>
                     <p className="mt-1 text-[11px] text-muted-foreground">{index === 0 ? "第一个账号 · " : ""}{account.hasPassword ? "需要密码" : "免密码"} · 凭据 r{account.credentialRevision}</p>
+                    {settings.navidromeSupported && account.hasPassword && account.subsonicTokenAuthReady === false && (
+                      <p className="mt-2 text-xs text-amber-600">该账号来自旧版本，请编辑并重新设置一次密码后再用于 Navidrome 客户端登录。</p>
+                    )}
                   </div>
                   <div className="flex flex-wrap gap-2">
                     <SecondaryButton type="button" disabled={pendingAccountAction !== null} onClick={() => beginEditAccount(account)}><Pencil className="size-4" /> 编辑</SecondaryButton>
@@ -520,16 +655,21 @@ export function LibraryCatalogPage({ serviceId, admin = false }: { serviceId: st
     search: "",
     mediaType: "all",
     videoItemType: "all",
+    musicItemType: "all",
     matchState: "matched",
     sort: "created_desc",
   });
   const [pageOffset, setPageOffset] = useState(0);
   const resource = useApiResource(async () => {
     const service = await getService(serviceId, admin);
+    const selectedItemType = catalogQuery.musicItemType !== "all"
+      ? catalogQuery.musicItemType
+      : catalogQuery.videoItemType === "all" ? undefined : catalogQuery.videoItemType;
     const options = {
       search: catalogQuery.search || undefined,
-      mediaType: catalogQuery.mediaType === "all" ? undefined : catalogQuery.mediaType,
-      itemType: catalogQuery.videoItemType === "all" ? undefined : catalogQuery.videoItemType,
+      mediaType: catalogQuery.mediaType === "all" ? service.dataType : catalogQuery.mediaType,
+      // 音乐库“全部”默认只展示专辑，歌曲和艺术家必须从独立分类进入。
+      itemType: selectedItemType ?? (service.dataType === "music" ? "music.album" : undefined),
       matchState: catalogQuery.matchState === "all" ? undefined : catalogQuery.matchState,
       sort: catalogQuery.sort,
       limit: LIBRARY_CATALOG_PAGE_SIZE,
@@ -539,7 +679,7 @@ export function LibraryCatalogPage({ serviceId, admin = false }: { serviceId: st
       ? await listAdminServiceItems(serviceId, options)
       : await listLibraryItems(service.libraryId, options);
     return { service, catalog };
-  }, [serviceId, admin, catalogQuery.search, catalogQuery.mediaType, catalogQuery.videoItemType, catalogQuery.matchState, catalogQuery.sort, pageOffset]);
+  }, [serviceId, admin, catalogQuery.search, catalogQuery.mediaType, catalogQuery.videoItemType, catalogQuery.musicItemType, catalogQuery.matchState, catalogQuery.sort, pageOffset]);
 
   /** 筛选变化后回到第一页，相同筛选不触发重复请求。 */
   const updateCatalogQuery = useCallback((nextQuery: MediaCatalogQuery): void => {
@@ -547,6 +687,7 @@ export function LibraryCatalogPage({ serviceId, admin = false }: { serviceId: st
       const unchanged = currentQuery.search === nextQuery.search
         && currentQuery.mediaType === nextQuery.mediaType
         && currentQuery.videoItemType === nextQuery.videoItemType
+        && currentQuery.musicItemType === nextQuery.musicItemType
         && currentQuery.matchState === nextQuery.matchState
         && currentQuery.sort === nextQuery.sort;
       return unchanged ? currentQuery : nextQuery;

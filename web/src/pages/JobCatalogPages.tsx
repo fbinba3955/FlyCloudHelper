@@ -116,9 +116,24 @@ function getScannedMediaLabel(dataType: "video" | "music" | "audiobook"): string
 
 /** 根据服务数据类型显示完成处理的媒体业务对象。 */
 function getProcessedMediaLabel(dataType: "video" | "music" | "audiobook"): string {
-  if (dataType === "music") return "处理音乐";
+  if (dataType === "music") return "处理曲目";
   if (dataType === "audiobook") return "处理有声书";
   return "处理影片";
+}
+
+/** 根据服务数据类型说明任务处理数量的统计口径。 */
+function getProcessedMediaDescription(dataType: "video" | "music" | "audiobook"): string {
+  if (dataType === "music") return "已经完成标签读取、元数据刮削和落库的曲目文件数量";
+  if (dataType === "audiobook") return "已经完成识别、元数据刮削和落库的有声书数量";
+  return "按 Flymby APP 刮削任务聚合后，已经成功处理或最终失败的完整电影、节目数量";
+}
+
+/** 根据服务数据类型说明匹配和未匹配数量的统计口径。 */
+function getMatchedMediaDescription(dataType: "video" | "music" | "audiobook", matched: boolean): string {
+  const mediaName = dataType === "music" ? "曲目" : dataType === "audiobook" ? "有声书" : "完整电影或节目";
+  return matched
+    ? `${mediaName}中取得元数据匹配结果的数量`
+    : `${mediaName}中已处理但没有取得元数据匹配结果的数量`;
 }
 
 /** 旧任务没有保存匹配数量时显示横线，避免把未知误报为零。 */
@@ -630,9 +645,9 @@ function JobsView({ admin }: { admin: boolean }) {
               ) : (
                 <div className="mt-3 grid grid-cols-2 gap-3 font-mono text-[11px] text-muted-foreground sm:grid-cols-5">
                   <span title={activeJobIsAiSupplement ? "任务开始时媒体库中未匹配的电影或节目数量" : "扫描路径中识别出的可处理媒体文件数量"}>{activeJobIsAiSupplement ? "待补充" : getScannedMediaLabel(activeJob.dataType)} {getScannedMediaCount(activeJob).toLocaleString()}</span>
-                  <span title={activeJobIsAiSupplement ? "已经完成 AI 补充处理的电影或节目数量" : "按 Flymby APP 刮削任务聚合后，已经成功处理或最终失败的完整电影、节目数量"}>{activeJobIsAiSupplement ? "已处理" : getProcessedMediaLabel(activeJob.dataType)} {activeJob.processedCount.toLocaleString()}</span>
-                  <span title="完整电影或节目中取得元数据匹配结果的数量">已匹配 {formatOptionalCount(activeJob.matchedCount)}</span>
-                  <span title="完整电影或节目中已处理但没有取得元数据匹配结果的数量">未匹配 {formatOptionalCount(activeJob.unmatchedCount)}</span>
+                  <span title={activeJobIsAiSupplement ? "已经完成 AI 补充处理的电影或节目数量" : getProcessedMediaDescription(activeJob.dataType)}>{activeJobIsAiSupplement ? "已处理" : getProcessedMediaLabel(activeJob.dataType)} {activeJob.processedCount.toLocaleString()}</span>
+                  <span title={getMatchedMediaDescription(activeJob.dataType, true)}>已匹配 {formatOptionalCount(activeJob.matchedCount)}</span>
+                  <span title={getMatchedMediaDescription(activeJob.dataType, false)}>未匹配 {formatOptionalCount(activeJob.unmatchedCount)}</span>
                   <span title="完整电影或节目处理失败的数量">错误 {activeJob.errorCount.toLocaleString()}</span>
                 </div>
               )}

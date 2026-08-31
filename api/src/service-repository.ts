@@ -18,7 +18,6 @@ import {
   type ServiceStatus,
   type SourceFileRecord,
   type VideoRegionGroup,
-  parseJsonArray,
   parseJsonObject,
 } from "./domain.js";
 import { ApiError, toSafeErrorMessage } from "./errors.js";
@@ -28,6 +27,10 @@ import type { FlymbyNfoMetadata } from "./media/flymby-nfo-parser.js";
 import { parseFlymbyVideoName } from "./media/flymby-video-parser.js";
 import { parseMediaProbeResult, type MediaProbeResult } from "./media/media-probe.js";
 import type { TmdbEpisodeMetadata, TmdbVideoMetadata } from "./metadata/tmdb.js";
+import {
+  AUDIO_TAG_PARSER_VERSION,
+  type AudioTagReadResult,
+} from "./music/audio-tag-reader.js";
 import { ServiceAccessService, type GeneratedServiceAccessCredentials } from "./service-access.js";
 
 type ServiceRepositoryLogger = (
@@ -37,6 +40,7 @@ type ServiceRepositoryLogger = (
 
 interface JellyfinServiceCleanupResult {
   protocolSessionCount: number;
+  virtualPreferenceCount: number;
   playbackProgressCount: number;
   playbackSessionCount: number;
   playbackHistoryCount: number;
@@ -54,6 +58,13 @@ const EUROPE_AMERICA_REGION_CODES = new Set(
     + "AU NZ")
     .split(" "),
 );
+
+/** 从已解析JSON字段读取字符串数组，过滤非字符串和值为空的条目。 */
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    : [];
+}
 
 /** 根据节目 TMDB origin_country 计算稳定地区分组；电影和缺失数据统一归入 other。 */
 function readVideoRegionGroup(itemType: string, metadata: Record<string, unknown>): VideoRegionGroup {
@@ -78,6 +89,7 @@ interface ServiceRow {
   status: ServiceStatus;
   connection_status: string;
   relay_playback_enabled: number | string | boolean;
+  notification_enabled: number | string | boolean;
   jellyfin_enabled: number | string | boolean;
   credential_revision: number | string;
   scan_profile_revision: number | string;
@@ -231,6 +243,13 @@ export interface ScanRootRunRecord {
   warningCount: number;
 }
 
+/** 规格父任务同步结果，completedNow 只在本次原子更新首次进入完成态时为真。 */
+export interface MediaProbeSynchronizationResult {
+  job: ScanJobRecord;
+  completedNow: boolean;
+  completedFileCount: number;
+}
+
 /** 把服务查询行转换为公开服务摘要。 */
 function mapService(row: ServiceRow): CloudServiceRecord {
   return {
@@ -244,6 +263,7 @@ function mapService(row: ServiceRow): CloudServiceRecord {
     status: row.status,
     connectionStatus: row.connection_status,
     relayPlaybackEnabled: Number(row.relay_playback_enabled) === 1 || row.relay_playback_enabled === true,
+    notificationEnabled: Number(row.notification_enabled) === 1 || row.notification_enabled === true,
     jellyfinEnabled: Number(row.jellyfin_enabled) === 1 || row.jellyfin_enabled === true,
     credentialRevision: Number(row.credential_revision),
     scanProfileRevision: Number(row.scan_profile_revision),
@@ -585,12 +605,14 @@ export class ServiceRepository {
   private readonly logger?: ServiceRepositoryLogger;
   private readonly scanWorkerConcurrency: number;
   private readonly mediaProbeConcurrency: number;
+  private readonly serviceAccess: ServiceAccessService;
   // 关键变量：阻止同一 API 实例同时执行同一服务的多次清空，跨实例仍由数据库服务行锁兜底。
   private readonly clearingCatalogServiceIds = new Set<string>();
 
   /** 初始化服务仓储，并保存两个独立任务池的并发上限。 */
   public constructor(
     database: FlyCloudHelperDatabase,
+    serviceAccess: ServiceAccessService,
     logger?: ServiceRepositoryLogger,
     queueLimits: { scanWorkerConcurrency: number; mediaProbeConcurrency: number } = {
       scanWorkerConcurrency: 5,
@@ -601,6 +623,7 @@ export class ServiceRepository {
     this.logger = logger;
     this.scanWorkerConcurrency = queueLimits.scanWorkerConcurrency;
     this.mediaProbeConcurrency = queueLimits.mediaProbeConcurrency;
+    this.serviceAccess = serviceAccess;
   }
 
   /**
@@ -721,6 +744,7 @@ export class ServiceRepository {
         "s.status",
         "s.connection_status",
         "l.app_relay_playback_enabled as relay_playback_enabled",
+        "s.notification_enabled",
         "l.jellyfin_enabled as jellyfin_enabled",
         "s.credential_revision",
         "s.scan_profile_revision",
@@ -743,6 +767,7 @@ export class ServiceRepository {
         "s.status",
         "s.connection_status",
         "l.app_relay_playback_enabled",
+        "s.notification_enabled",
         "l.jellyfin_enabled",
         "s.credential_revision",
         "s.scan_profile_revision",
@@ -782,6 +807,7 @@ export class ServiceRepository {
         status: input.initialStatus ?? "active",
         connection_status: "valid",
         relay_playback_enabled: 0,
+        notification_enabled: 0,
         credential_revision: 1,
         scan_profile_revision: 1,
         metadata_profile_revision: 1,
@@ -798,8 +824,12 @@ export class ServiceRepository {
         catalog_version: 0,
         app_relay_playback_enabled: 0,
         jellyfin_relay_playback_enabled: 1,
+        jellyfin_download_enabled: 1,
         jellyfin_region_libraries_enabled: 0,
         jellyfin_enabled: 0,
+        navidrome_enabled: 0,
+        navidrome_path_suffix: input.serviceId,
+        navidrome_path_suffix_lookup: input.serviceId.toLowerCase(),
         jellyfin_path_suffix: input.serviceId,
         jellyfin_path_suffix_lookup: input.serviceId.toLowerCase(),
         status: "active",
@@ -833,7 +863,7 @@ export class ServiceRepository {
         configuration_json: JSON.stringify(input.metadataProfile),
         created_at: now,
       });
-      accessCredentials = await new ServiceAccessService(this.database).createForService(input.serviceId, transaction);
+      accessCredentials = await this.serviceAccess.createForService(input.serviceId, transaction);
       if (input.binding) {
         await transaction("client_service_links").insert({
           id: input.binding.id,
@@ -2238,6 +2268,58 @@ export class ServiceRepository {
     return this.getServiceDetail(serviceId, userId);
   }
 
+  /** 更新单个服务是否向 Telegram 等外部渠道投递后台任务结果。 */
+  public async updateServiceNotificationEnabled(
+    serviceId: string,
+    userId: string | undefined,
+    enabled: boolean,
+  ): Promise<ServiceDetailRecord> {
+    const query = this.database.query("cloud_services").where({ id: serviceId }).whereNull("deleted_at");
+    if (userId) query.where({ user_id: userId });
+    const changed = await query.update({
+      notification_enabled: enabled ? 1 : 0,
+      updated_at: new Date().toISOString(),
+    });
+    if (changed !== 1) throw new ApiError(404, "service_not_found", "云端服务不存在");
+    return this.getServiceDetail(serviceId, userId);
+  }
+
+  /** 在任务完成时读取服务最新通知开关，避免长任务沿用过期配置。 */
+  public async isServiceNotificationEnabled(serviceId: string): Promise<boolean> {
+    const row = await this.database.query("cloud_services")
+      .select("notification_enabled")
+      .where({ id: serviceId })
+      .whereNull("deleted_at")
+      .first() as { notification_enabled: number | string | boolean } | undefined;
+    return row ? Number(row.notification_enabled) === 1 || row.notification_enabled === true : false;
+  }
+
+  /** 统计扫描任务启动后新建的媒体条目，供完成通知展示本次入库数量。 */
+  public async getScanCreatedMediaCounts(job: Pick<ScanJobRecord, "serviceId" | "startedAt">): Promise<{
+    videoContentCount: number;
+    songCount: number;
+    albumCount: number;
+    artistCount: number;
+  }> {
+    if (!job.startedAt) return { videoContentCount: 0, songCount: 0, albumCount: 0, artistCount: 0 };
+    const rows = await this.database.query("media_items")
+      .select("item_type")
+      .count<{ item_type: string; count: string | number }[]>({ count: "id" })
+      .where({ service_id: job.serviceId })
+      .whereNull("deleted_at")
+      .where("created_at", ">=", job.startedAt)
+      .whereIn("item_type", ["video.movie", "video.series", "music.track", "music.album", "music.artist"])
+      .groupBy("item_type");
+    // 关键变量：按条目类型读取计数，影视只统计媒体库顶层电影和节目，不把剧集文件重复计入新内容。
+    const counts = new Map(rows.map((row) => [String(row.item_type), Number(row.count ?? 0)]));
+    return {
+      videoContentCount: (counts.get("video.movie") ?? 0) + (counts.get("video.series") ?? 0),
+      songCount: counts.get("music.track") ?? 0,
+      albumCount: counts.get("music.album") ?? 0,
+      artistCount: counts.get("music.artist") ?? 0,
+    };
+  }
+
   /** 显式清除服务的 Jellyfin 账号、会话和播放数据，并释放自定义协议地址。 */
   private async deleteJellyfinServiceData(
     transaction: Knex.Transaction,
@@ -2245,6 +2327,8 @@ export class ServiceRepository {
     now: string,
   ): Promise<JellyfinServiceCleanupResult> {
     // 关键变量：播放表同时关联账号和媒体条目，必须先于服务访问账号删除，不能依赖软删除不会触发的外键级联。
+    const virtualPreferenceCount = Number(await transaction("service_jellyfin_virtual_preferences")
+      .where({ service_id: serviceId }).delete());
     const playbackHistoryCount = Number(await transaction("service_playback_history")
       .where({ service_id: serviceId }).delete());
     const playbackSessionCount = Number(await transaction("service_playback_sessions")
@@ -2260,8 +2344,12 @@ export class ServiceRepository {
     await transaction("media_libraries").where({ service_id: serviceId }).update({
       app_relay_playback_enabled: 0,
       jellyfin_relay_playback_enabled: 0,
+      jellyfin_download_enabled: 0,
       jellyfin_region_libraries_enabled: 0,
       jellyfin_enabled: 0,
+      navidrome_enabled: 0,
+      navidrome_path_suffix: deletedPathSuffix,
+      navidrome_path_suffix_lookup: deletedPathSuffix.toLowerCase(),
       jellyfin_path_suffix: deletedPathSuffix,
       jellyfin_path_suffix_lookup: deletedPathSuffix.toLowerCase(),
       status: "disabled",
@@ -2269,6 +2357,7 @@ export class ServiceRepository {
     });
     return {
       protocolSessionCount,
+      virtualPreferenceCount,
       playbackProgressCount,
       playbackSessionCount,
       playbackHistoryCount,
@@ -2312,6 +2401,7 @@ export class ServiceRepository {
         事件: "删除服务时同步清除Jellyfin数据",
         服务ID: serviceId,
         删除协议会话数量: jellyfinCleanupResult.protocolSessionCount,
+        删除虚拟条目收藏数量: jellyfinCleanupResult.virtualPreferenceCount,
         删除播放进度数量: jellyfinCleanupResult.playbackProgressCount,
         删除播放会话数量: jellyfinCleanupResult.playbackSessionCount,
         删除播放历史数量: jellyfinCleanupResult.playbackHistoryCount,
@@ -2435,6 +2525,7 @@ export class ServiceRepository {
         await transaction("media_relations").where({ library_id: libraryId }).delete();
         await transaction("media_items").where({ library_id: libraryId }).delete();
         await transaction("nfo_sidecar_cache").where({ library_id: libraryId }).delete();
+        await transaction("audio_file_tags").where({ library_id: libraryId }).delete();
         await transaction("source_files").where({ library_id: libraryId }).delete();
         await transaction("catalog_changes").where({ library_id: libraryId }).delete();
         await transaction("media_libraries").where({ id: libraryId }).update({
@@ -2454,6 +2545,104 @@ export class ServiceRepository {
     } finally {
       this.clearingCatalogServiceIds.delete(serviceId);
     }
+  }
+
+  /** 文件指纹和解析器版本均未变化时复用音频标签，避免增量扫描再次读取远端字节。 */
+  public async readAudioTagCache(sourceFileId: string, fingerprint: string): Promise<AudioTagReadResult | null> {
+    const row = await this.database.query("audio_file_tags").where({
+      source_file_id: sourceFileId,
+      fingerprint,
+      parser_version: AUDIO_TAG_PARSER_VERSION,
+    }).first();
+    if (!row) return null;
+    const tags = parseJsonObject(row.tag_json);
+    const technical = parseJsonObject(row.technical_json);
+    const artwork = parseJsonObject(row.artwork_json);
+    return {
+      status: row.status as AudioTagReadResult["status"],
+      tags: {
+        title: String(tags.title ?? ""),
+        artists: readStringArray(tags.artists),
+        album: String(tags.album ?? ""),
+        albumArtists: readStringArray(tags.albumArtists),
+        trackNumber: Number(tags.trackNumber ?? 0),
+        trackTotal: Number(tags.trackTotal ?? 0),
+        discNumber: Number(tags.discNumber ?? 0),
+        discTotal: Number(tags.discTotal ?? 0),
+        date: String(tags.date ?? ""),
+        year: Number.isInteger(Number(tags.year)) && Number(tags.year) > 0 ? Number(tags.year) : null,
+        genres: readStringArray(tags.genres),
+        composers: readStringArray(tags.composers),
+        lyrics: String(tags.lyrics ?? ""),
+        isrc: String(tags.isrc ?? ""),
+        musicBrainzRecordingId: String(tags.musicBrainzRecordingId ?? ""),
+        musicBrainzReleaseTrackId: String(tags.musicBrainzReleaseTrackId ?? ""),
+        musicBrainzReleaseId: String(tags.musicBrainzReleaseId ?? ""),
+        musicBrainzReleaseGroupId: String(tags.musicBrainzReleaseGroupId ?? ""),
+        musicBrainzArtistIds: readStringArray(tags.musicBrainzArtistIds),
+        musicBrainzAlbumArtistIds: readStringArray(tags.musicBrainzAlbumArtistIds),
+      },
+      technical: {
+        durationMs: Number(technical.durationMs ?? 0),
+        container: String(technical.container ?? ""),
+        bitRate: Number(technical.bitRate ?? 0),
+        codec: String(technical.codec ?? ""),
+        sampleRate: Number(technical.sampleRate ?? 0),
+        channels: Number(technical.channels ?? 0),
+        channelLayout: String(technical.channelLayout ?? ""),
+        bitDepth: Number(technical.bitDepth ?? 0),
+      },
+      artwork: {
+        embedded: artwork.embedded === true,
+        url: typeof artwork.url === "string" && artwork.url ? artwork.url : null,
+      },
+      readBytesLimit: Number(row.read_bytes_limit ?? 0),
+      errorCode: row.error_code ? String(row.error_code) : null,
+      errorMessage: row.error_message ? String(row.error_message) : null,
+      readAt: String(row.read_at),
+    };
+  }
+
+  /** 保存当前源文件指纹对应的音频标签，不保存临时地址和Provider请求头。 */
+  public async saveAudioTagCache(input: {
+    sourceFile: SourceFileRecord;
+    fingerprint: string;
+    result: AudioTagReadResult;
+  }): Promise<void> {
+    const now = new Date().toISOString();
+    await this.database.query("audio_file_tags")
+      .insert({
+        source_file_id: input.sourceFile.id,
+        user_id: input.sourceFile.userId,
+        service_id: input.sourceFile.serviceId,
+        library_id: input.sourceFile.libraryId,
+        fingerprint: input.fingerprint,
+        status: input.result.status,
+        parser_version: AUDIO_TAG_PARSER_VERSION,
+        tag_json: JSON.stringify(input.result.tags),
+        technical_json: JSON.stringify(input.result.technical),
+        artwork_json: JSON.stringify(input.result.artwork),
+        read_bytes_limit: input.result.readBytesLimit,
+        error_code: input.result.errorCode,
+        error_message: input.result.errorMessage,
+        read_at: input.result.readAt,
+        created_at: now,
+        updated_at: now,
+      })
+      .onConflict("source_file_id")
+      .merge({
+        fingerprint: input.fingerprint,
+        status: input.result.status,
+        parser_version: AUDIO_TAG_PARSER_VERSION,
+        tag_json: JSON.stringify(input.result.tags),
+        technical_json: JSON.stringify(input.result.technical),
+        artwork_json: JSON.stringify(input.result.artwork),
+        read_bytes_limit: input.result.readBytesLimit,
+        error_code: input.result.errorCode,
+        error_message: input.result.errorMessage,
+        read_at: input.result.readAt,
+        updated_at: now,
+      });
   }
 
   /** 文件指纹未变化时返回已解析的NFO，缺少修改时间和ETag时不冒险复用。 */
@@ -3096,7 +3285,10 @@ export class ServiceRepository {
   }
 
   /** 汇总单个规格后台任务的文件状态，并推进父任务进度或终态。 */
-  public async synchronizeMediaProbeJob(jobId: string, currentFileName: string | null = null): Promise<ScanJobRecord | null> {
+  public async synchronizeMediaProbeJob(
+    jobId: string,
+    currentFileName: string | null = null,
+  ): Promise<MediaProbeSynchronizationResult | null> {
     const jobRow = await this.database.query("media_probe_jobs").where({ id: jobId }).first() as MediaProbeJobRow | undefined;
     if (!jobRow) return null;
     const statusRows = await this.database.query("media_file_probes")
@@ -3148,9 +3340,13 @@ export class ServiceRepository {
         patch.active_started_at = null;
       }
     }
-    await this.database.query("media_probe_jobs").where({ id: jobId }).update(patch);
+    // 关键变量：限定旧状态可防止并发文件完成时重复宣告父任务完成，也避免较早的进度覆盖终态。
+    const changed = await this.database.query("media_probe_jobs")
+      .where({ id: jobId, status: jobRow.status })
+      .update(patch);
+    const completedNow = patch.status === "completed" && changed === 1;
     const updated = await this.mediaProbeJobSummaryQuery().where("j.id", jobId).first() as MediaProbeJobRow | undefined;
-    return updated ? mapMediaProbeJob(updated) : null;
+    return updated ? { job: mapMediaProbeJob(updated), completedNow, completedFileCount: completedCount } : null;
   }
 
   /** 返回规格后台任务的失败文件，用于任务详情定位 Provider 或媒体异常。 */
@@ -3283,9 +3479,15 @@ export class ServiceRepository {
     const itemId = existing ? String(existing.id) : input.id;
     const existingMetadata = existing ? parseJsonObject(existing.metadata_json) : {};
     const hasManualMatch = Object.keys(asObject(existingMetadata.manualMatch)).length > 0;
+    // 关键变量：音乐平台偶发缺图时保留上一轮已成功取得的歌曲、专辑或艺术家图片。
+    const artworkPreservingInput = existing && input.mediaType === "music" ? {
+      ...input,
+      posterUrl: input.posterUrl || (existing.poster_url ? String(existing.poster_url) : null),
+      backdropUrl: input.backdropUrl || (existing.backdrop_url ? String(existing.backdrop_url) : null),
+    } : input;
     // 关键变量：人工匹配结果优先于后续自动扫描，但扫描仍刷新 generation，避免条目被全量扫描误删。
     const effectiveInput = hasManualMatch && existing ? {
-      ...input,
+      ...artworkPreservingInput,
       mediaType: existing.media_type as MediaType,
       itemType: String(existing.item_type),
       title: String(existing.title),
@@ -3298,7 +3500,7 @@ export class ServiceRepository {
       matchState: existing.match_state as MatchState,
       externalIds: Object.fromEntries(Object.entries(parseJsonObject(existing.external_ids_json)).map(([key, value]) => [key, String(value)])),
       metadata: existingMetadata,
-    } : input;
+    } : artworkPreservingInput;
     const externalIdsJson = JSON.stringify(effectiveInput.externalIds);
     const metadataJson = JSON.stringify(effectiveInput.metadata);
     const regionGroup = readVideoRegionGroup(effectiveInput.itemType, effectiveInput.metadata);
@@ -3560,6 +3762,52 @@ export class ServiceRepository {
     return [];
   }
 
+  /** 原子替换音乐艺术家与专辑、歌曲的关系，支持同一歌曲后续扩展为多艺术家。 */
+  public async replaceMusicArtistRelations(input: {
+    userId: string;
+    libraryId: string;
+    artistItemIds: string[];
+    albumItemId: string | null;
+    trackItemId: string;
+  }): Promise<void> {
+    // 关键变量：艺术家编号去重后同时用于删除过期关系和写入本轮关系。
+    const artistItemIds = [...new Set(input.artistItemIds.filter(Boolean))];
+    await this.database.query.transaction(async (transaction) => {
+      if (input.albumItemId) {
+        const albumRelations = transaction("media_relations").where({
+          user_id: input.userId,
+          library_id: input.libraryId,
+          child_item_id: input.albumItemId,
+          relation_type: "artist_album",
+        });
+        if (artistItemIds.length > 0) albumRelations.whereNotIn("parent_item_id", artistItemIds);
+        await albumRelations.delete();
+      }
+      const trackRelations = transaction("media_relations").where({
+        user_id: input.userId,
+        library_id: input.libraryId,
+        child_item_id: input.trackItemId,
+        relation_type: "artist_track",
+      });
+      if (artistItemIds.length > 0) trackRelations.whereNotIn("parent_item_id", artistItemIds);
+      await trackRelations.delete();
+      for (const [index, artistItemId] of artistItemIds.entries()) {
+        if (input.albumItemId) {
+          await transaction("media_relations").insert({
+            id: randomUUID(), user_id: input.userId, library_id: input.libraryId,
+            parent_item_id: artistItemId, child_item_id: input.albumItemId,
+            relation_type: "artist_album", sort_order: index,
+          }).onConflict(["user_id", "parent_item_id", "child_item_id", "relation_type"]).merge({ sort_order: index });
+        }
+        await transaction("media_relations").insert({
+          id: randomUUID(), user_id: input.userId, library_id: input.libraryId,
+          parent_item_id: artistItemId, child_item_id: input.trackItemId,
+          relation_type: "artist_track", sort_order: index,
+        }).onConflict(["user_id", "parent_item_id", "child_item_id", "relation_type"]).merge({ sort_order: index });
+      }
+    });
+  }
+
   /** 在成功 generation 后执行扫描结果对账并推进目录版本。 */
   public async finalizeGeneration(input: {
     userId: string;
@@ -3803,7 +4051,7 @@ export class ServiceRepository {
     const parentRows = await transaction("media_items")
       .select("id")
       .where({ user_id: userId, library_id: libraryId })
-      .whereIn("item_type", ["video.series", "music.album", "audiobook.book"])
+      .whereIn("item_type", ["video.series", "music.album", "music.artist", "audiobook.book"])
       .whereNull("deleted_at");
     const parentIds = parentRows.map((row) => String(row.id));
     if (parentIds.length === 0) return [];
@@ -3865,9 +4113,12 @@ export class ServiceRepository {
     if (filters.mediaType) base.where("m.media_type", filters.mediaType);
     if (filters.itemType) {
       base.where("m.item_type", filters.itemType);
+    } else if (filters.mediaType === "music") {
+      // 音乐媒体库默认以专辑为入口，歌曲和艺术家通过显式分类筛选查看。
+      base.where("m.item_type", "music.album");
     } else {
-      // 海报墙只展示电影、节目、专辑和有声书等顶层条目；单集通过父条目的 children 接口读取。
-      base.whereNot("m.item_type", "video.episode");
+      // 通用海报墙不直接展示单集和歌曲；对应分类页可通过 itemType 明确请求。
+      base.whereNotIn("m.item_type", ["video.episode", "music.track"]);
     }
     if (filters.regionGroup) base.where("m.region_group", filters.regionGroup);
     if (filters.matchState) base.where("m.match_state", filters.matchState);
@@ -4122,6 +4373,44 @@ export class ServiceRepository {
     });
   }
 
+  /** 查询音乐专辑或歌曲反向关联的艺术家，不把艺术家混入原有子项列表。 */
+  public async listCatalogMusicArtists(itemId: string, userId?: string): Promise<MediaItemRecord[]> {
+    const item = await this.getCatalogItem(itemId, userId);
+    if (item.itemType !== "music.album" && item.itemType !== "music.track") return [];
+    const relationType = item.itemType === "music.album" ? "artist_album" : "artist_track";
+    const relationRows = await this.database.query("media_relations")
+      .select("parent_item_id")
+      .where({
+        user_id: item.userId,
+        library_id: item.libraryId,
+        child_item_id: itemId,
+        relation_type: relationType,
+      })
+      .orderBy("sort_order", "asc");
+    const artistIds = relationRows.map((row) => String(row.parent_item_id));
+    if (artistIds.length === 0) return [];
+    const artistRows = await this.database.query("media_items as m")
+      .join("cloud_services as s", "s.id", "m.service_id")
+      .join("user_accounts as u", "u.id", "s.user_id")
+      .select("m.*", "u.username as owner_username", "s.display_name as service_name")
+      .where("m.user_id", item.userId)
+      .where("m.library_id", item.libraryId)
+      .where("m.item_type", "music.artist")
+      .whereIn("m.id", artistIds)
+      .whereNull("m.deleted_at")
+      .whereNull("s.deleted_at");
+    const artistsById = new Map(artistRows.map((row) => [String(row.id), this.mapMediaItem({
+      ...row,
+      file_count: 0,
+      media_probe_summary: null,
+    })]));
+    // 关键变量：多艺术家专辑按关系顺序返回，数据库 IN 查询自身不保证顺序。
+    return artistIds.flatMap((artistId) => {
+      const artist = artistsById.get(artistId);
+      return artist ? [artist] : [];
+    });
+  }
+
   /** 读取当前条目及其直接子项关联的源文件，返回值不包含播放定位和凭据。 */
   public async listCatalogItemPaths(itemId: string, userId?: string): Promise<CatalogPathRow[]> {
     const item = await this.getCatalogItem(itemId, userId);
@@ -4252,11 +4541,13 @@ export class ServiceRepository {
         rating: input.metadata.rating,
         genres: input.metadata.genres,
         people: input.metadata.people,
+        logoUrl: input.metadata.logoUrl,
         episodeCount: input.metadata.episodeCount,
         originCountries: input.metadata.originCountries,
         matchedQuery: input.metadata.matchedQuery,
         candidateCount: input.metadata.candidateCount,
         tmdbDetailsSynchronized: true,
+        tmdbArtworkSynchronized: true,
         tmdbDetailsSynchronizedAt: now,
       };
       await transaction("media_items").where({ id: input.itemId, user_id: input.userId }).update({
@@ -4442,11 +4733,13 @@ export class ServiceRepository {
         rating: input.metadata.rating,
         genres: input.metadata.genres,
         people: input.metadata.people,
+        logoUrl: input.metadata.logoUrl,
         episodeCount: input.metadata.episodeCount,
         originCountries: input.metadata.originCountries,
         matchedQuery: input.metadata.matchedQuery,
         candidateCount: input.metadata.candidateCount,
         tmdbDetailsSynchronized: input.metadata.detailsSynchronized,
+        tmdbArtworkSynchronized: input.metadata.detailsSynchronized,
         manualMatch: {
           source: "tmdb",
           tmdbId: input.metadata.id,

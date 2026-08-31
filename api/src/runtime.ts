@@ -17,6 +17,7 @@ import type { PublicAccessService } from "./public-access.js";
 import type { ServiceAccessService } from "./service-access.js";
 import type { MediaProbeWorker } from "./media-probe-worker.js";
 import type { ScanScheduleStore, ScanScheduleWorker } from "./scan-schedule-service.js";
+import type { TelegramNotificationService } from "./telegram-notification-service.js";
 
 /** 后台路由共享的已初始化运行时依赖。 */
 export interface ApiRuntime {
@@ -40,6 +41,7 @@ export interface ApiRuntime {
   failureReports: ScanFailureReportService;
   publicAccess: PublicAccessService;
   serviceAccess: ServiceAccessService;
+  telegramNotifications: TelegramNotificationService;
   logBusinessEvent: (
     level: "info" | "warn",
     fields: Record<string, string | number | boolean | null>,

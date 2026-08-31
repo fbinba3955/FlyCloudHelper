@@ -78,7 +78,7 @@ const adminNavigation: NavigationItem[] = [
   { to: "/admin/catalog", label: "媒体库", icon: LibraryBig },
   { to: "/admin/plugins", label: "插件管理", icon: Puzzle },
   { to: "/admin/ai-models", label: "AI 模型", icon: BrainCircuit },
-  { to: "/admin/config", label: "系统配置", icon: Settings2 },
+  { to: "/admin/config", label: "系统设置", icon: Settings2 },
   { to: "/admin/system", label: "系统状态", icon: ServerCog },
   { to: "/admin/audit", label: "审计日志", icon: ScrollText },
 ];
