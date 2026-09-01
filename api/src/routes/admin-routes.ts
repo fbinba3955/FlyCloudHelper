@@ -818,12 +818,15 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
   server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/admin/services/:serviceId/scan-profile", async (request) => {
     const operator = await requireSuperAdmin(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId);
+    const updateScope = request.body.updateScope === "paths" ? "paths" : "profile";
     const scanProfile = validateScanProfile(
       requireObject(request.body, "scan", "扫描配置"),
       service.providerType,
       service.dataType,
       runtime.providers.get(service.providerType).descriptor.recommendedScanSettings,
+      updateScope === "paths",
     );
+    const recommendedSettings = runtime.providers.get(service.providerType).descriptor.recommendedScanSettings;
     const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, service.userId));
     await validateConfiguredScanRoots(runtime.providers.get(service.providerType), connection, scanProfile, {
       persistConnection: async (nextConnection) => {
@@ -847,6 +850,16 @@ export async function registerAdminRoutes(server: FastifyInstance, runtime: ApiR
       service.userId,
       scanProfile,
     );
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-scan-concurrency",
+      事件: updateScope === "paths" ? "管理员保存扫描路径并保留服务任务数" : "管理员按服务配置保存无上限任务数",
+      管理员ID: operator.id,
+      服务ID: service.id,
+      扫描任务数: Number(scanProfile.scanDirectoryConcurrency),
+      刮削任务数: Number(scanProfile.scrapeTaskConcurrency),
+      Provider默认扫描任务数: recommendedSettings.scanDirectoryConcurrency.default,
+      Provider默认刮削任务数: recommendedSettings.scrapeTaskConcurrency.default,
+    });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-scan-path",
       事件: "管理员更新服务扫描路径",

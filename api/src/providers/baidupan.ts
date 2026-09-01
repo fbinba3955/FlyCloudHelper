@@ -48,8 +48,7 @@ export class BaiduPanProvider implements ProviderAdapter {
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
     recommendedScanSettings: createProviderRecommendedScanSettings({
       // 百度单页可以读取 1000 项，但业务码 31034 对突发并发更敏感。
-      scanDirectoryConcurrency: { default: 4, min: 1, max: 4 },
-      fullScanDirectoryConcurrency: 2,
+      scanDirectoryConcurrency: { default: 4 },
     }),
     connectionFields: [
       { name: "accessToken", label: "Access Token", type: "password", required: true, secret: true },

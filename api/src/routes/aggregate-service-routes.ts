@@ -76,6 +76,44 @@ export async function registerAggregateServiceRoutes(server: FastifyInstance, ru
     },
   );
 
+  server.post<{ Params: { aggregateServiceId: string } }>(
+    "/api/v1/aggregate-services/:aggregateServiceId/rebuild",
+    async (request) => {
+      const user = await requireRequestUser(request, runtime.database);
+      const aggregateService = await runtime.aggregateServices.getById(request.params.aggregateServiceId, user.id);
+      const indexJobId = await runtime.aggregateIndex.enqueue(aggregateService.id, user.id, "rebuild");
+      runtime.logBusinessEvent("info", {
+        日志关键字: "codex-aggregate-index",
+        事件: "手动重新构建聚合服务",
+        用户ID: user.id,
+        聚合服务ID: aggregateService.id,
+        索引任务ID: indexJobId,
+      });
+      return {
+        aggregateService: await runtime.aggregateServices.getById(aggregateService.id, user.id),
+        indexJobId,
+      };
+    },
+  );
+
+  server.delete<{ Params: { aggregateServiceId: string } }>(
+    "/api/v1/aggregate-services/:aggregateServiceId",
+    async (request, reply) => {
+      const user = await requireRequestUser(request, runtime.database);
+      const result = await runtime.aggregateServices.delete(request.params.aggregateServiceId, user.id);
+      runtime.logBusinessEvent("warn", {
+        日志关键字: "codex-aggregate-delete",
+        事件: "删除聚合服务及全部独立数据",
+        用户ID: user.id,
+        聚合服务ID: request.params.aggregateServiceId,
+        聚合服务名称: result.displayName,
+        删除关联数据行数: result.deletedRelatedRows,
+        是否影响来源服务: false,
+      });
+      return reply.status(204).send();
+    },
+  );
+
   server.get<{ Params: { aggregateServiceId: string } }>(
     "/api/v1/aggregate-services/:aggregateServiceId/accounts",
     async (request) => {

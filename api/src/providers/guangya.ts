@@ -191,8 +191,7 @@ export class GuangyaProvider implements ProviderAdapter {
     ],
     recommendedScanSettings: createProviderRecommendedScanSettings({
       // 光鸭文件接口内部按 210ms 排队并可能返回业务 429，保持较低并发可避免重试抵消收益。
-      scanDirectoryConcurrency: { default: 4, min: 1, max: 4 },
-      fullScanDirectoryConcurrency: 2,
+      scanDirectoryConcurrency: { default: 4 },
     }),
     authenticationMode: "web_qr",
     connectionFields: [],

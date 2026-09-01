@@ -221,6 +221,7 @@ export async function buildApiServer(config: ApiConfig): Promise<FastifyInstance
     plugins,
     aiModels,
     failureReports,
+    aggregateIndex,
     logger: server.log,
     config,
   });

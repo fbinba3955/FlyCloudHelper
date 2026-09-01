@@ -154,11 +154,6 @@ function readScanConcurrencySettings(
   };
 }
 
-/** 创建包含最小值和最大值的连续整数选项。 */
-function buildConcurrencyOptions(min: number, max: number): number[] {
-  return Array.from({ length: max - min + 1 }, (_, index) => min + index);
-}
-
 /** 读取影视元数据配置，并兼容早期 sources 数组。 */
 function readVideoMetadataSettings(profile: Record<string, unknown>): VideoMetadataSettings {
   const profiles = profile.profiles && typeof profile.profiles === "object" && !Array.isArray(profile.profiles)
@@ -833,7 +828,7 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
     };
     setMessage(`正在验证并保存${mode === "full" ? "全量" : "增量"}扫描目录…`);
     try {
-      await updateServiceScanProfile(serviceId, nextProfile, admin);
+      await updateServiceScanProfile(serviceId, nextProfile, admin, "paths");
       setFullScanRoots(nextFullScanRoots);
       setIncrementalScanRoots(nextIncrementalScanRoots);
       setMessage(`扫描路径已保存：全量 ${nextFullScanRoots.length} 条，增量 ${nextIncrementalScanRoots.length} 条`);
@@ -1013,14 +1008,6 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
 
   const providerDescriptor = providers.data?.find((item) => item.type === service.providerType);
   const recommendedScanSettings = providerDescriptor?.recommendedScanSettings;
-  const scanConcurrencyOptions = buildConcurrencyOptions(
-    recommendedScanSettings?.scanDirectoryConcurrency.min ?? 1,
-    recommendedScanSettings?.scanDirectoryConcurrency.max ?? 16,
-  );
-  const scrapeConcurrencyOptions = buildConcurrencyOptions(
-    recommendedScanSettings?.scrapeTaskConcurrency.min ?? 1,
-    recommendedScanSettings?.scrapeTaskConcurrency.max ?? 4,
-  );
   // 关键变量：最近一条任务用于服务详情顶部状态卡片。
   const recentJob = service.recentJobs[0];
   // 关键变量：删除服务前必须先处理排队、运行、重试等待或暂停中的任务。
@@ -1111,17 +1098,13 @@ export function ServiceDetailPage({ serviceId, admin = false }: { serviceId: str
           <form onSubmit={(event) => void saveScanConcurrency(event)} className="grid gap-4 md:grid-cols-2">
             <label className="block">
               <span className="text-xs text-muted-foreground">扫描任务数</span>
-              <select value={scanConcurrencySettings.scanDirectoryConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, scanDirectoryConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
-                {scanConcurrencyOptions.map((value) => <option key={value} value={value}>{value}{value === recommendedScanSettings?.scanDirectoryConcurrency.default ? "（推荐）" : ""}</option>)}
-              </select>
-              <p className="mt-2 text-xs text-muted-foreground">增量扫描使用该并发；全量扫描按 Flymby APP 规则实际使用 {recommendedScanSettings?.fullScanDirectoryConcurrency ?? 1} 个目录任务。</p>
+              <input type="number" step="1" value={scanConcurrencySettings.scanDirectoryConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, scanDirectoryConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" />
+              <p className="mt-2 text-xs text-muted-foreground">全量和增量扫描都使用该任务数；当前服务默认值为 {recommendedScanSettings?.scanDirectoryConcurrency.default ?? 8}，不限制最大值。</p>
             </label>
             <label className="block">
               <span className="text-xs text-muted-foreground">刮削任务数</span>
-              <select value={scanConcurrencySettings.scrapeTaskConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, scrapeTaskConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm">
-                {scrapeConcurrencyOptions.map((value) => <option key={value} value={value}>{value}{value === recommendedScanSettings?.scrapeTaskConcurrency.default ? "（推荐）" : ""}</option>)}
-              </select>
-              <p className="mt-2 text-xs text-muted-foreground">{service.dataType === "music" ? "控制同时执行的音乐元数据补全任务；标签读取使用云助手内置并发。" : "实际并发不会超过当前可用 TMDB Key 支持的并发数。"}</p>
+              <input type="number" step="1" value={scanConcurrencySettings.scrapeTaskConcurrency} onChange={(event) => setScanConcurrencySettings((current) => ({ ...current, scrapeTaskConcurrency: Number(event.target.value) }))} className="mt-2 w-full rounded-lg border border-input bg-background/50 px-3.5 py-3 text-sm" />
+              <p className="mt-2 text-xs text-muted-foreground">当前服务默认值为 {recommendedScanSettings?.scrapeTaskConcurrency.default ?? 4}，不限制最大值。{service.dataType === "music" ? "音乐标签读取仍使用云助手内置并发。" : "TMDB 网络请求仍由可用 Key 容量独立调度。"}</p>
             </label>
             <div className="flex justify-end md:col-span-2"><PrimaryButton type="submit">保存任务并发</PrimaryButton></div>
           </form>

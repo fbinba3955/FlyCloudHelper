@@ -82,35 +82,24 @@ export interface ProviderFileStreamAccess {
   headers: Record<string, string>;
 }
 
-/** Provider 建议的扫描和刮削并发范围，默认值与 Flymby APP 保持一致。 */
+/** Provider 为新服务提供的扫描和刮削任务默认值。 */
 export interface ProviderRecommendedScanSettings {
   scanDirectoryConcurrency: {
     default: number;
-    min: number;
-    max: number;
   };
   scrapeTaskConcurrency: {
     default: number;
-    min: number;
-    max: number;
   };
-  /** 全量扫描为了避免持续占满网盘连接，实际目录并发不超过该值。 */
-  fullScanDirectoryConcurrency: number;
 }
 
 /** 创建 Provider 独立扫描参数时使用的明确配置，避免不同网盘继续共用同一限流策略。 */
 export interface ProviderScanSettingsInput {
   scanDirectoryConcurrency: {
     default: number;
-    min: number;
-    max: number;
   };
   scrapeTaskConcurrency?: {
     default: number;
-    min: number;
-    max: number;
   };
-  fullScanDirectoryConcurrency: number;
 }
 
 /** Worker 交给 Provider 的单次枚举运行参数。 */
@@ -207,9 +196,8 @@ export interface ProviderAdapter {
  */
 export function createFlymbyRecommendedScanSettings(): ProviderRecommendedScanSettings {
   return {
-    scanDirectoryConcurrency: { default: 8, min: 1, max: 16 },
-    scrapeTaskConcurrency: { default: 4, min: 1, max: 4 },
-    fullScanDirectoryConcurrency: 1,
+    scanDirectoryConcurrency: { default: 8 },
+    scrapeTaskConcurrency: { default: 4 },
   };
 }
 
@@ -221,19 +209,18 @@ export function createProviderRecommendedScanSettings(
     scanDirectoryConcurrency: { ...input.scanDirectoryConcurrency },
     scrapeTaskConcurrency: input.scrapeTaskConcurrency
       ? { ...input.scrapeTaskConcurrency }
-      : { default: 4, min: 1, max: 4 },
-    fullScanDirectoryConcurrency: input.fullScanDirectoryConcurrency,
+      : { default: 4 },
   };
 }
 
-/** 把用户配置限制在 Provider 声明的并发范围内。 */
+/** 读取服务自己的任务数；无有效配置时才使用该 Provider 的服务默认值。 */
 export function readProviderConcurrency(
   value: unknown,
-  range: { default: number; min: number; max: number },
+  setting: { default: number },
 ): number {
   const parsed = typeof value === "number" ? value : Number(value);
-  if (!Number.isInteger(parsed)) return range.default;
-  return Math.min(range.max, Math.max(range.min, parsed));
+  if (!Number.isInteger(parsed) || parsed <= 0) return setting.default;
+  return parsed;
 }
 
 /** 读取 Provider 连接中的必填字符串。 */

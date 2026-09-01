@@ -69,6 +69,11 @@ export interface UpdateAggregateServiceInput {
   regionLibrariesEnabled?: unknown;
 }
 
+export interface DeleteAggregateServiceResult {
+  displayName: string;
+  deletedRelatedRows: number;
+}
+
 /** 判断 SQLite、PostgreSQL 或 MySQL 错误是否来自唯一约束。 */
 function isUniqueConstraintError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
@@ -338,6 +343,41 @@ export class AggregateServiceRepository {
     }
 
     return { aggregateService: await this.getById(aggregateServiceId, input.userId), membersChanged };
+  }
+
+  /** 物理删除聚合服务及其独立索引、账号、会话和用户状态，不删除任何来源云服务。 */
+  public async delete(aggregateServiceId: string, userId: string): Promise<DeleteAggregateServiceResult> {
+    return this.database.query.transaction(async (transaction) => {
+      const service = await transaction("aggregate_services")
+        .select("display_name")
+        .where({ id: aggregateServiceId, user_id: userId })
+        .whereNull("deleted_at")
+        .first();
+      if (!service) throw new ApiError(404, "aggregate_service_not_found", "聚合服务不存在");
+
+      // 关键变量：显式清理顺序先处理子表，保证历史数据库未正确建立级联外键时也不会残留聚合数据。
+      const relatedTables = [
+        "aggregate_protocol_sessions",
+        "aggregate_playback_progress",
+        "aggregate_playback_sessions",
+        "aggregate_playback_history",
+        "aggregate_item_preferences",
+        "aggregate_index_jobs",
+        "aggregate_media_item_members",
+        "aggregate_media_items",
+        "aggregate_service_members",
+        "aggregate_access_accounts",
+      ];
+      let deletedRelatedRows = 0;
+      for (const table of relatedTables) {
+        deletedRelatedRows += Number(await transaction(table).where({ aggregate_service_id: aggregateServiceId }).delete());
+      }
+      const deletedServices = Number(await transaction("aggregate_services")
+        .where({ id: aggregateServiceId, user_id: userId })
+        .delete());
+      if (deletedServices !== 1) throw new ApiError(409, "aggregate_service_delete_failed", "聚合服务删除失败");
+      return { displayName: String(service.display_name), deletedRelatedRows };
+    });
   }
 
   /** 批量读取聚合服务成员和成员条目数，列表查询不会按卡片数量产生 N+1。 */

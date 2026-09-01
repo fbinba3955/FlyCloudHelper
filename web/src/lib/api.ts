@@ -694,9 +694,8 @@ export interface ProviderDescriptor {
   credentialSchemaVersion: number;
   capabilities: string[];
   recommendedScanSettings: {
-    scanDirectoryConcurrency: { default: number; min: number; max: number };
-    scrapeTaskConcurrency: { default: number; min: number; max: number };
-    fullScanDirectoryConcurrency: number;
+    scanDirectoryConcurrency: { default: number };
+    scrapeTaskConcurrency: { default: number };
   };
   authenticationMode?: "form" | "web_qr";
   connectionFields: Array<{
@@ -844,6 +843,20 @@ export async function updateAggregateService(
     { method: "PATCH", body: JSON.stringify(input) },
   );
   return result.aggregateService;
+}
+
+/** 手动重新构建聚合服务目录索引。 */
+export async function rebuildAggregateService(aggregateServiceId: string): Promise<AggregateService> {
+  const result = await requestJson<{ aggregateService: AggregateService; indexJobId: string }>(
+    `/api/v1/aggregate-services/${aggregateServiceId}/rebuild`,
+    { method: "POST", body: JSON.stringify({}) },
+  );
+  return result.aggregateService;
+}
+
+/** 删除聚合服务及其独立账号、索引和观看状态，不删除来源服务。 */
+export async function deleteAggregateService(aggregateServiceId: string): Promise<void> {
+  await requestJson<void>(`/api/v1/aggregate-services/${aggregateServiceId}`, { method: "DELETE" });
 }
 
 /** 读取同一聚合地址下的全部独立账号。 */
@@ -1252,10 +1265,11 @@ export async function updateServiceScanProfile(
   serviceId: string,
   scan: Record<string, unknown>,
   admin = false,
+  updateScope: "paths" | "profile" = "profile",
 ): Promise<ServiceDetail> {
   const result = await requestJson<{ service: ServiceDetail }>(
     admin ? `/api/v1/admin/services/${serviceId}/scan-profile` : `/api/v1/services/${serviceId}/scan-profile`,
-    { method: "PUT", body: JSON.stringify({ scan }) },
+    { method: "PUT", body: JSON.stringify({ scan, updateScope }) },
   );
   return result.service;
 }

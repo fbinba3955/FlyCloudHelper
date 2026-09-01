@@ -111,8 +111,7 @@ export class WebDavProvider implements ProviderAdapter {
       "relayPlayback",
     ],
     recommendedScanSettings: createProviderRecommendedScanSettings({
-      scanDirectoryConcurrency: { default: 8, min: 1, max: 16 },
-      fullScanDirectoryConcurrency: 4,
+      scanDirectoryConcurrency: { default: 8 },
     }),
     connectionFields: [
       { name: "baseUrl", label: "WebDAV 地址", type: "url", required: true, secret: false },

@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { AggregateIndexService } from "./aggregate-index-service.js";
 import type { ApiConfig } from "./config.js";
 import type { FlyCloudHelperDatabase } from "./database.js";
 import type { MediaItemRecord, MediaType, ScanJobRecord, SourceFileRecord } from "./domain.js";
@@ -459,6 +460,7 @@ export class ScanWorker {
   private readonly plugins: MetadataPluginManager;
   private readonly aiVideoNameCleaner: AiVideoNameCleaner;
   private readonly failureReports: ScanFailureReportService;
+  private readonly aggregateIndex: AggregateIndexService;
   private readonly logger: WorkerLogger;
   private readonly config: ApiConfig;
   private readonly abortControllers = new Map<string, AbortController>();
@@ -476,6 +478,7 @@ export class ScanWorker {
     plugins: MetadataPluginManager;
     aiModels: AiModelManager;
     failureReports: ScanFailureReportService;
+    aggregateIndex: AggregateIndexService;
     logger: WorkerLogger;
     config: ApiConfig;
   }) {
@@ -489,6 +492,7 @@ export class ScanWorker {
     this.plugins = input.plugins;
     this.aiVideoNameCleaner = new AiVideoNameCleaner(input.database, input.aiModels, input.logger);
     this.failureReports = input.failureReports;
+    this.aggregateIndex = input.aggregateIndex;
     this.logger = input.logger;
     this.config = input.config;
   }
@@ -525,6 +529,78 @@ export class ScanWorker {
         错误信息: error instanceof Error ? error.message : "未知数据库错误",
       });
       return { videoContentCount: 0, songCount: 0, albumCount: 0, artistCount: 0 };
+    }
+  }
+
+  /** 尽力读取影视媒体库目录版本，版本读取失败不能反向导致扫描任务失败。 */
+  private async readVideoCatalogVersion(job: ScanJobRecord): Promise<number | null> {
+    if (job.dataType !== "video") return null;
+    try {
+      const library = await this.database.query("media_libraries")
+        .select("catalog_version")
+        .where({ id: job.libraryId, user_id: job.userId })
+        .first();
+      return library ? Number(library.catalog_version ?? 0) : null;
+    } catch (error) {
+      this.logger.warn({
+        日志关键字: "codex-aggregate-index",
+        事件: "读取扫描前影视目录版本失败",
+        扫描任务ID: job.id,
+        来源服务ID: job.serviceId,
+        来源媒体库ID: job.libraryId,
+        错误信息: error instanceof Error ? error.message : "未知数据库错误",
+      });
+      return null;
+    }
+  }
+
+  /** 扫描成功后仅在目录版本实际推进时触发关联聚合服务，失败不影响已完成的来源扫描。 */
+  private async enqueueChangedAggregateIndexes(job: ScanJobRecord, previousCatalogVersion: number | null): Promise<void> {
+    if (job.dataType !== "video" || previousCatalogVersion === null) return;
+    try {
+      const completedJob = await this.repository.getJob(job.id);
+      if (completedJob.status !== "completed") return;
+      const catalogVersion = await this.readVideoCatalogVersion(job);
+      if (catalogVersion === null) return;
+      if (catalogVersion <= previousCatalogVersion) {
+        this.logger.info({
+          日志关键字: "codex-aggregate-index",
+          事件: "扫描目录无变化跳过聚合索引",
+          扫描任务ID: job.id,
+          来源服务ID: job.serviceId,
+          来源媒体库ID: job.libraryId,
+          扫描前目录版本: previousCatalogVersion,
+          扫描后目录版本: catalogVersion,
+        });
+        return;
+      }
+      const aggregateServiceCount = await this.aggregateIndex.enqueueForSourceCatalogChange({
+        userId: job.userId,
+        serviceId: job.serviceId,
+        libraryId: job.libraryId,
+        scanJobId: job.id,
+        previousCatalogVersion,
+        catalogVersion,
+      });
+      this.logger.info({
+        日志关键字: "codex-aggregate-index",
+        事件: "扫描目录变化聚合触发检查完成",
+        扫描任务ID: job.id,
+        来源服务ID: job.serviceId,
+        来源媒体库ID: job.libraryId,
+        扫描前目录版本: previousCatalogVersion,
+        扫描后目录版本: catalogVersion,
+        触发聚合服务数量: aggregateServiceCount,
+      });
+    } catch (error) {
+      this.logger.warn({
+        日志关键字: "codex-aggregate-index",
+        事件: "扫描完成后自动触发聚合索引失败",
+        扫描任务ID: job.id,
+        来源服务ID: job.serviceId,
+        来源媒体库ID: job.libraryId,
+        错误信息: error instanceof Error ? error.message : "未知数据库错误",
+      });
     }
   }
 
@@ -630,6 +706,8 @@ export class ScanWorker {
   private async executeJob(job: ScanJobRecord): Promise<void> {
     const controller = new AbortController();
     this.abortControllers.set(job.id, controller);
+    // 关键变量：只有任务成功结束且目录版本大于此值时，才允许触发聚合索引。
+    const previousCatalogVersion = await this.readVideoCatalogVersion(job);
     this.logger.info({
       日志标记: "flycloud-helper-worker",
       事件: isStoredAiSupplementJob(job) ? "AI补充未匹配任务开始" : "扫描任务开始",
@@ -642,6 +720,7 @@ export class ScanWorker {
       } else {
         await this.scan(job, controller.signal);
       }
+      await this.enqueueChangedAggregateIndexes(job, previousCatalogVersion);
     } catch (error) {
       if (controller.signal.aborted) {
         await this.applyAbortedJobState(job, "任务执行异常出口");
@@ -1436,10 +1515,8 @@ export class ScanWorker {
       runtime.scanProfile.scanDirectoryConcurrency,
       recommendedSettings.scanDirectoryConcurrency,
     );
-    // 关键变量：全量扫描按Provider独立上限运行，避免统一单目录串行，也防止高并发触发网盘限流。
-    const effectiveScanDirectoryConcurrency = job.scanMode === "full"
-      ? Math.min(configuredScanDirectoryConcurrency, recommendedSettings.fullScanDirectoryConcurrency)
-      : configuredScanDirectoryConcurrency;
+    // 关键变量：全量和增量扫描都使用当前服务自己的任务数，Provider 参数只负责提供初始默认值。
+    const effectiveScanDirectoryConcurrency = configuredScanDirectoryConcurrency;
     const configuredScrapeTaskConcurrency = readProviderConcurrency(
       runtime.scanProfile.scrapeTaskConcurrency,
       recommendedSettings.scrapeTaskConcurrency,
@@ -1576,7 +1653,6 @@ export class ScanWorker {
       扫描模式: job.scanMode,
       扫描配置并发: configuredScanDirectoryConcurrency,
       扫描实际并发: effectiveScanDirectoryConcurrency,
-      全量扫描并发上限: recommendedSettings.fullScanDirectoryConcurrency,
       刮削配置并发: configuredScrapeTaskConcurrency,
       影片任务实际并发: scrapeConcurrency,
       单任务文件落库并发: mediaFilePersistenceConcurrency,

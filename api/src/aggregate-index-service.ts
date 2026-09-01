@@ -31,6 +31,23 @@ interface AggregateItemGroup {
   members: AggregateSourceItem[];
 }
 
+interface AggregateBuildResult {
+  groups: AggregateItemGroup[];
+  /** 关键变量：构建读取来源数据前的目录版本，用于判断构建期间是否又发生变化。 */
+  memberCatalogVersions: Array<{ memberId: string; catalogVersion: number }>;
+}
+
+export interface SourceCatalogChangeInput {
+  userId: string;
+  serviceId: string;
+  libraryId: string;
+  scanJobId: string;
+  previousCatalogVersion: number;
+  catalogVersion: number;
+}
+
+const EPISODE_RELATION_QUERY_BATCH_SIZE = 1_000;
+
 /** 安全读取数据库 JSON 字段，异常旧数据只按空对象参与索引。 */
 function parseJsonObject(value: unknown): Record<string, unknown> {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -48,6 +65,19 @@ function parseJsonObject(value: unknown): Record<string, unknown> {
 /** 将外部 ID 对象转换为仅包含字符串值的字典。 */
 function readExternalIds(value: unknown): Record<string, string> {
   return Object.fromEntries(Object.entries(parseJsonObject(value)).map(([key, item]) => [key, String(item)]));
+}
+
+/** 从数据库异常中提取真正原因，避免超长 SQL 参数列表占满任务错误字段。 */
+function formatAggregateIndexError(error: unknown): string {
+  if (!(error instanceof Error)) return "聚合目录索引失败";
+  const rawMessage = error.message.trim();
+  // 关键变量：Knex 通常以“SQL - 数据库错误”返回异常，最后一段才是需要展示的失败原因。
+  const separatorIndex = rawMessage.lastIndexOf(" - ");
+  const databaseMessage = separatorIndex >= 0
+    ? rawMessage.slice(separatorIndex + 3).trim()
+    : rawMessage;
+  const errorCode = String((error as Error & { code?: string }).code ?? "").trim();
+  return `${errorCode ? `[${errorCode}] ` : ""}${databaseMessage || "聚合目录索引失败"}`.slice(0, 2_000);
 }
 
 /** 为聚合条目生成跨重建稳定的内部 ID。 */
@@ -119,6 +149,8 @@ async function upsertAggregateItemsInChunks(
 export class AggregateIndexService {
   private draining = false;
   private wakeRequested = false;
+  // 关键变量：同一进程内合并同一聚合服务的并发入队请求，避免多个来源同时扫描完成时重复建任务。
+  private readonly enqueueOperations = new Map<string, Promise<string>>();
 
   public constructor(
     private readonly database: FlyCloudHelperDatabase,
@@ -136,6 +168,21 @@ export class AggregateIndexService {
 
   /** 为一个聚合服务排队；已有排队或运行任务时复用，不重复创建。 */
   public async enqueue(aggregateServiceId: string, userId: string, jobType: "initial" | "rebuild" | "incremental" = "initial"): Promise<string> {
+    const pendingOperation = this.enqueueOperations.get(aggregateServiceId);
+    if (pendingOperation) return pendingOperation;
+    const enqueueOperation = this.enqueueOnce(aggregateServiceId, userId, jobType);
+    this.enqueueOperations.set(aggregateServiceId, enqueueOperation);
+    try {
+      return await enqueueOperation;
+    } finally {
+      if (this.enqueueOperations.get(aggregateServiceId) === enqueueOperation) {
+        this.enqueueOperations.delete(aggregateServiceId);
+      }
+    }
+  }
+
+  /** 在单个聚合服务的串行入队窗口中复用活动任务或新建任务。 */
+  private async enqueueOnce(aggregateServiceId: string, userId: string, jobType: "initial" | "rebuild" | "incremental"): Promise<string> {
     const existing = await this.database.query("aggregate_index_jobs")
       .select("id")
       .where({ aggregate_service_id: aggregateServiceId })
@@ -170,6 +217,42 @@ export class AggregateIndexService {
     });
     this.kick();
     return jobId;
+  }
+
+  /** 来源扫描确实推进目录版本后，为包含该来源且尚未同步的聚合服务排队。 */
+  public async enqueueForSourceCatalogChange(input: SourceCatalogChangeInput): Promise<number> {
+    if (input.catalogVersion <= input.previousCatalogVersion) return 0;
+    const rows = await this.database.query("aggregate_service_members as member")
+      .innerJoin("aggregate_services as aggregate_service", "aggregate_service.id", "member.aggregate_service_id")
+      .select("aggregate_service.id", "aggregate_service.user_id", "aggregate_service.display_name")
+      .where({
+        "member.service_id": input.serviceId,
+        "member.library_id": input.libraryId,
+        "member.enabled": 1,
+        "aggregate_service.user_id": input.userId,
+      })
+      .whereNull("aggregate_service.deleted_at")
+      .whereNot("aggregate_service.status", "disabled")
+      .where("member.last_catalog_version", "<", input.catalogVersion);
+
+    // 关键变量：一个来源在同一聚合服务中只有一个成员，但仍按服务 ID 去重，兼容历史脏数据。
+    const aggregateServices = [...new Map(rows.map((row) => [String(row.id), row])).values()];
+    for (const aggregateService of aggregateServices) {
+      const indexJobId = await this.enqueue(String(aggregateService.id), String(aggregateService.user_id), "incremental");
+      this.log("info", {
+        日志关键字: "codex-aggregate-index",
+        事件: "来源扫描变化自动触发聚合索引",
+        扫描任务ID: input.scanJobId,
+        来源服务ID: input.serviceId,
+        来源媒体库ID: input.libraryId,
+        扫描前目录版本: input.previousCatalogVersion,
+        扫描后目录版本: input.catalogVersion,
+        聚合服务ID: String(aggregateService.id),
+        聚合服务名称: String(aggregateService.display_name),
+        聚合索引任务ID: indexJobId,
+      });
+    }
+    return aggregateServices.length;
   }
 
   /** 异步唤醒串行索引循环，避免同一数据库被多个全量聚合任务同时占满。 */
@@ -213,15 +296,20 @@ export class AggregateIndexService {
     });
     const startedMs = Date.now();
     try {
-      const itemGroups = await this.buildGroups(aggregateServiceId, jobId);
-      await this.persistGroups(aggregateServiceId, jobId, itemGroups);
+      const buildResult = await this.buildGroups(aggregateServiceId, jobId);
+      await this.persistGroups(
+        aggregateServiceId,
+        jobId,
+        buildResult.groups,
+        buildResult.memberCatalogVersions,
+      );
       const finishedAt = new Date().toISOString();
       this.log("info", {
         日志关键字: "codex-aggregate-index",
         事件: "聚合目录索引完成",
         聚合服务ID: aggregateServiceId,
         索引任务ID: jobId,
-        聚合条目数量: itemGroups.length,
+        聚合条目数量: buildResult.groups.length,
         耗时毫秒: Date.now() - startedMs,
       });
       await this.database.query("aggregate_index_jobs").where({ id: jobId }).update({
@@ -229,14 +317,15 @@ export class AggregateIndexService {
         finished_at: finishedAt,
         updated_at: finishedAt,
       });
+      await this.enqueueFollowUpForOutdatedMembers(aggregateServiceId, jobId);
     } catch (error) {
       const finishedAt = new Date().toISOString();
-      const errorMessage = error instanceof Error ? error.message : "聚合目录索引失败";
+      const errorMessage = formatAggregateIndexError(error);
       await this.database.query.transaction(async (transaction) => {
         await transaction("aggregate_index_jobs").where({ id: jobId }).update({
           status: "failed",
           error_code: "aggregate_index_failed",
-          error_message: errorMessage.slice(0, 2_000),
+          error_message: errorMessage,
           finished_at: finishedAt,
           updated_at: finishedAt,
         });
@@ -256,12 +345,54 @@ export class AggregateIndexService {
     }
   }
 
+  /** 构建期间来源目录再次变化时追加一轮任务，避免复用运行中任务后遗漏最新变化。 */
+  private async enqueueFollowUpForOutdatedMembers(aggregateServiceId: string, completedJobId: string): Promise<void> {
+    try {
+      const service = await this.database.query("aggregate_services")
+        .select("id", "user_id")
+        .where({ id: aggregateServiceId })
+        .whereNull("deleted_at")
+        .first();
+      if (!service) return;
+      const outdatedMember = await this.database.query("aggregate_service_members as member")
+        .innerJoin("media_libraries as library", "library.id", "member.library_id")
+        .select("member.id", "member.last_catalog_version", "library.catalog_version")
+        .where({ "member.aggregate_service_id": aggregateServiceId, "member.enabled": 1 })
+        .whereRaw("?? > ??", ["library.catalog_version", "member.last_catalog_version"])
+        .first();
+      if (!outdatedMember) return;
+      const followUpJobId = await this.enqueue(aggregateServiceId, String(service.user_id), "incremental");
+      this.log("info", {
+        日志关键字: "codex-aggregate-index",
+        事件: "构建期间来源变化追加聚合索引",
+        聚合服务ID: aggregateServiceId,
+        已完成索引任务ID: completedJobId,
+        后续索引任务ID: followUpJobId,
+        来源构建版本: Number(outdatedMember.last_catalog_version ?? 0),
+        来源最新版本: Number(outdatedMember.catalog_version ?? 0),
+      });
+    } catch (error) {
+      this.log("warn", {
+        日志关键字: "codex-aggregate-index",
+        事件: "检查聚合构建期间来源变化失败",
+        聚合服务ID: aggregateServiceId,
+        已完成索引任务ID: completedJobId,
+        错误信息: formatAggregateIndexError(error),
+      });
+    }
+  }
+
   /** 读取成员目录并按可靠外部 ID 归并电影、节目和单集。 */
-  private async buildGroups(aggregateServiceId: string, jobId: string): Promise<AggregateItemGroup[]> {
-    const memberRows = await this.database.query("aggregate_service_members")
-      .select("id", "service_id", "library_id", "priority")
-      .where({ aggregate_service_id: aggregateServiceId, enabled: 1 })
-      .orderBy("priority", "asc");
+  private async buildGroups(aggregateServiceId: string, jobId: string): Promise<AggregateBuildResult> {
+    const memberRows = await this.database.query("aggregate_service_members as member")
+      .innerJoin("media_libraries as library", "library.id", "member.library_id")
+      .select("member.id", "member.service_id", "member.library_id", "member.priority", "library.catalog_version")
+      .where({ "member.aggregate_service_id": aggregateServiceId, "member.enabled": 1 })
+      .orderBy("member.priority", "asc");
+    const memberCatalogVersions = memberRows.map((member) => ({
+      memberId: String(member.id),
+      catalogVersion: Number(member.catalog_version ?? 0),
+    }));
     const memberByServiceId = new Map(memberRows.map((member) => [String(member.service_id), member]));
     const serviceIds = memberRows.map((member) => String(member.service_id));
     if (serviceIds.length < 2) throw new Error("聚合服务至少需要两个可用影视来源");
@@ -322,11 +453,26 @@ export class AggregateIndexService {
     });
 
     const episodes = sourceItems.filter((item) => item.itemType === "video.episode");
-    const parentRelations = episodes.length > 0
-      ? await this.database.query("media_relations")
-        .select("parent_item_id", "child_item_id")
-        .whereIn("child_item_id", episodes.map((item) => item.id))
-      : [];
+    const episodeIds = episodes.map((item) => item.id);
+    const parentRelations: Array<Record<string, unknown>> = [];
+    if (episodeIds.length > 0) {
+      const relationBatchCount = Math.ceil(episodeIds.length / EPISODE_RELATION_QUERY_BATCH_SIZE);
+      this.log("info", {
+        日志关键字: "codex-aggregate-index",
+        事件: "分批读取聚合单集父子关系",
+        聚合服务ID: aggregateServiceId,
+        索引任务ID: jobId,
+        单集数量: episodeIds.length,
+        每批数量: EPISODE_RELATION_QUERY_BATCH_SIZE,
+        查询批次数: relationBatchCount,
+      });
+      for (let index = 0; index < episodeIds.length; index += EPISODE_RELATION_QUERY_BATCH_SIZE) {
+        const relationRows = await this.database.query("media_relations")
+          .select("parent_item_id", "child_item_id")
+          .whereIn("child_item_id", episodeIds.slice(index, index + EPISODE_RELATION_QUERY_BATCH_SIZE));
+        parentRelations.push(...relationRows);
+      }
+    }
     const parentByChildId = new Map(parentRelations.map((relation) => [
       String(relation.child_item_id),
       String(relation.parent_item_id),
@@ -353,11 +499,16 @@ export class AggregateIndexService {
         members: value.items,
       });
     });
-    return groups;
+    return { groups, memberCatalogVersions };
   }
 
   /** 事务内原子替换索引，客户端不会看到半套聚合目录。 */
-  private async persistGroups(aggregateServiceId: string, jobId: string, groups: AggregateItemGroup[]): Promise<void> {
+  private async persistGroups(
+    aggregateServiceId: string,
+    jobId: string,
+    groups: AggregateItemGroup[],
+    memberCatalogVersions: Array<{ memberId: string; catalogVersion: number }>,
+  ): Promise<void> {
     const now = new Date().toISOString();
     await this.database.query.transaction(async (transaction) => {
       await transaction("aggregate_media_item_members").where({ aggregate_service_id: aggregateServiceId }).delete();
@@ -402,14 +553,10 @@ export class AggregateIndexService {
       })));
       await insertInChunks(transaction, "aggregate_media_item_members", memberMappings, 60);
 
-      const memberVersions = await transaction("aggregate_service_members as member")
-        .innerJoin("media_libraries as library", "library.id", "member.library_id")
-        .select("member.id", "library.catalog_version")
-        .where("member.aggregate_service_id", aggregateServiceId);
-      // 成员数量通常很小，逐成员更新游标可同时兼容 SQLite、PostgreSQL 和 MySQL。
-      for (const memberVersion of memberVersions) {
-        await transaction("aggregate_service_members").where({ id: memberVersion.id }).update({
-          last_catalog_version: Number(memberVersion.catalog_version ?? 0),
+      // 只能保存构建开始时的来源版本，不能把构建过程中出现的新版本误标为已同步。
+      for (const memberVersion of memberCatalogVersions) {
+        await transaction("aggregate_service_members").where({ id: memberVersion.memberId }).update({
+          last_catalog_version: memberVersion.catalogVersion,
           updated_at: now,
         });
       }

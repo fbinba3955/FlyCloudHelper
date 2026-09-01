@@ -4,9 +4,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { PageHeader, PrimaryButton, SecondaryButton } from "@/components/ConsoleShell";
 import { Panel, ProgressMeter, StatusPill } from "@/components/ui-kit";
 import {
-  createAggregateAccessAccount, createAggregateService, deleteAggregateAccessAccount,
+  createAggregateAccessAccount, createAggregateService, deleteAggregateAccessAccount, deleteAggregateService,
   listAggregateAccessAccounts, listAggregateServices, listServices,
-  updateAggregateAccessAccount, updateAggregateService,
+  rebuildAggregateService, updateAggregateAccessAccount, updateAggregateService,
   type AggregateAccessAccount, type AggregateProtocol, type AggregateService, type CloudService,
 } from "@/lib/api";
 import { useApiResource } from "@/lib/use-api-resource";
@@ -35,6 +35,16 @@ function getAggregateStatus(service: AggregateService): { label: string; tone: "
   if (service.status === "failed") return { label: "构建失败", tone: "danger" };
   if (service.status === "disabled") return { label: "已停用", tone: "neutral" };
   return { label: "配置待构建", tone: "neutral" };
+}
+
+/** 返回适合卡片展示的索引失败原因，并兼容旧任务中被 SQL 文本占满的错误。 */
+function getAggregateFailureMessage(service: AggregateService): string {
+  const message = service.latestIndexJob?.errorMessage?.trim() ?? "";
+  if (!message) return "聚合目录索引构建失败，请重新构建。";
+  if (/^(select|insert|update|delete)\s/iu.test(message)) {
+    return "旧构建任务的数据库错误被 SQL 文本截断，请更新后重新构建以获得准确原因。";
+  }
+  return message;
 }
 
 /** 显示一个可点击的协议配置开关。 */
@@ -68,10 +78,13 @@ export function AggregateServicePage() {
   const [newPassword, setNewPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [accountSubmitting, setAccountSubmitting] = useState(false);
+  const [serviceAction, setServiceAction] = useState<{ type: "rebuild" | "delete"; serviceId: string } | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   // 关键变量：同步拦截连续点击，避免状态更新前重复写入配置。
   const submitActionRef = useRef(false);
+  // 关键变量：同步占用聚合服务级操作，避免重新构建或删除被连续提交。
+  const serviceActionRef = useRef<string | null>(null);
 
   const videoServices = useMemo(
     () => (serviceResource.data?.items ?? []).filter((service) => service.dataType === "video"),
@@ -183,6 +196,40 @@ export function AggregateServicePage() {
     finally { setAccountSubmitting(false); }
   }
 
+  /** 手动重新构建当前聚合目录，失败服务也可以直接恢复。 */
+  async function rebuildService(service: AggregateService): Promise<void> {
+    if (serviceActionRef.current) return;
+    serviceActionRef.current = service.id; setServiceAction({ type: "rebuild", serviceId: service.id });
+    setActionError(null); setActionMessage(null);
+    try {
+      await rebuildAggregateService(service.id);
+      setActionMessage(`“${service.displayName}”已进入重新构建队列`);
+      await aggregateResource.refresh();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "聚合服务重新构建失败";
+      console.warn("codex-aggregate-index", { 事件: "网页重新构建聚合服务失败", 聚合服务ID: service.id, 错误信息: message });
+      setActionError(message);
+    } finally { serviceActionRef.current = null; setServiceAction(null); }
+  }
+
+  /** 二次确认后删除聚合服务及其独立数据，来源影视服务保持不变。 */
+  async function removeService(service: AggregateService): Promise<void> {
+    if (serviceActionRef.current) return;
+    if (!window.confirm(`确定删除聚合服务“${service.displayName}”吗？聚合账号、索引和观看状态会同步删除，来源影视服务不会受到影响。`)) return;
+    serviceActionRef.current = service.id; setServiceAction({ type: "delete", serviceId: service.id });
+    setActionError(null); setActionMessage(null);
+    try {
+      await deleteAggregateService(service.id);
+      if (editingServiceId === service.id) { setFormOpen(false); setEditingServiceId(null); setAccounts([]); }
+      setActionMessage(`聚合服务“${service.displayName}”已删除`);
+      await aggregateResource.refresh();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "聚合服务删除失败";
+      console.warn("codex-aggregate-delete", { 事件: "网页删除聚合服务失败", 聚合服务ID: service.id, 错误信息: message });
+      setActionError(message);
+    } finally { serviceActionRef.current = null; setServiceAction(null); }
+  }
+
   return (
     <>
       <PageHeader title="聚合服务" actions={<div className="flex flex-wrap gap-2"><Link to="/app/catalog"><SecondaryButton>返回我的媒体库</SecondaryButton></Link><SecondaryButton onClick={() => void Promise.all([serviceResource.refresh(), aggregateResource.refresh()])}><RefreshCw className="size-4" /> 刷新</SecondaryButton><PrimaryButton disabled={formOpen && !editingServiceId} onClick={openCreateForm}><Plus className="size-4" /> 添加聚合服务</PrimaryButton></div>} />
@@ -203,7 +250,38 @@ export function AggregateServicePage() {
 
       {aggregateResource.loading && (aggregateResource.data?.length ?? 0) === 0 && <Panel><p className="py-12 text-center text-sm text-muted-foreground">正在读取聚合服务…</p></Panel>}
       {!aggregateResource.loading && (aggregateResource.data?.length ?? 0) === 0 && <Panel><div className="py-12 text-center"><Layers3 className="mx-auto size-10 text-muted-foreground" /><p className="mt-4 text-sm font-medium">尚未添加聚合服务</p></div></Panel>}
-      <div className="grid gap-4 lg:grid-cols-2">{(aggregateResource.data ?? []).map((service) => { const status = getAggregateStatus(service); return <article key={service.id} className={cn("surface p-5", editingServiceId === service.id && "border-foreground/55")}><header className="flex items-start justify-between gap-3"><span className="flex min-w-0 items-center gap-3"><span className="flex size-10 items-center justify-center rounded-lg border border-border bg-background/55"><Layers3 className="size-5 text-muted-foreground" /></span><span className="min-w-0"><span className="block truncate text-sm font-semibold">{service.displayName}</span><span className="block font-mono text-[11px] text-muted-foreground">{service.path}</span></span></span><span className="flex flex-wrap justify-end gap-2"><StatusPill tone="info">{service.protocol === "jellyfin" ? "Jellyfin" : "Emby"}</StatusPill><StatusPill tone={status.tone}>{status.label}</StatusPill></span></header><dl className="mt-5 grid gap-3 text-xs sm:grid-cols-2"><div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-muted-foreground">来源服务</dt><dd className="mt-1 font-medium">{service.members.length}</dd></div><div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-muted-foreground">聚合条目</dt><dd className="mt-1 font-medium">{service.itemCount.toLocaleString()}</dd></div><div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-muted-foreground">播放方式</dt><dd className="mt-1 font-medium">{service.relayPlaybackEnabled ? "服务中转" : "原始地址"}</dd></div><div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-muted-foreground">客户端下载</dt><dd className="mt-1 font-medium">{service.downloadEnabled ? "允许" : "禁止"}</dd></div></dl>{service.latestIndexJob && ["queued", "running"].includes(service.latestIndexJob.status) && <div className="mt-4"><ProgressMeter value={service.latestIndexJob.processedCount} total={service.latestIndexJob.totalCount || null} /></div>}<div className="mt-5 flex justify-end border-t border-border pt-4"><SecondaryButton onClick={() => void openEditForm(service)}><Pencil className="size-4" /> 编辑</SecondaryButton></div></article>; })}</div>
+      <div className="grid gap-4 lg:grid-cols-2">
+        {(aggregateResource.data ?? []).map((service) => {
+          const status = getAggregateStatus(service);
+          const rebuilding = serviceAction?.type === "rebuild" && serviceAction.serviceId === service.id;
+          const deleting = serviceAction?.type === "delete" && serviceAction.serviceId === service.id;
+          const actionBlocked = serviceAction !== null;
+          return (
+            <article key={service.id} className={cn("surface p-5", editingServiceId === service.id && "border-foreground/55")}>
+              <header className="flex items-start justify-between gap-3">
+                <span className="flex min-w-0 items-center gap-3">
+                  <span className="flex size-10 items-center justify-center rounded-lg border border-border bg-background/55"><Layers3 className="size-5 text-muted-foreground" /></span>
+                  <span className="min-w-0"><span className="block truncate text-sm font-semibold">{service.displayName}</span><span className="block font-mono text-[11px] text-muted-foreground">{service.path}</span></span>
+                </span>
+                <span className="flex flex-wrap justify-end gap-2"><StatusPill tone="info">{service.protocol === "jellyfin" ? "Jellyfin" : "Emby"}</StatusPill><StatusPill tone={status.tone}>{status.label}</StatusPill></span>
+              </header>
+              <dl className="mt-5 grid gap-3 text-xs sm:grid-cols-2">
+                <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-muted-foreground">来源服务</dt><dd className="mt-1 font-medium">{service.members.length}</dd></div>
+                <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-muted-foreground">聚合条目</dt><dd className="mt-1 font-medium">{service.itemCount.toLocaleString()}</dd></div>
+                <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-muted-foreground">播放方式</dt><dd className="mt-1 font-medium">{service.relayPlaybackEnabled ? "服务中转" : "原始地址"}</dd></div>
+                <div className="rounded-lg border border-border bg-secondary/40 p-3"><dt className="text-muted-foreground">客户端下载</dt><dd className="mt-1 font-medium">{service.downloadEnabled ? "允许" : "禁止"}</dd></div>
+              </dl>
+              {service.latestIndexJob && ["queued", "running"].includes(service.latestIndexJob.status) && <div className="mt-4"><ProgressMeter value={service.latestIndexJob.processedCount} total={service.latestIndexJob.totalCount || null} /></div>}
+              {service.status === "failed" && <p className="mt-4 rounded-lg border border-destructive/30 bg-destructive/8 px-3 py-2 text-xs leading-5 text-destructive">{getAggregateFailureMessage(service)}</p>}
+              <div className="mt-5 flex flex-wrap justify-end gap-2 border-t border-border pt-4">
+                {service.status !== "building" && <SecondaryButton disabled={actionBlocked} onClick={() => void rebuildService(service)}><RefreshCw className={cn("size-4", rebuilding && "animate-spin")} /> {rebuilding ? "正在提交…" : "重新构建"}</SecondaryButton>}
+                <SecondaryButton disabled={actionBlocked} onClick={() => void openEditForm(service)}><Pencil className="size-4" /> 编辑</SecondaryButton>
+                <button type="button" disabled={actionBlocked} onClick={() => void removeService(service)} className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-destructive bg-destructive px-3 py-2 text-xs font-semibold text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"><Trash2 className="size-4" /> {deleting ? "正在删除…" : "删除"}</button>
+              </div>
+            </article>
+          );
+        })}
+      </div>
     </>
   );
 }

@@ -364,6 +364,7 @@ export function validateScanProfile(
   providerType?: string,
   serviceDataType: MediaType = "video",
   recommendedSettings: ProviderRecommendedScanSettings = createFlymbyRecommendedScanSettings(),
+  preserveConcurrency = false,
 ): Record<string, unknown> {
   const legacyRoots = profile.roots === undefined
     ? []
@@ -387,16 +388,18 @@ export function validateScanProfile(
     incrementalRoots: _incrementalRoots,
     ...otherProfile
   } = profile;
-  /** 校验单个并发设置，缺省时直接采用 Provider 推荐值。 */
+  /** 读取单个并发设置；Provider 只提供服务默认值，不限制用户设置的任务数量。 */
   const readConcurrency = (
     fieldName: "scanDirectoryConcurrency" | "scrapeTaskConcurrency",
-    range: { default: number; min: number; max: number },
+    setting: { default: number },
   ): number => {
     const value = profile[fieldName];
-    if (value === undefined) return range.default;
-    if (typeof value !== "number" || !Number.isInteger(value) || value < range.min || value > range.max) {
+    if (value === undefined) return setting.default;
+    // 关键变量：仅保存路径时原样保留该服务的任务数，不让路径修改触发并发配置校验。
+    if (preserveConcurrency) return value as number;
+    if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
       const fieldLabel = fieldName === "scanDirectoryConcurrency" ? "扫描任务数" : "刮削任务数";
-      throw validationError(`scan.${fieldName}`, `${fieldLabel}必须是 ${range.min}–${range.max} 之间的整数`);
+      throw validationError(`scan.${fieldName}`, `${fieldLabel}必须是正整数`);
     }
     return value;
   };
@@ -1272,12 +1275,15 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
   server.put<{ Params: { serviceId: string }; Body: Record<string, unknown> }>("/api/v1/services/:serviceId/scan-profile", async (request) => {
     const user = await requireRequestUser(request, runtime.database);
     const service = await runtime.repository.getServiceDetail(request.params.serviceId, user.id);
+    const updateScope = request.body.updateScope === "paths" ? "paths" : "profile";
     const profile = validateScanProfile(
       requireObject(request.body, "scan", "扫描配置"),
       service.providerType,
       service.dataType,
       runtime.providers.get(service.providerType).descriptor.recommendedScanSettings,
+      updateScope === "paths",
     );
+    const recommendedSettings = runtime.providers.get(service.providerType).descriptor.recommendedScanSettings;
     const connection = runtime.vault.decrypt(await runtime.repository.getActiveEncryptedConnection(service.id, user.id));
     await validateConfiguredScanRoots(runtime.providers.get(service.providerType), connection, profile, {
       persistConnection: async (nextConnection) => {
@@ -1302,6 +1308,16 @@ export async function registerServiceRoutes(server: FastifyInstance, runtime: Ap
       profile,
       readExpectedRevision(request.body.expectedRevision),
     );
+    runtime.logBusinessEvent("info", {
+      日志关键字: "codex-scan-concurrency",
+      事件: updateScope === "paths" ? "保存扫描路径并保留服务任务数" : "按服务配置保存无上限任务数",
+      用户ID: user.id,
+      服务ID: service.id,
+      扫描任务数: Number(profile.scanDirectoryConcurrency),
+      刮削任务数: Number(profile.scrapeTaskConcurrency),
+      Provider默认扫描任务数: recommendedSettings.scanDirectoryConcurrency.default,
+      Provider默认刮削任务数: recommendedSettings.scrapeTaskConcurrency.default,
+    });
     runtime.logBusinessEvent("info", {
       日志关键字: "codex-flycloud-helper-scan-path",
       事件: "更新服务扫描路径",

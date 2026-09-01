@@ -48,8 +48,7 @@ export class AliyunDriveProvider implements ProviderAdapter {
     capabilities: ["list", "stableResourceId", "playbackLocator", "directDownload", "relay"],
     recommendedScanSettings: createProviderRecommendedScanSettings({
       // 阿里开放接口单页最多读取 200 项，允许多个目录并行但限制峰值请求数。
-      scanDirectoryConcurrency: { default: 8, min: 1, max: 8 },
-      fullScanDirectoryConcurrency: 4,
+      scanDirectoryConcurrency: { default: 8 },
     }),
     connectionFields: [
       { name: "accessToken", label: "Access Token", type: "password", required: true, secret: true },
