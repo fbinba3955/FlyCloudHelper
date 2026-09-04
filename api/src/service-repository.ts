@@ -249,6 +249,29 @@ export interface ScanRootRunRecord {
   warningCount: number;
 }
 
+/** 扫描完成通知中展示的一条影视入库摘要。 */
+export interface ScanCreatedVideoContent {
+  title: string;
+  itemType: "video.movie" | "video.series";
+  /** 电影为空；节目表示本次扫描新入库的集数。 */
+  episodeCount: number | null;
+}
+
+/** 扫描任务启动后新建的媒体数量和最多五条影视明细。 */
+export interface ScanCreatedMediaCounts {
+  videoContentCount: number;
+  videoContents: ScanCreatedVideoContent[];
+  songCount: number;
+  albumCount: number;
+  artistCount: number;
+}
+
+/** 把媒体标题限制为适合单行 Telegram 通知展示的长度。 */
+function readNotificationVideoTitle(value: unknown): string {
+  const title = String(value || "未命名影片").replace(/[\r\n]+/gu, " ").trim();
+  return title.slice(0, 120) || "未命名影片";
+}
+
 /** 规格父任务同步结果，completedNow 只在本次原子更新首次进入完成态时为真。 */
 export interface MediaProbeSynchronizationResult {
   job: ScanJobRecord;
@@ -2306,14 +2329,18 @@ export class ServiceRepository {
     return row ? Number(row.notification_enabled) === 1 || row.notification_enabled === true : false;
   }
 
-  /** 统计扫描任务启动后新建的媒体条目，供完成通知展示本次入库数量。 */
-  public async getScanCreatedMediaCounts(job: Pick<ScanJobRecord, "serviceId" | "startedAt">): Promise<{
-    videoContentCount: number;
-    songCount: number;
-    albumCount: number;
-    artistCount: number;
-  }> {
-    if (!job.startedAt) return { videoContentCount: 0, songCount: 0, albumCount: 0, artistCount: 0 };
+  /** 统计扫描任务启动后新建的媒体条目，并读取最多五条影视明细。 */
+  public async getScanCreatedMediaCounts(
+    job: Pick<ScanJobRecord, "serviceId" | "startedAt">,
+  ): Promise<ScanCreatedMediaCounts> {
+    const emptyResult: ScanCreatedMediaCounts = {
+      videoContentCount: 0,
+      videoContents: [],
+      songCount: 0,
+      albumCount: 0,
+      artistCount: 0,
+    };
+    if (!job.startedAt) return emptyResult;
     const rows = await this.database.query("media_items")
       .select("item_type")
       .count<{ item_type: string; count: string | number }[]>({ count: "id" })
@@ -2322,10 +2349,74 @@ export class ServiceRepository {
       .where("created_at", ">=", job.startedAt)
       .whereIn("item_type", ["video.movie", "video.series", "music.track", "music.album", "music.artist"])
       .groupBy("item_type");
-    // 关键变量：按条目类型读取计数，影视只统计媒体库顶层电影和节目，不把剧集文件重复计入新内容。
     const counts = new Map(rows.map((row) => [String(row.item_type), Number(row.count ?? 0)]));
+
+    // 关键变量：旧节目本次新增单集也属于新入库内容，需要与新建节目合并后去重统计。
+    const existingSeriesBaseQuery = this.database.query("media_items as series")
+      .join("media_relations as relation", function joinNewEpisodes() {
+        this.on("relation.parent_item_id", "=", "series.id")
+          .andOnVal("relation.relation_type", "=", "series_episode");
+      })
+      .join("media_items as episode", "episode.id", "relation.child_item_id")
+      .where({ "series.service_id": job.serviceId, "series.item_type": "video.series" })
+      .whereNull("series.deleted_at")
+      .whereNull("episode.deleted_at")
+      .where("series.created_at", "<", job.startedAt)
+      .where("episode.created_at", ">=", job.startedAt);
+    const existingSeriesCountRow = await existingSeriesBaseQuery.clone()
+      .countDistinct<{ count: string | number }[]>({ count: "series.id" })
+      .first();
+    const existingSeriesRows = await existingSeriesBaseQuery.clone()
+      .select("series.id", "series.title")
+      .count<{ id: string; title: string; episode_count: string | number }[]>({ episode_count: "episode.id" })
+      .groupBy("series.id", "series.title")
+      .orderBy("series.title", "asc")
+      .limit(5);
+
+    const newTopLevelRows = await this.database.query("media_items")
+      .select("id", "title", "item_type")
+      .where({ service_id: job.serviceId })
+      .whereNull("deleted_at")
+      .where("created_at", ">=", job.startedAt)
+      .whereIn("item_type", ["video.movie", "video.series"])
+      .orderBy("title", "asc")
+      .limit(5) as Array<{ id: string; title: string; item_type: "video.movie" | "video.series" }>;
+    const displayedNewSeriesIds = newTopLevelRows
+      .filter((row) => row.item_type === "video.series")
+      .map((row) => String(row.id));
+    const displayedNewSeriesEpisodeRows = displayedNewSeriesIds.length === 0
+      ? []
+      : await this.database.query("media_relations as relation")
+        .join("media_items as episode", "episode.id", "relation.child_item_id")
+        .select("relation.parent_item_id")
+        .count<{ parent_item_id: string; episode_count: string | number }[]>({ episode_count: "episode.id" })
+        .whereIn("relation.parent_item_id", displayedNewSeriesIds)
+        .where({ "relation.relation_type": "series_episode" })
+        .whereNull("episode.deleted_at")
+        .where("episode.created_at", ">=", job.startedAt)
+        .groupBy("relation.parent_item_id");
+    const displayedNewSeriesEpisodeCounts = new Map(displayedNewSeriesEpisodeRows.map((row) => [
+      String(row.parent_item_id),
+      Number(row.episode_count ?? 0),
+    ]));
+    const videoContents: ScanCreatedVideoContent[] = [
+      ...newTopLevelRows.map((row): ScanCreatedVideoContent => ({
+        title: readNotificationVideoTitle(row.title),
+        itemType: row.item_type,
+        episodeCount: row.item_type === "video.series" ? displayedNewSeriesEpisodeCounts.get(String(row.id)) ?? 0 : null,
+      })),
+      ...existingSeriesRows.map((row): ScanCreatedVideoContent => ({
+        title: readNotificationVideoTitle(row.title),
+        itemType: "video.series",
+        episodeCount: Number(row.episode_count ?? 0),
+      })),
+    ].sort((left, right) => left.title.localeCompare(right.title, "zh-CN")).slice(0, 5);
+
     return {
-      videoContentCount: (counts.get("video.movie") ?? 0) + (counts.get("video.series") ?? 0),
+      videoContentCount: (counts.get("video.movie") ?? 0)
+        + (counts.get("video.series") ?? 0)
+        + Number(existingSeriesCountRow?.count ?? 0),
+      videoContents,
       songCount: counts.get("music.track") ?? 0,
       albumCount: counts.get("music.album") ?? 0,
       artistCount: counts.get("music.artist") ?? 0,

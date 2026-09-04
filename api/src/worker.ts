@@ -66,6 +66,7 @@ import { CredentialVault } from "./secrets.js";
 import { loadMusicSourceSettings } from "./system-settings.js";
 import {
   ServiceRepository,
+  type ScanCreatedMediaCounts,
   type ScanCheckpointProgress,
 } from "./service-repository.js";
 
@@ -448,6 +449,30 @@ function findMatchingScanRoot(entryPath: string, roots: ScanRoot[]): ScanRoot | 
     })[0];
 }
 
+/** 生成扫描完成通知；影视列出最多五个新入库影片，音乐保持数量摘要。 */
+function buildScanCompletionMessage(
+  job: Pick<ScanJobRecord, "dataType" | "scanMode" | "serviceName">,
+  createdMediaCounts: ScanCreatedMediaCounts,
+): string {
+  const scanModeLabel = job.scanMode === "full" ? "全量" : "增量";
+  if (job.dataType === "music") {
+    return `服务“${job.serviceName}”的${scanModeLabel}扫描已完成：新增入库 ${createdMediaCounts.songCount} 首歌曲、${createdMediaCounts.albumCount} 张专辑、${createdMediaCounts.artistCount} 位艺术家。`;
+  }
+  const videoLines = createdMediaCounts.videoContents.map((content, index) => (
+    content.itemType === "video.series"
+      ? `${index + 1}. 《${content.title}》（本次新增 ${content.episodeCount ?? 0} 集）`
+      : `${index + 1}. 《${content.title}》（电影）`
+  ));
+  const remainingLine = createdMediaCounts.videoContentCount > 5
+    ? `……等 ${createdMediaCounts.videoContentCount} 个影片。`
+    : null;
+  return [
+    `服务“${job.serviceName}”的${scanModeLabel}扫描已完成：新增入库 ${createdMediaCounts.videoContentCount} 个影片。`,
+    ...videoLines,
+    ...(remainingLine ? [remainingLine] : []),
+  ].join("\n");
+}
+
 /** 轮询数据库任务队列并执行 Provider 扫描；当前只开放影视持久化。 */
 export class ScanWorker {
   private readonly database: FlyCloudHelperDatabase;
@@ -513,12 +538,9 @@ export class ScanWorker {
   }
 
   /** 尽力统计本次扫描新增入库内容；统计失败时使用零值完成原任务。 */
-  private async readScanCreatedMediaCounts(job: Pick<ScanJobRecord, "serviceId" | "startedAt">): Promise<{
-    videoContentCount: number;
-    songCount: number;
-    albumCount: number;
-    artistCount: number;
-  }> {
+  private async readScanCreatedMediaCounts(
+    job: Pick<ScanJobRecord, "serviceId" | "startedAt">,
+  ): Promise<ScanCreatedMediaCounts> {
     try {
       return await this.repository.getScanCreatedMediaCounts(job);
     } catch (error) {
@@ -528,7 +550,7 @@ export class ScanWorker {
         服务ID: job.serviceId,
         错误信息: error instanceof Error ? error.message : "未知数据库错误",
       });
-      return { videoContentCount: 0, songCount: 0, albumCount: 0, artistCount: 0 };
+      return { videoContentCount: 0, videoContents: [], songCount: 0, albumCount: 0, artistCount: 0 };
     }
   }
 
@@ -2801,10 +2823,12 @@ export class ScanWorker {
       this.readServiceNotificationEnabled(job.serviceId),
       this.readScanCreatedMediaCounts(job),
     ]);
-    // 关键变量：影视与音乐使用不同业务单位，通知只展示本次任务启动后实际新建入库的顶层内容。
-    const completionMessage = job.dataType === "music"
-      ? `服务“${job.serviceName}”的${job.scanMode === "full" ? "全量" : "增量"}扫描已完成：新增入库 ${createdMediaCounts.songCount} 首歌曲、${createdMediaCounts.albumCount} 张专辑、${createdMediaCounts.artistCount} 位艺术家。`
-      : `服务“${job.serviceName}”的${job.scanMode === "full" ? "全量" : "增量"}扫描已完成：新增入库 ${createdMediaCounts.videoContentCount} 个影视内容。`;
+    // 关键变量：影视与音乐使用不同业务单位，只有本次任务确实有新内容入库时才投递 Telegram。
+    const createdContentCount = job.dataType === "music"
+      ? createdMediaCounts.songCount + createdMediaCounts.albumCount + createdMediaCounts.artistCount
+      : createdMediaCounts.videoContentCount;
+    const deliverScanNotificationExternally = notificationEnabled && createdContentCount > 0;
+    const completionMessage = buildScanCompletionMessage(job, createdMediaCounts);
     await this.database.createNotificationSafely({
       userId: job.userId,
       category: "task",
@@ -2812,7 +2836,7 @@ export class ScanWorker {
       title: "扫描任务已完成",
       message: completionMessage,
       actionPath: "/app/jobs",
-      deliverExternally: notificationEnabled,
+      deliverExternally: deliverScanNotificationExternally,
     });
     this.logger.info({
       日志关键字: "codex-flycloud-helper-task-count",
@@ -2838,7 +2862,10 @@ export class ScanWorker {
       新增歌曲数量: createdMediaCounts.songCount,
       新增专辑数量: createdMediaCounts.albumCount,
       新增艺术家数量: createdMediaCounts.artistCount,
-      是否投递外部通知: notificationEnabled,
+      通知展示影视数量: createdMediaCounts.videoContents.length,
+      服务任务通知已启用: notificationEnabled,
+      是否存在新增入库内容: createdContentCount > 0,
+      是否投递外部通知: deliverScanNotificationExternally,
       扫描耗时毫秒: Date.now() - scanStartedAt,
       平均每秒枚举文件数量: Number((enumeratedEntryCount / Math.max(1, (Date.now() - scanStartedAt) / 1_000)).toFixed(2)),
     });

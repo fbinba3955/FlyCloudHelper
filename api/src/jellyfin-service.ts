@@ -103,6 +103,7 @@ interface JellyfinPersonCache {
 
 const JELLYFIN_ITEM_UUID_PREFIX = "f10c0000";
 const JELLYFIN_SEASON_UUID_PREFIX = "f2";
+const JELLYFIN_USER_STATE_BATCH_SIZE = 50;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const INTERNAL_ITEM_ID_PATTERN = /^itm_([0-9a-f]{24})$/iu;
 
@@ -2174,23 +2175,53 @@ export class JellyfinCompatibilityService {
       decodeAggregateJellyfinItemId(protocolItemId),
     );
     const now = new Date().toISOString();
-    const existing = await this.readAggregateProgress(context, aggregateItem.aggregateItemId);
-    const patch = {
-      played: played ? 1 : 0,
-      position_ticks: 0,
-      hidden_from_resume: played ? 1 : 0,
-      play_count: played ? Math.max(1, Number(existing?.play_count ?? 0)) : 0,
-      updated_at: now,
-      last_played_at: played ? now : existing?.last_played_at ?? null,
-    };
-    if (existing) await this.runtime.database.query("aggregate_playback_progress").where({ id: existing.id }).update(patch);
-    else await this.runtime.database.query("aggregate_playback_progress").insert({
-      id: randomUUID(),
-      aggregate_service_id: context.serviceId,
-      account_id: context.accountId,
-      aggregate_item_id: aggregateItem.aggregateItemId,
-      media_source_id: null,
-      ...patch,
+    const episodeIds = aggregateItem.itemType === "video.series"
+      ? (await this.aggregateCatalog.listEpisodes(context.serviceId, context.ownerUserId, aggregateItem.aggregateItemId))
+        .map((episode) => episode.aggregateItemId)
+      : [];
+    // 关键变量：父节目自身也保留观看状态，全部单集用于标准 Jellyfin 的递归标记语义。
+    const targetItemIds = [...new Set([aggregateItem.aggregateItemId, ...episodeIds])];
+    await this.runtime.database.query.transaction(async (transaction) => {
+      const existingRows: Array<Record<string, unknown>> = [];
+      for (let offset = 0; offset < targetItemIds.length; offset += JELLYFIN_USER_STATE_BATCH_SIZE) {
+        existingRows.push(...await transaction("aggregate_playback_progress")
+          .where({ aggregate_service_id: context.serviceId, account_id: context.accountId })
+          .whereIn("aggregate_item_id", targetItemIds.slice(offset, offset + JELLYFIN_USER_STATE_BATCH_SIZE)));
+      }
+      const existingByItemId = new Map(existingRows.map((row) => [String(row.aggregate_item_id), row]));
+      const rows = targetItemIds.map((aggregateItemId) => {
+        const existing = existingByItemId.get(aggregateItemId);
+        return {
+          id: String(existing?.id ?? randomUUID()),
+          aggregate_service_id: context.serviceId,
+          account_id: context.accountId,
+          aggregate_item_id: aggregateItemId,
+          media_source_id: existing?.media_source_id ?? null,
+          played: played ? 1 : 0,
+          position_ticks: 0,
+          hidden_from_resume: played ? 1 : 0,
+          play_count: played ? Math.max(1, Number(existing?.play_count ?? 0)) : 0,
+          updated_at: now,
+          last_played_at: played ? now : null,
+        };
+      });
+      for (let offset = 0; offset < rows.length; offset += JELLYFIN_USER_STATE_BATCH_SIZE) {
+        await transaction("aggregate_playback_progress")
+          .insert(rows.slice(offset, offset + JELLYFIN_USER_STATE_BATCH_SIZE))
+          .onConflict(["aggregate_service_id", "account_id", "aggregate_item_id"])
+          .merge(["played", "position_ticks", "hidden_from_resume", "play_count", "last_played_at", "updated_at"]);
+      }
+    });
+    this.runtime.logBusinessEvent("info", {
+      日志关键字: "codex-jellyfin-user-state",
+      事件: "级联更新聚合Jellyfin观看状态",
+      聚合服务ID: context.serviceId,
+      账号ID: context.accountId,
+      聚合条目ID: aggregateItem.aggregateItemId,
+      媒体类型: aggregateItem.itemType,
+      是否已观看: played,
+      级联单集数量: episodeIds.length,
+      清零进度条目数量: targetItemIds.length,
     });
     return this.getAggregateUserData(context, protocolItemId);
   }
@@ -2491,20 +2522,48 @@ export class JellyfinCompatibilityService {
     const item = await this.runtime.repository.getCatalogItem(internalItemId, context.ownerUserId);
     if (item.serviceId !== context.serviceId) throw new ApiError(404, "jellyfin_item_not_found", "媒体条目不存在");
     const now = new Date().toISOString();
-    const existing = await this.runtime.database.query("service_playback_progress").where({ service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId }).first();
-    const patch = {
-      played: played ? 1 : 0,
-      position_ticks: 0,
-      hidden_from_resume: played ? 1 : 0,
-      play_count: played ? Math.max(1, Number(existing?.play_count ?? 0)) : 0,
-      updated_at: now,
-      last_played_at: played ? now : existing?.last_played_at ?? null,
-    };
-    if (existing) await this.runtime.database.query("service_playback_progress").where({ id: existing.id }).update(patch);
-    else await this.runtime.database.query("service_playback_progress").insert({ id: randomUUID(), service_id: context.serviceId, account_id: context.accountId, item_id: internalItemId, ...patch });
+    const episodeIds = item.itemType === "video.series"
+      ? (await this.runtime.repository.listCatalogChildren(internalItemId, context.ownerUserId))
+        .filter((child) => child.serviceId === context.serviceId && child.itemType === "video.episode")
+        .map((episode) => episode.id)
+      : [];
+    // 关键变量：普通 Jellyfin 与聚合 Jellyfin 保持一致，节目和所有单集在同一事务中更新。
+    const targetItemIds = [...new Set([internalItemId, ...episodeIds])];
+    await this.runtime.database.query.transaction(async (transaction) => {
+      const existingRows: Array<Record<string, unknown>> = [];
+      for (let offset = 0; offset < targetItemIds.length; offset += JELLYFIN_USER_STATE_BATCH_SIZE) {
+        existingRows.push(...await transaction("service_playback_progress")
+          .where({ service_id: context.serviceId, account_id: context.accountId })
+          .whereIn("item_id", targetItemIds.slice(offset, offset + JELLYFIN_USER_STATE_BATCH_SIZE)));
+      }
+      const existingByItemId = new Map(existingRows.map((row) => [String(row.item_id), row]));
+      const rows = targetItemIds.map((targetItemId) => {
+        const existing = existingByItemId.get(targetItemId);
+        return {
+          id: String(existing?.id ?? randomUUID()),
+          service_id: context.serviceId,
+          account_id: context.accountId,
+          item_id: targetItemId,
+          media_source_id: existing?.media_source_id ?? null,
+          played: played ? 1 : 0,
+          position_ticks: 0,
+          hidden_from_resume: played ? 1 : 0,
+          play_count: played ? Math.max(1, Number(existing?.play_count ?? 0)) : 0,
+          updated_at: now,
+          last_played_at: played ? now : null,
+        };
+      });
+      for (let offset = 0; offset < rows.length; offset += JELLYFIN_USER_STATE_BATCH_SIZE) {
+        await transaction("service_playback_progress")
+          .insert(rows.slice(offset, offset + JELLYFIN_USER_STATE_BATCH_SIZE))
+          .onConflict(["service_id", "account_id", "item_id"])
+          .merge(["played", "position_ticks", "hidden_from_resume", "play_count", "last_played_at", "updated_at"]);
+      }
+    });
+    const progress = await this.readProgress(context, internalItemId);
     const runTimeTicks = await this.readItemRunTimeTicks(item);
     const userData = this.mapUserData(
-      { ...existing, ...patch, item_id: internalItemId },
+      progress,
       runTimeTicks,
       await this.isMediaItemFavorite(context, internalItemId),
       encodeProtocolItemId(internalItemId),
@@ -2515,7 +2574,10 @@ export class JellyfinCompatibilityService {
       服务ID: context.serviceId,
       账号ID: context.accountId,
       媒体条目ID: internalItemId,
+      媒体类型: item.itemType,
       是否已观看: played,
+      级联单集数量: episodeIds.length,
+      清零进度条目数量: targetItemIds.length,
     });
     return userData;
   }
